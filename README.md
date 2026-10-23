@@ -12,7 +12,7 @@ A working prototype of the "AI-Powered Procurement Intelligence Platform" assess
 - **Conflicting evidence, measured:** 35 of 68 projects that IEG rated unsatisfactory still had a satisfactory last ISR. A written policy decides which source answers which question and always shows both.
 - **Across the lifecycle:** tender design checks (672 of 1,939 international tenders advertised below the 30-business-day minimum drew 4.9 bidders vs 5.6), early warnings for 1,340 active projects (73 red, 238 amber, reasons cited), and table-aware parsing of long PDFs (plain chunking had lost 26.8% of table rows).
 - **Continuous learning:** Change Data Feed on 9 tables; an incremental graph update equals a full rebuild row for row; drift checks, a retrain trigger and a champion/challenger gate; 9 pilot KPIs with baselines.
-- **Engineering:** 285 unit tests on the shared package, ruff and pytest in CI, the pipeline as a Databricks Asset Bundle, and every notebook exported with its outputs to `executed/`.
+- **Engineering:** 323 unit tests on the shared package, ruff and pytest in CI, the pipeline as a Databricks Asset Bundle, and every notebook exported with its outputs to `executed/`.
 
 ## Where to look
 
@@ -25,6 +25,8 @@ A working prototype of the "AI-Powered Procurement Intelligence Platform" assess
 | Evaluation labels: panel votes, tier-3 adjudication decisions with evidence and their log, final labels; the 30-brief review pack | `data/human_review/` ([adjudication_log.md](data/human_review/adjudication_log.md)) |
 | Shared pure-Python code and its tests | `src/proc_intel/`, `tests/` |
 | Diagrams (SVG, generated) and the scripts that build the PDF and deck | `docs/figures/`, `docs/build_docs.py`, `slides/build_deck.py` |
+| Every notebook diagram as Mermaid source with its pre-rendered image | [docs/diagrams.md](docs/diagrams.md) |
+| Full reasoning behind each notebook's "Key design decisions" table | [docs/decision_log.md](docs/decision_log.md) |
 | Results of each component | sections below: phase 1 results, then one section per component |
 
 ## Results in brief (snapshot 2026-10-20)
@@ -205,10 +207,6 @@ Primary and foreign keys are declared in Unity Catalog (informational) and count
 - **Limitations.** A unanimous panel can still be wrong (pair 80); the two Meta judges err together; the rubrics were sharpened after seeing answers on these same items, so agreement is optimistic; the tier-3 adjudicator is an AI agent, so its decisions carry written evidence a person can audit but have not yet been reviewed by procurement specialists.
 - **Code and tests:** `src/proc_intel/panel.py` (rubrics, parsing, majority, disagreement rule, pairwise agreement, Fleiss' kappa, claim pooling, merge) + `tests/test_panel.py` (38 tests).
 
-## factcheck (phase 5: brief facts checked in code, review pack re-generated)
+## Next: fact-checking the brief writer
 
-- **Problem:** 5 of the 30 labelled review briefs had an unsupported claim next to real citations, e.g. a precedent called "same project" with a different project id (r06), "2 to 6 firms in the same project" when the project's two contracts had 2 and 5 (r10).
-- **Fix:** contract records carry a `facts` line (project | country | method | year | firms in award notice, counted as the adjudicator counted them); the writer sees the package's own project, country, region and method and may state counts, ranges, methods and relations only from cited fields (rule 10); `proc_intel.factcheck` (22 tests) re-checks every cited sentence after writing, corrects wrong counts (`factcheck_fixed`) and removes other unsupported sentences (`factcheck_removed`).
-- **Writer thinking:** `WRITER_REASONING_EFFORT = "high"` (Qwen 3.5 thinking on, owner's request); `PLANNER_REASONING_EFFORT = "none"`. Per-call timeout 240 s with one retry; throttled calls wait up to a minute.
-- **Re-run (`p16_brief_factcheck`):** the same 30 packages with p11's replay (same as-of date, held-out project, cutoff model and benchmarks) -> `proc_gold.review_briefs_v2`, `data/human_review/review_briefs_v2.csv` (columns of `review_briefs.csv`, label columns empty) and `review_briefs_v2_full.csv` (each cited record shown with its facts line). Round 1: the fact-check changed 0 of 30 briefs; groundedness judge 7 flags (9 before). Round 2 (quantifiers such as "all five" must hold for every cited contract, region in the facts line, evidence gaps cite `tool_log` records of what a tool did not find, judge rubric that treats mitigations as advice): the fact-check removed 3 sentences and qualified 1; judge 6 flags (8 with p11's rubric); 21 briefs cite a `tool_log` record; citation validity 0.994; median latency 34.5 s (28.6 s before). Reading the round-2 events showed one wrongly removed sentence (r17) and one missed claim (r13 "all 5 ... this method"); both are fixed in the code with tests but the pack was not re-run. The comparison is the combined effect of all changes.
-- **Provider switch:** evaluation re-runs can send the writer and the judge to the same open-weight models through OpenRouter (`LLM_PROVIDER = "openrouter"`, falls back to Databricks on HTTP 402/429) for throughput; production and the official round-2 pack use the Databricks endpoints.
+A fact-checking upgrade of the brief writer is being evaluated and will be added.

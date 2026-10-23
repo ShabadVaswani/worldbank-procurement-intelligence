@@ -20,8 +20,11 @@ Entity resolution (`p04`) adds `supplier_entities`; notice-to-contract linking (
 
 %md-sandbox
 <p><b>Core contract model</b></p>
-<pre class="mermaid">
----
+<img src="../figures/rendered/er_core_contract_model.png" alt="er_core_contract_model diagram" style="max-width:100%; width:1421px"/>
+
+<details><summary>Diagram source (Mermaid)</summary>
+
+<pre><code>---
 config:
   layout: elk
 ---
@@ -70,10 +73,15 @@ erDiagram
     contract_suppliers }o--|| suppliers : "supplier_id"
     suppliers ||--|| supplier_entity_map : "every supplier mapped"
     supplier_entity_map }|--|| supplier_entities : "supplier_entity_id"
-</pre>
+</code></pre>
+
+</details>
 <p><b>Lookups: dimension tables and the FKs that point to them</b></p>
-<pre class="mermaid">
----
+<img src="../figures/rendered/er_lookups.png" alt="er_lookups diagram" style="max-width:100%; width:2055px"/>
+
+<details><summary>Diagram source (Mermaid)</summary>
+
+<pre><code>---
 config:
   layout: elk
 ---
@@ -98,67 +106,7 @@ erDiagram
     notices }o--o| dim_procurement_method : "procurement_method_name"
     contracts }o--|| dim_procurement_category : "procurement_category_code"
     notices }o--o| dim_procurement_category : "procurement_category_code"
-</pre>
-<script type="module">
-  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.6.0/dist/mermaid.esm.min.mjs";
-  import elkLayouts from "https://cdn.jsdelivr.net/npm/@mermaid-js/layout-elk@0.1.7/dist/mermaid-layout-elk.esm.min.mjs";
-  mermaid.registerLayoutLoaders(elkLayouts);
-  mermaid.initialize({ startOnLoad: true });
-</script>
-
-<details><summary>Text version of the diagram</summary>
-
-```
- cardinality at each end: 1 = exactly one, 0..1 = zero or one, 0..N = zero or more, 1..N = one or more
-
- +------------------------+  0..N        1  +----------------------+  1        0..N  +----------------------+
- | notices                |---------------->| dim_project          |<----------------| contracts            |
- | PK notice_id           |                 | PK project_id        |                 | PK contract_id       |
- | FK project_id          |                 +----------------------+                 | FK project_id        |
- +------------------------+                                                          +----------------------+
-    | 1          | 1                                                                     1 |            | 1
-    |            |                +-------------------------------+                        |            |
-    |            +------ 0..N --->| notice_contract_links  (p05)  |<--- 0..N --------------+            |
-    |                             | PK notice_id, contract_id     |  notices N:M contracts              |
-    |                             +-------------------------------+                                     |
-    | 0..N                                                                                         1..N |
- +------------------------+                                                          +----------------------+
- | notice_bidders         |                                                          | contract_suppliers   |
- | PK notice_id,          |                                                          | PK contract_id,      |
- |    supplier_id         |                                                          |    supplier_id       |
- | role: awarded /        |                                                          +----------------------+
- |  evaluated / rejected  |                                                                     | 0..N
- +------------------------+                                                                     |
-    | 0..N                                  1  +----------------------+  1                      |
-    +----------------------------------------->| suppliers            |<------------------------+
-                                               | PK supplier_id       |
-                                               +----------------------+
-                                                          | 1
-                                                          | 1     p04 entity resolution: every supplier is mapped
-                                               +----------------------+
-                                               | supplier_entity_map  |
-                                               | PK supplier_id       |
-                                               | FK supplier_entity_id|
-                                               +----------------------+
-                                                          | 1..N
-                                                          | 1
-                                               +----------------------+
-                                               | supplier_entities    |
-                                               | PK supplier_entity_id|
-                                               +----------------------+
-
- Lookups (child N : parent 1 when the FK is always set, N : 0..1 when it may be null):
-   dim_country (PK country_code)        <- dim_project.country_code, notices.country_code,
-                                           contracts.borrower_country_code, suppliers.supplier_country_code,
-                                           supplier_entities.country_code, contract_suppliers.supplier_country_code,
-                                           notice_bidders.firm_country_code                       (all N : 0..1)
-   dim_procurement_method (PK method_name)       <- contracts (N : 1), notices (N : 0..1)
-   dim_procurement_category (PK category_code)   <- contracts (N : 1), notices (N : 0..1)
- Every dim_project row is referenced by at least one notice or contract.
- Reused from the outcome project by join, not copied:
-   silver.country_year (WGI + macro)  on (country_code = country_iso2, year)
-   silver.projects, gold.active_project_scores, silver.rag_chunks  on project_id
-```
+</code></pre>
 
 </details>
 
@@ -166,37 +114,18 @@ notice_bidders keeps the strongest role per firm per notice (awarded > evaluated
 
 Every `dim_project` row is referenced by at least one notice or contract. Reused from the outcome project by join, not copied: `silver.country_year` (WGI + macro) on (`country_code` = `country_iso2`, year); `silver.projects`, `gold.active_project_scores` and `silver.rag_chunks` on `project_id`.
 
-## How it was built and tested
+## Key design decisions
 
-**Step 1 — Is the amount per supplier or per contract?**
-- **Question:** a joint-venture contract has one row per member, each with `supplier_contract_amount_usd`. Is that the member's share, or the contract value repeated?
-- **What we found:** in 7,083 of the 8,864 multi-supplier contracts every row carries the identical amount. In the other 1,781 the two values differ by a fixed ratio, almost always exactly 1.0303 or 1.0003 — a conversion artefact, not a split. Example: contract 1543858 lists AIRES INGEGNERIA and ALL INGEGNERIA, both at US$161,538.89.
-- **Decision:** the amount is the **contract value repeated per member**. `contracts.contract_amount_usd` holds it once (the maximum of the rows, with `amount_spread_ratio` kept as a quality flag). Summing the raw column would double-count every joint venture.
+| Decision | Rationale | Evidence |
+|---|---|---|
+| `contracts.contract_amount_usd` holds the amount once per contract (the maximum of the rows), with `amount_spread_ratio` kept as a quality flag | `supplier_contract_amount_usd` is the contract value repeated per joint-venture member; summing the raw column would double-count every joint venture | In 7,083 of the 8,864 multi-supplier contracts every row carries the identical amount; in the other 1,781 the values differ by a fixed ratio, almost always exactly 1.0303 or 1.0003 (a conversion artefact, not a split); contract 1543858 lists AIRES INGEGNERIA and ALL INGEGNERIA, both at US$161,538.89 |
+| Project, method, category, dates and reference stored once in `contracts`; `contract_suppliers` keeps only what varies by member | These attributes are contract-level | For all 282,890 contracts each of these columns has exactly one value (re-checked in the quality table) |
+| One crosswalk (`proc_intel.countries`) maps every code and name to ISO alpha-2, or to the Bank's regional code | Without it, five borrowers would silently lose their governance indicators | The feed uses Bank codes: DR Congo `ZR`, Serbia `YF`, Yemen `RY`, Timor-Leste `TP`, West Bank and Gaza `GZ` (ISO `CD`, `RS`, `YE`, `TL`, `PS`); Côte d'Ivoire and Somalia rows have no code (4,972 and 2,837 rows); regional codes such as `3W`; notices use names with their own spellings ("Turkey", "Türkiye", "Vietnam", "Somalia") |
+| `suppliers` has one row per `supplier_id` with a flag for anonymised individuals; grouping ids into firms is done in `p04`; the award row without an id gets a surrogate id `NOID-<hash>` | `supplier_id` is a registration id, not a firm identity | Individual consultants are anonymised ("INDIVIDUAL CONSULTANT", 16-character hashed id, 65,121 rows); 6,648 names occur under more than one id |
+| Firm ids, names, countries and roles parsed from award notices into `notice_bidders`; beneficial-ownership tables never read; bidders that never won a contract still get a `suppliers` row | Losing bidders are a competition signal; ownership tables name private persons; the foreign key must hold | Award-notice HTML lists awarded, evaluated and rejected firms as "NAME (supplier id)", plus the award notification date and contract duration; some notices carry beneficial-ownership tables |
+| Primary and foreign keys declared, and duplicates and orphans counted in the closing quality table | Unity Catalog keys are informational, not enforced | Nothing stops a duplicate or an orphan from being written |
 
-**Step 2 — Contract attributes really are contract-level**
-- **Question:** can project, method, category, dates and reference move from the row level to one row per contract without losing information?
-- **What we found:** for all 282,890 contracts each of these columns has exactly one value (re-checked below in the quality table).
-- **Decision:** `contracts` holds them once; `contract_suppliers` keeps only what varies by member.
-
-**Step 3 — Country codes do not line up**
-- **Question:** does the awards feed's country code join to the governance indicators?
-- **What we found:** the feed uses the Bank's own codes. DR Congo is `ZR`, Serbia `YF`, Yemen `RY`, Timor-Leste `TP`, West Bank and Gaza `GZ`, while the indicators use ISO (`CD`, `RS`, `YE`, `TL`, `PS`). Côte d'Ivoire and Somalia rows arrive with **no code at all** (4,972 and 2,837 rows). Regional programmes have codes such as `3W` (Western and Central Africa). The notices feed only has names, with its own spellings ("Turkey", "Türkiye", "Vietnam", "Somalia").
-- **Decision:** one crosswalk (`proc_intel.countries`) maps every code and name to ISO alpha-2, or to the Bank's regional code. Without it, five borrowers would silently lose their governance indicators.
-
-**Step 4 — Who is a supplier?**
-- **Question:** is `supplier_id` an identity?
-- **What we found:** individual consultants are anonymised: supplier "INDIVIDUAL CONSULTANT" with a 16-character hashed id (65,121 rows). Otherwise `supplier_id` is a registration id: stable in spelling for most ids, but one firm often holds several ids (6,648 names occur under more than one id).
-- **Decision:** `suppliers` has one row per `supplier_id` (with a flag for anonymised individuals); grouping ids into real firms is entity resolution, done in `p04`. One award row has no id (its supplier text is a broken fragment); it gets a surrogate id `NOID-<hash>` so the bridge keeps its key.
-
-**Step 5 — Award notices name the losing bidders too**
-- **Question:** what is inside a Contract Award notice besides the winner?
-- **What we found:** the HTML lists awarded, evaluated and rejected firms, each as "NAME (supplier id)", plus the date the award notification was issued and the contract duration. Some notices also carry beneficial-ownership tables naming private persons.
-- **Decision:** parse firm ids, names, countries and roles into `notice_bidders` (a competition signal for phase 2), and **never** read the ownership tables. Bidders that never won a contract in the awards feed still get a `suppliers` row, so the foreign key holds.
-
-**Step 6 — Keys that are declared but not enforced**
-- **Question:** what do primary and foreign keys guarantee on Databricks?
-- **What we found:** Unity Catalog keys are informational. Nothing stops a duplicate or an orphan from being written.
-- **Decision:** declare them (documentation, lineage, optimizer hints) **and** count duplicates and orphans in the quality table at the end of this notebook.
+Full reasoning: docs/decision_log.md
 
 ## Setup
 

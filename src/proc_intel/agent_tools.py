@@ -31,10 +31,8 @@ from sklearn.pipeline import make_pipeline
 # Record ids
 # ---------------------------------------------------------------------------------------------------------
 
-RECORD_TYPES = ("contract", "supplier_entity", "document_chunk", "lesson_chunk", "benchmark", "forecast", "tool_log")
-_ID_RE = re.compile(r"^(contract|supplier_entity|document_chunk|lesson_chunk|benchmark|forecast|tool_log):[A-Za-z0-9_.\-|]+$")
-# a record id written inside free text (evidence gaps cite the tool_log record that states an absence)
-_INLINE_ID = re.compile(r"\b(?:contract|supplier_entity|document_chunk|lesson_chunk|benchmark|forecast|tool_log):[A-Za-z0-9_.\-|]+")
+RECORD_TYPES = ("contract", "supplier_entity", "document_chunk", "lesson_chunk", "benchmark", "forecast")
+_ID_RE = re.compile(r"^(contract|supplier_entity|document_chunk|lesson_chunk|benchmark|forecast):[A-Za-z0-9_.\-|]+$")
 NO_PRECEDENT_GAP = "no close precedent found"
 
 
@@ -46,13 +44,6 @@ def record_id(kind: str, key: Any) -> str:
 
 def is_record_id(text: str) -> bool:
     return bool(_ID_RE.match(text or ""))
-
-
-def tool_log_record(tool: str, label: str, **facts: Any) -> dict:
-    """A citable record of what a tool did NOT find ('no contract passed the precedent rule, 30 candidates checked',
-    'peer group skipped: 12 contracts < 20'), so an evidence gap can cite its source like any other statement."""
-    key = hashlib.sha1(json.dumps([tool, label, facts], sort_keys=True, default=str).encode()).hexdigest()[:10]
-    return {"record_id": record_id("tool_log", f"{tool}-{key}"), "type": "tool_log", "tool": tool, "label": label, **facts}
 
 
 def benchmark_key(level: str, country: str | None, method: str | None, category: str | None) -> str:
@@ -75,6 +66,7 @@ def search_text(contract_description: str | None, notice_description: str | None
     parts: list[str] = []
     for p in (contract_description, notice_description, project_name):
         p = _WS.sub(" ", (p or "")).strip()
+        # skip a part already contained in an earlier one (notice descriptions often repeat the contract description)
         if p and not any(p.lower() in q.lower() for q in parts):
             parts.append(p)
     return " | ".join(parts)
@@ -101,6 +93,7 @@ def fit_search_index(texts: Sequence[str], n_features: int = 2 ** 20):
     Returns (fitted transformer with .transform(texts), csr matrix).
     """
     vec = make_pipeline(
+        # alternate_sign=False keeps every weight positive; norm=None leaves normalisation to the TF-IDF step after it
         HashingVectorizer(ngram_range=(1, 2), n_features=n_features, alternate_sign=False, norm=None,
                           strip_accents="unicode", lowercase=True, stop_words=STOP_WORDS, token_pattern=WORD_PATTERN,
                           dtype=np.float32),
@@ -130,6 +123,7 @@ def boosted_top_k(scores: np.ndarray, boosts: np.ndarray, k: int, min_score: flo
         return []
     total = scores[idx] + boosts[idx]
     if len(idx) > k:
+        # argpartition finds the k best in linear time without sorting all candidates; only those k are sorted below
         part = np.argpartition(-total, k - 1)[:k]
         idx, total = idx[part], total[part]
     order = np.lexsort((idx, -total))                      # ties broken by row number: deterministic
@@ -143,6 +137,7 @@ def location_boost(row_country: np.ndarray, row_region: np.ndarray, country: str
     if region:
         boost[row_region == region] = same_region
     if country:
+        # assigned after the region bonus so a same-country row gets the country bonus only, not both
         boost[row_country == country] = same_country
     return boost
 
@@ -248,6 +243,7 @@ def check_tool_call(name: str, raw_arguments: str | dict | None, tool_specs: dic
             value = float(value)                                 # models often quote numbers: "k": "5"
         if typ == "integer" and isinstance(value, float) and value.is_integer():
             value = int(value)
+        # bool is a subclass of int in Python, so True would otherwise pass as the integer 1
         if isinstance(value, bool) and typ in ("integer", "number"):
             return None, f"argument '{key}' must be {_ARTICLE[typ]}"
         if not isinstance(value, want):
@@ -301,6 +297,7 @@ def parse_brief(text: str) -> tuple[dict | None, str | None]:
     """Parse the model's reply into a brief dict; (None, error) when it is not a schema-shaped object."""
     try:
         s = (text or "").strip()
+        # some models wrap the JSON in prose or code fences; take the outermost {...}
         if not s.startswith("{"):
             m = re.search(r"\{.*\}", s, re.S)
             s = m.group(0) if m else s
@@ -331,6 +328,7 @@ def parse_brief(text: str) -> tuple[dict | None, str | None]:
 def _clean_ids(ids: Iterable, known: set[str], invalid: list[str]) -> list[str]:
     out = []
     for c in ids:
+        # writers sometimes copy the brackets from "[contract:123]"; strip them before matching
         c = str(c).strip().strip("[]")
         if c in known:
             if c not in out:
@@ -347,6 +345,7 @@ def _num_equal(a, b, tol: float = 0.5) -> bool:
         return False
 
 
+# standalone numbers only: digits inside ids or words ("P123456", "FY2024") are not checked
 _NUMBER = re.compile(r"(?<![\w.])\d+(?:\.\d+)?(?!\w)")
 _THOUSANDS = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
 # percentile and interval names a timeline summary may use without a record holding them ("P90", "90th", "80% interval")
@@ -475,6 +474,7 @@ def validate_brief(brief: dict, records: dict[str, dict], package_text: str = ""
             if tl.get(field) is not None:
                 flags.append("timeline_uncited")
             tl[field] = None
+        # the record is the source of truth: a number the writer changed is overwritten, not just flagged
         elif tl.get(field) is None or not _equal(field, tl[field], ref.get(src)):
             if tl.get(field) is not None:
                 flags.append("timeline_corrected")
@@ -511,6 +511,7 @@ def validate_brief(brief: dict, records: dict[str, dict], package_text: str = ""
         rid = str(p.get("record_id", "")).strip().strip("[]")
         if rid not in known:
             invalid.append(rid)
+        # a real record that is not a close precedent (e.g. a contract from a supplier profile) cannot be listed as one
         elif not (rid.startswith("contract:") and records[rid].get("close_precedent")):
             flags.append("precedent_not_close")
         elif rid not in seen and len(precedents) < max_precedents:
@@ -521,29 +522,15 @@ def validate_brief(brief: dict, records: dict[str, dict], package_text: str = ""
     if not precedents:
         flags.append("no_close_precedent")
         if not any(NO_PRECEDENT_GAP in str(g).lower() for g in b["evidence_gaps"]):
-            log = next((r["record_id"] for r in records.values()
-                        if r.get("type") == "tool_log" and r.get("tool") == "similar_past_contracts"), None)
-            b["evidence_gaps"].insert(0, NO_PRECEDENT_GAP + (f" [{log}]" if log else ""))
-
-    gap_ids: list[str] = []
-    gaps = []
-    for g in b["evidence_gaps"]:
-        g = str(g)
-        for rid in _INLINE_ID.findall(g):
-            if rid in known:
-                gap_ids.append(rid)
-            else:
-                invalid.append(rid)
-                g = g.replace(rid, "")
-        gaps.append(re.sub(r"\s*\[[\s,;]*\]", "", re.sub(r"\[\s*[,;]\s*", "[", g)).strip())
-    b["evidence_gaps"] = [g for g in gaps if g]
+            b["evidence_gaps"].insert(0, NO_PRECEDENT_GAP)
 
     if invalid:
         flags.append("invalid_citation")
     if b["status"] == "complete" and (_PROBLEM_FLAGS & set(flags) or not risks):
         b["status"] = "partial"
     cited = sorted(set(tl["citations"] + ma["citations"] + [c for r in risks for c in r["citations"]]
-                       + [p["record_id"] for p in precedents] + gap_ids))
+                       + [p["record_id"] for p in precedents]))
+    # validity = valid distinct ids / (valid distinct ids + invalid mentions)
     n_cited_raw = len(cited) + len(invalid)
     report = {"invalid_citations": sorted(set(invalid)), "flags": sorted(set(flags)), "cited_ids": cited,
               "n_citations": n_cited_raw, "citation_validity": (len(cited) / n_cited_raw) if n_cited_raw else None}
@@ -600,6 +587,7 @@ def precision_at_k(relevant: Sequence[bool | None], k: int = 5) -> float | None:
     judged = list(relevant)[:k]
     if not judged:
         return None
+    # divide by k, not len(judged): an empty slot counts as a miss
     return sum(bool(r) for r in judged) / k
 
 
@@ -663,6 +651,7 @@ def choose_precedent_rule(rows: Sequence[dict], cosine_grid: Iterable[float], tf
             m = precedent_rule_metrics(rows, float(a), float(b), k)
             p, r = m["precision"], m["recall"]
             m["f_beta"] = (1 + beta ** 2) * p * r / (beta ** 2 * p + r) if p and r else 0.0
+            # strictly better only (with a float tolerance), so ties keep the first, lowest thresholds
             if best is None or m["f_beta"] > best["f_beta"] + 1e-12:
                 best = m
     return best

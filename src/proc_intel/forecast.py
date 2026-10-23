@@ -52,6 +52,7 @@ def month_index(d: date) -> int:
 
 def _window(frame: pd.DataFrame, keys: Mapping[str, Any], n_month: int, months: int = HISTORY_MONTHS) -> pd.DataFrame:
     """Rows of `frame` with the given key values and h_month in [n_month - months, n_month - 1]."""
+    # ends the month before the notice month, as in p07, so nothing from the notice month itself is used
     m = (frame["h_month"] >= n_month - months) & (frame["h_month"] <= n_month - 1)
     for k, v in keys.items():
         m &= frame[k] == v
@@ -62,6 +63,8 @@ def _lower_median(values) -> float:
     """The smallest value with at least half of the values at or below it: what Spark's percentile_approx(x, 0.5)
     returns on small groups (p07 uses it for hist_median_days_cm)."""
     v = np.sort(np.asarray(values, dtype=float))
+    # not np.median: the model was trained on Spark's value, which for an even count is the lower middle value, not the
+    # mean of the two
     return float(v[math.ceil(0.5 * len(v)) - 1]) if len(v) else float("nan")
 
 
@@ -173,6 +176,7 @@ def planning_features(package: Mapping, *, method: str | None, category: str | N
         appr = _as_date(project.get("approval_date"))
         row["project_age_years"] = (notice_date - appr).days / 365.25 if appr else float("nan")
         cm = _num(project.get("commitment_musd"))
+        # cm == cm is False only for NaN (a missing commitment)
         row["log_commitment"] = math.log1p(cm) if cm == cm else float("nan")
         row["project_prior_tenders"] = float(prior_tenders) if prior_tenders is not None else float("nan")
     else:
@@ -183,6 +187,7 @@ def planning_features(package: Mapping, *, method: str | None, category: str | N
 
     gov_year = notice_date.year - 1
     years = sorted(y for (c, y) in governance if c == country)
+    # leakage guard as in p07: the year before the notice, or the latest earlier year; never a later year
     use = gov_year if gov_year in years else (max((y for y in years if y <= gov_year), default=None))
     if use is None:
         row.update({g: float("nan") for g in GOVERNANCE})
@@ -196,6 +201,7 @@ def planning_features(package: Mapping, *, method: str | None, category: str | N
                                                  "mkt_mean_named_firms_3y", "hist_median_days_cm", "hist_n_cm")})
     for k in CATEGORICAL:
         row.setdefault(k, None)
+    # the model takes the columns by name, but returning them in p07's order keeps rows comparable in logs and hashes
     return {k: row[k] for k in FEATURES}, assumptions
 
 
@@ -209,6 +215,8 @@ def scoring_problems(row: Mapping, categories: Mapping[str, list]) -> tuple[list
         v = row.get(col)
         if v in (None, "", MISSING):
             blocking.append(f"{col} unknown")
+        # method and category set the duration scale; an unseen value would silently score as "missing", so refuse
+        # instead
         elif v not in categories.get(col, []):
             blocking.append(f"{col} '{v}' not seen in the model's training data")
     for col in ("country_code", "notice_type", "notice_language"):
@@ -228,6 +236,7 @@ def model_frame(row: Mapping) -> pd.DataFrame:
 
 def forecast_key(row: Mapping, model_version: str) -> str:
     """Stable short hash of the feature row and the model version: the forecast record's id key."""
+    # NaN is not equal to itself and json writes it as NaN; map it to None and round floats so equal rows hash equally
     clean = {k: (None if isinstance(v, float) and v != v else (round(v, 6) if isinstance(v, float) else v))
              for k, v in sorted(row.items())}
     raw = json.dumps({"v": model_version, "x": clean}, sort_keys=True, default=str)

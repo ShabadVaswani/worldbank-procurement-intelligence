@@ -50,7 +50,7 @@ How to read this document: sections 2 to 5 follow the brief's four modules. Each
 - **Measure before trusting.** Each step has an acceptance check on real data: a labelled sample (labels from the three-tier escalation in 1.5), a holdout window, or an equality proof. The numbers in this document come from those checks.
 - **A consistent scope over a longer one.** Older contract-award data (FY2001–2016) covers only major, prior-reviewed contracts and leaves a FY2017–2019 gap, so the project uses the complete FY2020+ series rather than mixing two different populations.
 - **Leakage and truncation are design inputs.** The awards feed starts in FY2020, so old tenders look slow and new ones look fast. The models are trained only on cohorts that can be fully observed (section 3.1).
-- **Small pure functions, tested.** The logic shared by notebooks lives in `src/proc_intel` with 285 unit tests, run in CI with a linter on every push.
+- **Small pure functions, tested.** The logic shared by notebooks lives in `src/proc_intel` with 323 unit tests, run in CI with a linter on every push.
 
 ## 1.3 End-to-end architecture
 

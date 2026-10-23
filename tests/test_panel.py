@@ -3,11 +3,7 @@ import json
 import pytest
 
 from proc_intel.panel import (
-    BRIEF_RUBRIC,
-    BRIEF_RUBRIC_V2,
     BRIEF_SCHEMA,
-    CLAIM_RUBRIC,
-    CLAIM_RUBRIC_V2,
     CLAIM_SCHEMA,
     NOT_APPLICABLE,
     PAIR_SCHEMA,
@@ -25,14 +21,11 @@ from proc_intel.panel import (
     listed_items,
     majority,
     normalise,
-    output_tag,
-    package_facts,
     pair_message,
     pairwise_agreement,
     panel_value,
     parse_json_object,
     review_summary,
-    run_tag,
     timeline_vote,
 )
 
@@ -239,39 +232,3 @@ def test_claim_message_and_vote():
     assert claim_vote({"claims": [{"number": 1, "supported": True}, {"number": 9, "supported": False}]}, claims)[0] == "no"
     assert claim_vote({"claims": "bad"}, claims) == (None, "no valid answer")
     assert claim_vote(None, claims)[0] is None
-
-
-def test_run_tag():
-    assert run_tag("review_briefs.csv") == ""
-    assert run_tag(" review_briefs_v2.csv ") == "_v2"
-    assert run_tag("review_briefs_v2_full.csv") == "_v2_full"
-    for bad in ("review_briefs_.csv", "briefs_v2.csv", "review_briefs_v2.csv.bak", "", "review_briefs_V2.csv", "../review_briefs.csv",
-                "review_briefs__v2.csv", "review_briefs_v2_.csv"):
-        with pytest.raises(ValueError):
-            run_tag(bad)
-
-
-def test_rubric_v2_and_package_facts():
-    for rubric in (BRIEF_RUBRIC_V2, CLAIM_RUBRIC_V2):
-        assert "tool_log" in rubric and "advice" in rubric
-    assert BRIEF_RUBRIC_V2 != BRIEF_RUBRIC and CLAIM_RUBRIC_V2 != CLAIM_RUBRIC
-    assert BRIEF_RUBRIC_V2.split("4. any_unsupported_claim")[0] == BRIEF_RUBRIC.split("4. any_unsupported_claim")[0]
-    row = {"project_id": "P174034", "country": "NE", "region": "Western and Central Africa", "method": "QCBS",
-           "category": "CS", "notice_date": "2024-02-05", "description": "d", "brief_text": "b", "cited_records": "[]",
-           "actual_outcome": "o"}
-    assert package_facts(row) == "project P174034 | NE | Western and Central Africa | QCBS"
-    assert brief_message(row) == brief_message(row, False) and "PACKAGE FACTS" not in brief_message(row)
-    assert "\nPACKAGE FACTS: project P174034 | NE | Western and Central Africa | QCBS\nd\n" in brief_message(row, True)
-    assert "PACKAGE FACTS" in claim_message(row, ["c"], True) and "PACKAGE FACTS" not in claim_message(row, ["c"])
-    assert package_facts({}) == "project not recorded | country not recorded | region not recorded | method not recorded"
-
-
-def test_output_tag():
-    assert output_tag("review_briefs.csv") == ""
-    assert output_tag("review_briefs_v1_full.csv", "v2", "_v1r") == "_v1r"
-    assert output_tag("review_briefs_v2_full.csv", "v2", "_v2") == "_v2"
-    assert output_tag("review_briefs_holdout_full.csv", "v2") == "_holdout_full"
-    for args in (("review_briefs.csv", "v2"), ("review_briefs.csv", "v3"), ("review_briefs_v2.csv", "v2", "v2"),
-                 ("review_briefs_v2.csv", "v2", "_V2"), ("bad.csv", "v2", "_x")):
-        with pytest.raises(ValueError):
-            output_tag(*args)
