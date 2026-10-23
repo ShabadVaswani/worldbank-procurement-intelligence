@@ -1,0 +1,13 @@
+---
+config:
+  layout: elk
+---
+flowchart LR
+    tn["tender notice<br/>(IFB / REOI / IFP)"]
+    bd["bid deadline<br/>(submission_deadline)"]
+    an["award notification<br/>(award notice HTML)"]
+    cs["contract signed<br/>(awards feed)"]
+    tn -->|"advertising period"| bd
+    bd --> an --> cs
+    bd -.->|"evaluation, award and signature"| cs
+    tn -.->|"days_notice_to_signing"| cs

@@ -1,0 +1,33 @@
+[project]
+name = "proc-intel"
+version = "0.1.0"
+description = "World Bank procurement intelligence: pure-Python helpers shared by the Databricks notebooks"
+requires-python = ">=3.10"
+dependencies = ["requests", "rapidfuzz>=3", "unidecode", "scikit-learn", "numpy", "scipy"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 140
+target-version = "py310"
+src = ["src", "tests"]
+# Databricks source notebooks use notebook globals (spark, dbutils, display) and %run; they are linted on the cluster, not here.
+extend-exclude = ["notebooks", "executed", ".databricks"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4"]
+ignore = [
+    "E741",   # short names such as l / I are used as in the papers the formulas come from
+    "SIM108", # ternaries are not always clearer than an if/else
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/test_evidence.py" = ["E501"]  # fixed-width document text copied verbatim from the reports
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["proc_intel.resolution.MatchRules"]  # frozen dataclass, safe as a default
+
+[tool.ruff.lint.isort]
+known-first-party = ["proc_intel"]

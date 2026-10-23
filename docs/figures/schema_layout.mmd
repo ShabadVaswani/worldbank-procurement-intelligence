@@ -1,0 +1,15 @@
+---
+config:
+  layout: elk
+---
+flowchart TD
+    cat["dbw_wb_outcome"]
+    old["bronze / silver / gold / ml<br/>outcome project (read only from here)"]
+    pb["proc_bronze<br/>raw records as delivered by the APIs"]
+    raw["raw (volume)<br/>untouched JSON pages, one folder per snapshot"]
+    ps["proc_silver<br/>cleaned, typed, keyed model (contracts, suppliers, notices, ...)"]
+    pg["proc_gold<br/>tender timelines and the knowledge graph (nodes / edges)"]
+    cat --> old
+    cat --> pb --> raw
+    cat --> ps
+    cat --> pg

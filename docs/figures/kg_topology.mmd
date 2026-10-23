@@ -1,0 +1,20 @@
+---
+config:
+  layout: elk
+---
+flowchart LR
+    document_chunk["document_chunk<br/>(silver.rag_chunks)"]
+    project["project"]
+    country["country"]
+    notice["notice"]
+    contract["contract"]
+    supplier_entity["supplier_entity"]
+    project -->|"IN_COUNTRY"| country
+    supplier_entity -->|"REGISTERED_IN"| country
+    notice -->|"FOR_PROJECT"| project
+    document_chunk -->|"DESCRIBES"| project
+    notice -->|"ADVERTISES (tender)"| contract
+    notice -->|"ANNOUNCES (award)"| contract
+    contract -->|"AWARDED_TO"| supplier_entity
+    contract -->|"PART_OF"| project
+    supplier_entity -->|"BID_ON (role)"| notice

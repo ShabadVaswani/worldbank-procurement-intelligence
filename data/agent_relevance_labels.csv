@@ -1,0 +1,31 @@
+eval_id,contract_id,human_relevant,note
+e15,1750002,False,pesticide residue test kits: not medical diagnostics
+e04,1871144,True,double classroom blocks
+e15,1716900,True,medical rapid test kits for health facilities (pregnancy vs hepatitis C)
+e04,1871081,True,school classroom blocks
+e02,1612588,False,marketing training equipment: not clinical simulation
+e14,1621260,True,road section rehabilitation works
+e01,1735365,True,farm-to-market road concreting
+e09,1647851,True,disk arrays for data storage: storage arrays are part of the package
+e05,1673652,True,vehicles for regional offices
+e04,1855906,True,double classroom block
+e19,1761100,False,project implementation manual: not works supervision
+e20,1700380,True,classroom construction
+e01,1775094,True,farm-to-market road concreting
+e14,1625076,True,road section rehabilitation works
+e01,1761749,True,farm-to-market road construction
+e04,1782144,True,double classroom blocks
+e13,1778915,False,project audit: not an education study
+e13,1869279,False,design of livestock houses: unrelated
+e04,1635133,True,classroom blocks at a primary school
+e09,1701430,True,IT equipment for a data centre
+e12,1602124,True,cadastral field surveys (non-consulting)
+e01,1654070,True,farm-to-market road concreting
+e12,1891420,True,cadastral survey services
+e11,1871681,True,4x4 double-cabin pickups
+e09,1877891,True,servers and network equipment
+e05,1871681,True,"borderline: both motor vehicles for government offices, pickups instead of sedans"
+e08,1647742,True,"borderline: road safety consulting, scope (management vs strategy) unclear from the description"
+e20,1598784,True,classroom block construction
+e02,1710100,True,medical simulation equipment
+e01,1708280,True,farm-to-market road construction

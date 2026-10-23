@@ -1,0 +1,19 @@
+---
+config:
+  layout: elk
+---
+flowchart TD
+    pairs["data/supplier_pair_labels.csv (100 pairs)<br/>+ up to 3 contracts per record (proc_silver)"]
+    prub["PAIR_RUBRIC: same / different / unsure"]
+    pj["judges: gpt-oss-120b, Llama 4 Maverick, Qwen 3.5 122B"]
+    briefs["data/human_review/review_briefs.csv (30 briefs)<br/>package, brief, cited records, actual outcome"]
+    brub["BRIEF_RUBRIC: timeline_ok, precedents (each),<br/>risks (each), any_unsupported_claim"]
+    bj["judges: gpt-oss-120b, Llama 4 Maverick, Llama 3.3 70B<br/>(Qwen wrote the briefs: excluded)"]
+    panel["proc_gold.label_panel<br/>one vote per item x judge x field"]
+    agg["proc_intel.panel: majority, disagreement rule,<br/>pairwise agreement, Fleiss' kappa"]
+    pl["data/human_review/panel_labels.csv"]
+    adj["tier 3: AI adjudicator (disagreements only)"]
+    fin["adjudication_decisions.csv + apply_adjudication.py<br/>final_labels.csv, ER precision / recall, review pack"]
+    pairs --> prub --> pj --> panel
+    briefs --> brub --> bj --> panel
+    panel --> agg --> pl --> adj --> fin

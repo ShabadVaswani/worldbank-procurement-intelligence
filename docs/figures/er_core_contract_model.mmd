@@ -1,0 +1,49 @@
+---
+config:
+  layout: elk
+---
+erDiagram
+    dim_project {
+        string project_id PK
+    }
+    notices {
+        string notice_id PK
+        string project_id FK
+    }
+    contracts {
+        string contract_id PK
+        string project_id FK
+    }
+    notice_contract_links {
+        string notice_id PK, FK "added by p05"
+        string contract_id PK, FK "added by p05"
+    }
+    notice_bidders {
+        string notice_id PK, FK
+        string supplier_id PK, FK
+        string role "awarded, evaluated or rejected"
+    }
+    contract_suppliers {
+        string contract_id PK, FK
+        string supplier_id PK, FK
+    }
+    suppliers {
+        string supplier_id PK
+    }
+    supplier_entity_map {
+        string supplier_id PK, FK "added by p04"
+        string supplier_entity_id FK "added by p04"
+    }
+    supplier_entities {
+        string supplier_entity_id PK
+    }
+    notices }o--|| dim_project : "project_id"
+    contracts }o--|| dim_project : "project_id"
+    notices ||--o{ notice_contract_links : "notices N to M contracts"
+    contracts ||--o{ notice_contract_links : "notices N to M contracts"
+    notices ||--o{ notice_bidders : "firms named"
+    contracts ||--|{ contract_suppliers : "members"
+    notice_bidders }o--|| suppliers : "supplier_id"
+    contract_suppliers }o--|| suppliers : "supplier_id"
+    suppliers ||--|| supplier_entity_map : "every supplier mapped"
+    supplier_entity_map }|--|| supplier_entities : "supplier_entity_id"

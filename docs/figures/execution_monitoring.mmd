@@ -1,0 +1,26 @@
+---
+config:
+  layout: elk
+---
+flowchart LR
+    s1["proc_gold.open_tender_scores (p07)"]
+    s2["proc_gold.tender_timelines + benchmarks"]
+    s3["FinancesOne loan / credit statements<br/>(IBRD DS00975, IDA DS00976;<br/>Sep 2026 and Sep 2024 snapshots)"]
+    s5["latest ISR text (Documents API)"]
+    subgraph ind["indicators"]
+        i1["1 stalled tenders<br/>open longer than their P90"]
+        i2["2 slow signings<br/>recent contracts above the slow threshold"]
+        i3["3 disbursement lag<br/>disbursed share vs peers at the same point in time"]
+        i4["4 closing extended<br/>closing date moved since the Sep 2024 statement"]
+        i5["5 ISR ratings<br/>PDO / IP below MS, or downgraded"]
+        i6["6 fiduciary risk<br/>SORT fiduciary High, or Substantial and raised"]
+    end
+    alert["proc_intel.monitoring.indicators() then alert():<br/>red / amber / watch / none"]
+    ew["proc_gold.early_warnings<br/>(reasons + citations per project)"]
+    s1 --> i1
+    s2 --> i2
+    s3 --> i3
+    s3 --> i4
+    s5 --> i5
+    s5 --> i6
+    ind --> alert --> ew

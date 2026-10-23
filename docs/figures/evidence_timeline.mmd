@@ -1,0 +1,11 @@
+---
+config:
+  layout: elk
+---
+flowchart LR
+    ap["approval"]
+    isr["mid-term to last ISR<br/>ISR ... ISR (isr_earlier) ... ISR (isr_last)<br/>task team: progress towards the PDO,<br/>implementation progress (forward-looking)"]
+    cl["closing"]
+    icr["ICR (self)<br/>outcome rating, Bank team<br/>(backward-looking, self-reported)"]
+    ieg["IEG ICR Review<br/>outcome rating, independent"]
+    ap -->|"time"| isr -->|"time"| cl -->|"time"| icr -->|"time"| ieg

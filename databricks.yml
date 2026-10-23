@@ -1,0 +1,85 @@
+# Databricks Asset Bundle: the phase-1 procurement pipeline as one workflow (not deployed yet).
+#   databricks bundle validate --var cluster_id=<id>
+#   databricks bundle deploy   --var cluster_id=<id>
+bundle:
+  name: worldbank-procurement-intelligence
+
+variables:
+  cluster_id:
+    description: Existing all-purpose cluster (single node, Databricks Runtime 18 LTS ML, Dedicated access mode)
+
+targets:
+  dev:
+    mode: development
+    default: true
+
+resources:
+  jobs:
+    wb_procurement_pipeline:
+      name: wb-procurement-pipeline
+      description: "Procurement intelligence phase 1: ingest awards + notices -> silver model -> supplier resolution -> notice/contract links + timelines -> knowledge graph."
+      max_concurrent_runs: 1
+      timeout_seconds: 10800
+      schedule:
+        quartz_cron_expression: "0 0 5 * * ?"   # daily 05:00 UTC (awards refresh daily)
+        timezone_id: UTC
+        pause_status: PAUSED
+      tags:
+        project: wb-procurement
+      tasks:
+        - task_key: setup
+          existing_cluster_id: ${var.cluster_id}
+          notebook_task: {notebook_path: ./notebooks/p00_setup.py}
+        - task_key: ingest_awards
+          depends_on: [{task_key: setup}]
+          existing_cluster_id: ${var.cluster_id}
+          notebook_task: {notebook_path: ./notebooks/p01_ingest_awards.py}
+        - task_key: ingest_notices
+          depends_on: [{task_key: setup}]
+          existing_cluster_id: ${var.cluster_id}
+          notebook_task: {notebook_path: ./notebooks/p02_ingest_notices.py}
+        - task_key: silver_model
+          depends_on: [{task_key: ingest_awards}, {task_key: ingest_notices}]
+          existing_cluster_id: ${var.cluster_id}
+          notebook_task: {notebook_path: ./notebooks/p03_silver_model.py}
+        - task_key: supplier_resolution
+          depends_on: [{task_key: silver_model}]
+          existing_cluster_id: ${var.cluster_id}
+          notebook_task: {notebook_path: ./notebooks/p04_supplier_resolution.py}
+        - task_key: link_notices_awards
+          depends_on: [{task_key: silver_model}]
+          existing_cluster_id: ${var.cluster_id}
+          notebook_task: {notebook_path: ./notebooks/p05_link_notices_awards.py}
+        - task_key: knowledge_graph
+          depends_on: [{task_key: supplier_resolution}, {task_key: link_notices_awards}]
+          existing_cluster_id: ${var.cluster_id}
+          notebook_task: {notebook_path: ./notebooks/p06_knowledge_graph.py}
+
+    # Phase 2 (p10): the daily closed loop. Bronze is loaded with MERGE into tables with Change Data Feed on;
+    # p10 in monitor mode reads the feed since its checkpoint, checks drift and freshness and refreshes the pilot KPIs.
+    # Silver/gold rebuilds stay in wb_procurement_pipeline above until those steps are converted to MERGE.
+    wb_procurement_daily_incremental:
+      name: wb-procurement-daily-incremental
+      description: "Daily closed loop: incremental bronze MERGE (CDF on) -> change feed since checkpoint, drift checks, freshness, pilot KPIs (p10 monitor mode)."
+      max_concurrent_runs: 1
+      timeout_seconds: 7200
+      schedule:
+        quartz_cron_expression: "0 30 6 * * ?"   # daily 06:30 UTC
+        timezone_id: UTC
+        pause_status: PAUSED
+      tags:
+        project: wb-procurement
+        phase: "2"
+      tasks:
+        - task_key: ingest_awards
+          existing_cluster_id: ${var.cluster_id}
+          notebook_task: {notebook_path: ./notebooks/p01_ingest_awards.py}
+        - task_key: ingest_notices
+          existing_cluster_id: ${var.cluster_id}
+          notebook_task: {notebook_path: ./notebooks/p02_ingest_notices.py}
+        - task_key: continuous_learning
+          depends_on: [{task_key: ingest_awards}, {task_key: ingest_notices}]
+          existing_cluster_id: ${var.cluster_id}
+          notebook_task:
+            notebook_path: ./notebooks/p10_continuous_learning.py
+            base_parameters: {mode: monitor}

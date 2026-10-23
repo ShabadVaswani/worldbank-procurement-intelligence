@@ -1,0 +1,23 @@
+---
+config:
+  layout: elk
+---
+flowchart TD
+    pkg["new package<br/>{country, category, method, description}"]
+    guard["input guard<br/>(Llama 3.3)"]
+    planner["planner LLM<br/>(Qwen 3.5)"]
+    subgraph tools["tools (at most 6 calls)"]
+        t1["similar_past_contracts<br/>TF-IDF + GTE, 282,890 contracts,<br/>only re-rank cosine at or above threshold"]
+        t2["tender_benchmark<br/>proc_gold.tender_benchmarks"]
+        t3["forecast_timeline<br/>ml.proc_tender_duration@champion"]
+        t4["lessons_learned<br/>appraisal + completion passages"]
+        t5["supplier_profile<br/>proc_gold.kg_nodes / kg_edges"]
+    end
+    writer["writer LLM<br/>(JSON brief)"]
+    validate["validation in code: unknown ids dropped,<br/>uncited risks removed, timeline numbers equal to<br/>the cited forecast and benchmark, precedents only close ones"]
+    brief["cited brief"]
+    pkg --> guard --> planner
+    planner -->|"tool calls (max 6)"| tools
+    tools -->|"records with ids"| writer
+    planner --> writer
+    writer --> validate --> brief

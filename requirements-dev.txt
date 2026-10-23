@@ -1,0 +1,8 @@
+requests
+rapidfuzz>=3
+unidecode
+scikit-learn
+numpy
+scipy
+pandas
+pytest

@@ -1,0 +1,19 @@
+---
+config:
+  layout: elk
+---
+flowchart TD
+    html["proc_bronze.procurement_notices.notice_text (HTML)"]
+    rules["rules (proc_intel.tender_checks.extract_requirements)<br/>+ Qwen JSON extraction only where the rules found<br/>a mention without a value"]
+    req["proc_silver.tender_requirements (400 notices)"]
+    adv["advertising period, market approach<br/>(all 10,000+ notices)"]
+    tt["proc_gold.tender_timelines (signed contracts, outcomes)"]
+    outc["bidders named in award notices, days to signing,<br/>re-advertised reference, value per lot"]
+    peers["peer statistics per country / region / category x market approach<br/>(proc_gold.tender_design_peers) + policy minimum (Regulations para 5.36)"]
+    chk["check_tender_design(notice_or_package, peers): flags"]
+    flags["proc_gold.tender_design_flags"]
+    ev["flagged vs not flagged: bidders, single-bidder share,<br/>days to signing, re-advertisement"]
+    html --> rules --> req --> peers
+    adv --> peers
+    tt --> outc --> peers
+    peers --> chk --> flags --> ev

@@ -1,0 +1,12 @@
+---
+config:
+  layout: elk
+---
+flowchart TD
+    rec["records (supplier_id, name, country)<br/>~370k, from contracts and award notices"]
+    blk["blocking: compare only within the same supplier country"]
+    rules["rules<br/>same_id: same supplier_id AND (names similar >= 0.5 OR one is the other's acronym)<br/>exact_name: same comparison string (not for ambiguous personal names)<br/>fuzzy_name: cosine >= 0.70 AND distinctive words match >= 0.90 (one extra word allowed)<br/>AND same numbers AND same joint-venture status"]
+    cc["connected components = supplier entities"]
+    rec -->|"normalise name (legal forms, accents, punctuation, the country's own name)"| blk
+    blk -->|"score: cosine of TF-IDF character trigrams (candidate if >= 0.5)"| rules
+    rules --> cc

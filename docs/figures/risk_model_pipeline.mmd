@@ -1,0 +1,29 @@
+---
+config:
+  layout: elk
+---
+flowchart TD
+    tt["proc_gold.tender_timelines (open, timed)<br/>notice date to signing date"]
+    subgraph feats["notice-time features"]
+        f1["notice: method, category, type,<br/>advertising days, language, length"]
+        f2["project: region, sector, age, size, earlier tenders"]
+        f3["country: governance (WGI) and income,<br/>year before the notice"]
+        f4["market: past contracts, winners, bidders,<br/>durations (3 years before)"]
+    end
+    cohort["cohort with full follow-up<br/>notices 2019-07 .. 2024-10, durations capped at 730 days"]
+    base["peer-group baseline<br/>quantiles of country x method x category, with fallbacks"]
+    lgbm["LightGBM quantile models P10 / P50 / P90<br/>+ slow-tender classifier<br/>(time split, rolling-origin CV)"]
+    surv["survival view<br/>Kaplan-Meier per notice (unsigned = censored), Weibull AFT"]
+    subgraph outs["outputs"]
+        o1["proc_gold.tender_benchmarks<br/>(peer groups)"]
+        o2["proc_gold.open_tender_scores<br/>(open notices)"]
+        o3["UC model ml.proc_tender_duration"]
+    end
+    tt --> cohort
+    feats --> cohort
+    cohort --> base
+    cohort --> lgbm
+    cohort --> surv
+    base --> outs
+    lgbm --> outs
+    surv --> outs

@@ -1,0 +1,59 @@
+erDiagram
+    dim_country {
+        string country_code PK
+    }
+    dim_project {
+        string project_id PK
+        string country_code FK
+    }
+    contracts {
+        string contract_id PK
+        string project_id FK
+        string borrower_country FK "to dim_country"
+        string method FK
+        string category FK
+        double contract_amount_usd "stored once per contract"
+    }
+    notices {
+        string notice_id PK
+        string project_id FK
+        string country_code FK "to dim_country"
+        string method FK
+        string category FK
+    }
+    contract_suppliers {
+        string contract_id PK, FK
+        string supplier_id PK, FK
+    }
+    notice_contract_links {
+        string notice_id PK, FK
+        string contract_id PK, FK
+        string link_role "tender or award"
+    }
+    notice_bidders {
+        string notice_id PK, FK
+        string supplier_id PK, FK
+        string role "awarded, evaluated, rejected"
+    }
+    suppliers {
+        string supplier_id PK
+        string country_code FK "to dim_country"
+    }
+    supplier_entity_map {
+        string supplier_id PK, FK
+        string supplier_entity_id FK
+    }
+    supplier_entities {
+        string supplier_entity_id PK
+    }
+    dim_country ||--o{ dim_project : "in country"
+    dim_project ||--o{ contracts : "part of"
+    dim_project ||--o{ notices : "for project"
+    contracts ||--|{ contract_suppliers : "members (joint ventures)"
+    contracts ||--o{ notice_contract_links : "linked notices"
+    notices ||--o{ notice_contract_links : "tender / award"
+    notices ||--o{ notice_bidders : "firms named"
+    contract_suppliers }o--|| suppliers : "supplier"
+    notice_bidders }o--|| suppliers : "supplier"
+    suppliers ||--|| supplier_entity_map : "every id mapped"
+    supplier_entity_map }|--|| supplier_entities : "resolved firm"

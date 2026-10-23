@@ -1,0 +1,44 @@
+notice_id,contract_id,match_tier,label_correct,note
+OP00242312,1760928,description,1,
+OP00090863,1630454,description,0,different packages: contract W9 (Saqlawia office) vs notice W08 (Anbar directorate office)
+OP00094704,1671351,description,1,lot 1 of tender 1B.2
+OP00149980,1697225,description,1,
+OP00076028,1675783,description,1,
+OP00214627,1757461,description,1,
+OP00259428,1824356,description,1,
+OP00086465,1852620,description,1,
+OP00148060,1797829,description,1,
+OP00194150,1745890,description,1,re-issue -2 of tender 16/2021
+OP00409860,1888970,description,1,
+OP00360918,1849465,description,1,
+OP00218106,1736121,exact_reference,1,
+OP00075104,1600237,exact_reference,1,
+OP00202368,1756038,exact_reference,1,same STEP activity covering several small check-dam works
+OP00210979,1739346,exact_reference,1,
+OP00277763,1823880,exact_reference,1,
+OP00298144,1814922,exact_reference,1,
+OP00184177,1716193,exact_reference,1,
+OP00403784,1879747,exact_reference,1,
+OP00156562,1722860,exact_reference,1,
+OP00317177,1883692,exact_reference,1,
+OP00149896,1684014,exact_reference,1,lot 2 of the IT equipment tender
+OP00154041,1808785,exact_reference,1,
+OP00210820,1760064,exact_reference,1,same STEP activity covering several locations
+OP00427474,1890125,exact_reference,1,
+OP00335077,1854795,exact_reference,1,
+OP00131934,1848719,reference_variant,1,lot A of PMC-16
+OP00427566,1903516,reference_variant,1,BIS = re-issue
+OP00210456,1738981,reference_variant,1,the notice reference contains a Cyrillic C in CW
+OP00133163,1761001,reference_variant,1,R = re-issue
+OP00164602,1732588,reference_variant,0,uncertain: individual 'jeune accompagnateur' contract vs reforestation technical-assistance notice
+OP00429166,1880418,reference_variant,1,
+OP00354413,1888119,reference_variant,1,lot A of CW-04
+OP00150722,1679997,step_activity_id,1,
+OP00108609,1655796,step_activity_id,1,
+OP00138292,1693875,step_activity_id,1,
+OP00120919,1655067,step_activity_id,1,"RFB vs RFQ suffix, same activity"
+OP00101596,1646136,step_activity_id,1,
+OP00075315,1608809,step_activity_id,1,lot B
+OP00120594,1727166,step_activity_id,1,
+OP00153900,1709250,step_activity_id,1,lot 7 of the medicines tender
+OP00213978,1818224,step_activity_id,1,

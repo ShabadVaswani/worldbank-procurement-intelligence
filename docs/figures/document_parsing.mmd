@@ -1,0 +1,19 @@
+---
+config:
+  layout: elk
+---
+flowchart TD
+    api["Documents API (pdfurl)"]
+    pdf["PDF in volume"]
+    lay["PyMuPDF layout: text lines with font size / bold, ruled tables"]
+    hd["running headers, page numbers, contents lines dropped<br/>headings to section path (level 1 / 2), annex flag"]
+    tb["tables: cells cleaned, quality gate, caption attached,<br/>continued tables merged across page breaks"]
+    el["proc_silver.doc_elements<br/>(heading / text / table, in reading order, with section path and page)"]
+    nc["narrative chunks<br/>(sentences of ONE section)"]
+    tc["table chunks<br/>(whole table, or row groups with the header repeated)"]
+    hdr["each prefixed by a contextual header<br/>project > section > sub-section [> table caption]"]
+    out["proc_silver.doc_chunks_v2<br/>(+ GTE embedding; section_id = parent for parent-child retrieval)"]
+    api --> pdf --> lay --> hd --> tb --> el
+    el --> nc --> hdr
+    el --> tc --> hdr
+    hdr --> out

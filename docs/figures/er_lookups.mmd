@@ -1,0 +1,25 @@
+---
+config:
+  layout: elk
+---
+erDiagram
+    dim_country {
+        string country_code PK
+    }
+    dim_procurement_method {
+        string method_name PK
+    }
+    dim_procurement_category {
+        string category_code PK
+    }
+    dim_project }o--o| dim_country : "country_code"
+    notices }o--o| dim_country : "country_code"
+    contracts }o--o| dim_country : "borrower_country_code"
+    suppliers }o--o| dim_country : "supplier_country_code"
+    supplier_entities }o--o| dim_country : "country_code"
+    contract_suppliers }o--o| dim_country : "supplier_country_code"
+    notice_bidders }o--o| dim_country : "firm_country_code"
+    contracts }o--|| dim_procurement_method : "procurement_method_name"
+    notices }o--o| dim_procurement_method : "procurement_method_name"
+    contracts }o--|| dim_procurement_category : "procurement_category_code"
+    notices }o--o| dim_procurement_category : "procurement_category_code"

@@ -1,0 +1,28 @@
+---
+config:
+  layout: elk
+---
+flowchart TD
+    apis["APIs (awards, notices, documents)"]
+    bronze["bronze"]
+    keys["changed keys"]
+    silver["silver rows of those keys"]
+    kg["KG nodes / edges<br/>(incremental MERGE, section 3)"]
+    stats["timelines, supplier stats<br/>(refresh queue of affected contracts / entities)"]
+    chunks["document chunks<br/>(embed only new or changed chunks, section 6)"]
+    drift["drift checks (section 4)"]
+    chall["challenger trained (p07)"]
+    champ["@champion"]
+    kpis["pilot KPIs + user feedback (section 7)"]
+    backlog["back to the backlog"]
+    apis -->|"daily MERGE (row hash: unchanged rows are not rewritten)"| bronze
+    bronze -->|"Change Data Feed"| keys --> silver
+    silver --> kg
+    silver --> stats
+    silver --> chunks
+    kg --> drift
+    stats --> drift
+    chunks --> drift
+    drift -->|"retrain trigger"| chall
+    chall -->|"gate (section 5)"| champ
+    chall --> kpis --> backlog

@@ -1,0 +1,17 @@
+---
+config:
+  layout: elk
+---
+flowchart TD
+    test["p07 test period<br/>notices 2023-07-01 .. 2024-10-13, 6,624 openly competed contracts with a known duration"]
+    pk["300 new packages<br/>on each notice date, hide the package's own project and everything dated later"]
+    tl["timeline: model (champion recipe, refit at the cutoff)<br/>and peer benchmarks vs actual days"]
+    pr["precedents: similar_past_contracts<br/>relevance by rule (proxy) and by LLM judge"]
+    icr["100 packages from projects with a completion report (ICR)"]
+    ls["lessons: lessons_learned (own project hidden) vs random passages<br/>LLM judge against what the project's own ICR says actually went wrong"]
+    full["30 packages: the full agent<br/>review pack (briefs, cited records, actual outcome; labelled in p15)"]
+    test -->|"stratified sample: region x category, fixed seed,<br/>one lot per notice, one tender per project"| pk
+    pk --> tl
+    pk --> pr
+    pk --> icr --> ls
+    pk --> full

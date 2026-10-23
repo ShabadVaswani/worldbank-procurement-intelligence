@@ -1,0 +1,23 @@
+---
+config:
+  layout: elk
+---
+flowchart LR
+    pkg["package<br/>(dict)"]
+    guard["input guard<br/>(Llama, JSON)"]
+    planner["planner<br/>(LLM, tool calls, at most 6)"]
+    subgraph tools["tools"]
+        t1["similar_past_contracts"]
+        t2["tender_benchmark"]
+        t3["forecast_timeline"]
+        t4["lessons_learned"]
+        t5["supplier_profile"]
+    end
+    rec["records with stable ids"]
+    cov["coverage check<br/>(code adds a core tool the planner skipped)"]
+    writer["writer<br/>(LLM, JSON brief)"]
+    val["validate in code:<br/>ids, numbers, precedents, status"]
+    brief["brief"]
+    pkg --> guard --> planner --> cov --> writer --> val --> brief
+    planner --> tools --> rec
+    rec -->|"the only citable evidence"| val
