@@ -18,13 +18,13 @@ A working prototype of the "AI-Powered Procurement Intelligence Platform" assess
 
 | What | Where |
 |---|---|
-| Technical proposal, organised by the brief's four modules (PDF and Markdown) | [docs/proposal.pdf](docs/proposal.pdf), [docs/proposal.md](docs/proposal.md) |
+| Technical proposal, organised by the brief's four modules (PDF, and Markdown with Mermaid diagrams) | [docs/proposal.pdf](docs/proposal.pdf), [docs/proposal.md](docs/proposal.md) |
 | Presentation deck (5 slides) and speaker notes with likely panel questions | [slides/procurement_intelligence.pptx](slides/procurement_intelligence.pptx), [PDF](slides/procurement_intelligence.pdf), [docs/speaker_notes.md](docs/speaker_notes.md) |
 | Data gaps and how each one is handled | [docs/data_gaps.md](docs/data_gaps.md) |
 | Notebooks as Databricks source / as run, with outputs | `notebooks/`, `executed/` |
 | Evaluation labels: panel votes, tier-3 adjudication decisions with evidence and their log, final labels; the 30-brief review pack | `data/human_review/` ([adjudication_log.md](data/human_review/adjudication_log.md)) |
 | Shared pure-Python code and its tests | `src/proc_intel/`, `tests/` |
-| Diagrams (SVG, generated) and the scripts that build the PDF and deck | `docs/figures/`, `docs/build_docs.py`, `slides/build_deck.py` |
+| Slide diagrams (SVG, generated) and the scripts that build the PDF and deck | `docs/figures/`, `docs/build_pdf.py`, `docs/build_docs.py`, `slides/build_deck.py` |
 | Every notebook diagram as Mermaid source with its pre-rendered image | [docs/diagrams.md](docs/diagrams.md) |
 | Full reasoning behind each notebook's "Key design decisions" table | [docs/decision_log.md](docs/decision_log.md) |
 | Results of each component | sections below: phase 1 results, then one section per component |

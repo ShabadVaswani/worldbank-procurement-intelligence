@@ -54,7 +54,28 @@ How to read this document: sections 2 to 5 follow the brief's four modules. Each
 
 ## 1.3 End-to-end architecture
 
-![End-to-end architecture. Solid boxes are built and run on real data; dashed boxes are designed, not built.](figures/architecture.svg)
+```mermaid
+flowchart TB
+    subgraph data["Data layers"]
+        direction LR
+        N["<b>Not public / not yet ingested</b><br/>amendments, milestones,<br/>CPIA, PPARs, CPFs"]:::designed
+        S["<b>Sources</b><br/>Contract awards: 295,058 rows, FY2020+<br/>Procurement notices: 416,745<br/>Projects API: 3,768 projects<br/>Documents API: PAD, ISR, ICR, ICR Review<br/>WGI, IEG ratings, loan statements"]
+        B["<b>Bronze</b><br/>raw volume, one file per API page<br/>MERGE on key + row hash<br/>change data feed on<br/>layout PDF parser"]
+        SV["<b>Silver</b><br/>keyed relational model<br/>entity resolution: 344,273 ids -> 261,169 firms<br/>notice-contract links: 64,065<br/>ratings evidence: 2,381 ratings<br/>passages + embeddings"]
+        N -.-> S --> B --> SV
+    end
+    subgraph serve["Serving layers"]
+        direction LR
+        G["<b>Gold</b><br/>tender timelines<br/>knowledge graph: 1.03M nodes, 2.28M edges<br/>tender benchmarks: 715 peer groups<br/>open tender scores: 6,005<br/>design flags, early warnings, KPIs"]
+        E["<b>Engines</b><br/>duration + slow-risk model (UC @champion)<br/>procurement agent: guard, tools, writer,<br/>validation in code<br/>evidence resolver<br/>tender + execution checks"]
+        U["<b>Users</b><br/>cited planning brief<br/>benchmarks, risk flags<br/>monitoring, KPIs<br/>user feedback"]
+        G --> E --> U
+    end
+    data --> serve
+    classDef designed stroke-dasharray: 5 5
+```
+
+*Figure: End-to-end architecture. Solid boxes are built and run on real data; dashed boxes are designed, not built. A daily loop (section 5.1) feeds changes from the serving layers back into bronze.*
 
 - **Sources.** World Bank APIs for awards, notices, projects and documents, plus the governance indicators already loaded by my first submission.
 - **Bronze.** Every API page is saved as a file in a Unity Catalog volume, so a restart skips finished pages. Tables are loaded with `MERGE` on a deterministic key and a hash of the business columns. A second run changes 0 rows, and records that disappear from the source are soft-deleted.
@@ -65,7 +86,18 @@ How to read this document: sections 2 to 5 follow the brief's four modules. Each
 
 ## 1.4 The procurement lifecycle and what serves each stage
 
-![Lifecycle stages and the platform capability behind each one.](figures/lifecycle.svg)
+```mermaid
+flowchart LR
+    p1["Stage 1: Planning and strategy<br/>peer benchmarks P10/P50/P90<br/>duration model forecast<br/>similar past contracts<br/>appraisal risk passages<br/><b>built</b>"]
+    p2["Stage 2: Tender design<br/>advertising period vs peers<br/>similar specifications<br/>lessons on spec problems<br/>design checks<br/><b>built on real data (p13)</b>"]
+    p3["Stage 3: Evaluation and award<br/>bidders per notice and roles<br/>supplier profile, co-bidders<br/>resolved firm history<br/>thin-competition signal<br/><b>built</b>"]
+    p4["Stage 4: Execution and monitoring<br/>slow-tender score<br/>open tenders past their P90<br/>newest ISR ratings<br/>early warnings<br/><b>built on real data (p14)</b>"]
+    p5["Stage 5: Completion and learning<br/>ISR vs ICR vs IEG resolver<br/>ICR lessons into the index<br/>change feed refresh<br/>retrain trigger + gate<br/><b>built</b>"]
+    p1 --> p2 --> p3 --> p4 --> p5
+    p5 -. "completion reports, IEG reviews and new contracts flow back into the next package's plan" .-> p1
+```
+
+*Figure: Lifecycle stages and the platform capability behind each one.*
 
 | Stage | Question a task team asks | Capability | Status |
 |---|---|---|---|
@@ -125,9 +157,84 @@ Suppliers are the hardest join. One firm holds many registration ids, one id som
 
 ## 2.3 Entity-relationship schema and knowledge graph
 
-![Silver data model: tables, keys and relationships.](figures/er_model.png)
+```mermaid
+erDiagram
+    dim_country {
+        string country_code PK
+    }
+    dim_project {
+        string project_id PK
+        string country_code FK
+    }
+    contracts {
+        string contract_id PK
+        string project_id FK
+        string borrower_country FK "to dim_country"
+        string method FK
+        string category FK
+        double contract_amount_usd "stored once per contract"
+    }
+    notices {
+        string notice_id PK
+        string project_id FK
+        string country_code FK "to dim_country"
+        string method FK
+        string category FK
+    }
+    contract_suppliers {
+        string contract_id PK, FK
+        string supplier_id PK, FK
+    }
+    notice_contract_links {
+        string notice_id PK, FK
+        string contract_id PK, FK
+        string link_role "tender or award"
+    }
+    notice_bidders {
+        string notice_id PK, FK
+        string supplier_id PK, FK
+        string role "awarded, evaluated, rejected"
+    }
+    suppliers {
+        string supplier_id PK
+        string country_code FK "to dim_country"
+    }
+    supplier_entity_map {
+        string supplier_id PK, FK
+        string supplier_entity_id FK
+    }
+    supplier_entities {
+        string supplier_entity_id PK
+    }
+    dim_country ||--o{ dim_project : "in country"
+    dim_project ||--o{ contracts : "part of"
+    dim_project ||--o{ notices : "for project"
+    contracts ||--|{ contract_suppliers : "members (joint ventures)"
+    contracts ||--o{ notice_contract_links : "linked notices"
+    notices ||--o{ notice_contract_links : "tender / award"
+    notices ||--o{ notice_bidders : "firms named"
+    contract_suppliers }o--|| suppliers : "supplier"
+    notice_bidders }o--|| suppliers : "supplier"
+    suppliers ||--|| supplier_entity_map : "every id mapped"
+    supplier_entity_map }|--|| supplier_entities : "resolved firm"
+```
 
-![Knowledge-graph edges built from those keys (Delta node and edge tables in proc_gold).](figures/kg_edges.png)
+*Figure: Silver data model: tables, keys and relationships.*
+
+```mermaid
+flowchart LR
+    chunk["document_chunk"] -->|"DESCRIBES"| project["project"]
+    project -->|"IN_COUNTRY"| country["country"]
+    notice["notice"] -->|"FOR_PROJECT"| project
+    notice -->|"ADVERTISES (tender)"| contract["contract"]
+    notice -->|"ANNOUNCES (award)"| contract
+    contract -->|"PART_OF"| project
+    contract -->|"AWARDED_TO"| firm["supplier_entity"]
+    firm -->|"BID_ON (role)"| notice
+    firm -->|"REGISTERED_IN"| country
+```
+
+*Figure: Knowledge-graph edges built from those keys (Delta node and edge tables in proc_gold).*
 
 The silver model is relational and keyed. The graph is built from it, so it inherits checked keys.
 
@@ -242,7 +349,29 @@ The question a panel should ask is: had the platform existed when a tender was a
 
 **Design.** A task team enters a package: country, category, method and a description. The agent plans which evidence to gather, calls tools, and writes a short JSON brief in a fixed schema. The brief contains a timeline, a market approach, risks with mitigations, precedents and evidence gaps.
 
-![Agent flow: guard, bounded tool loop, writer, validation in code.](figures/agent.svg)
+```mermaid
+flowchart TD
+    pkg["new package<br/>{country, category, method, description}"]
+    guard["input guard<br/>(Llama 3.3, JSON: in_scope / injection)"]
+    planner["planner LLM<br/>(Qwen 3.5)"]
+    subgraph tools["tools (at most 6 calls)"]
+        t1["similar_past_contracts<br/>TF-IDF + GTE re-rank, 282,890 contracts"]
+        t2["tender_benchmark<br/>peer groups P10/P50/P90"]
+        t3["forecast_timeline<br/>ml.proc_tender_duration@champion"]
+        t4["lessons_learned<br/>appraisal + completion passages"]
+        t5["supplier_profile<br/>knowledge graph"]
+    end
+    writer["writer LLM<br/>(JSON brief)"]
+    validate["validation in code<br/>unknown ids dropped, uncited risks removed,<br/>timeline numbers equal the cited records,<br/>only close precedents kept"]
+    brief["cited brief"]
+    pkg --> guard --> planner
+    planner -->|"tool calls"| tools
+    tools -->|"records with stable ids"| writer
+    planner --> writer
+    writer --> validate --> brief
+```
+
+*Figure: Agent flow: guard, bounded tool loop, writer, validation in code.*
 
 | Tool | What it searches | How |
 |---|---|---|
@@ -301,7 +430,30 @@ The question a panel should ask is: had the platform existed when a tender was a
 
 ## 4.1 Guardrail layers
 
-![Validation layers between a request and a brief.](figures/guardrails.svg)
+```mermaid
+flowchart LR
+    req["request: new<br/>procurement package"]
+    subgraph before["Before writing"]
+        direction TB
+        l1["Layer 1: Input guard (model)<br/>a second model family classifies scope and injection; free text wrapped as data"]
+        l2["Layer 2: Tool arguments (code)<br/>schema check, numeric coercion, country and method resolution"]
+        l3["Layer 3: Evidence only from tools (prompt)<br/>records passed as delimited blocks with ids; tool output is data, not instructions"]
+        l4["Layer 4: Evidence strength (code)<br/>weak precedents, no benchmark or distant lessons -> 'insufficient evidence'"]
+        l1 --> l2 --> l3 --> l4
+    end
+    subgraph after["After writing"]
+        direction TB
+        l5["Layer 5: Citation validation (code)<br/>ids no tool returned are dropped; uncited risks removed; status lowered"]
+        l6["Layer 6: Numeric check (code)<br/>timeline numbers must match the cited benchmark or model forecast"]
+        l7["Layer 7: Conflict flags (code)<br/>disagreeing sources shown side by side with dates, flag and confidence"]
+        l8["Layer 8: Trace and human review (people)<br/>MLflow trace per run; feedback stored with model and prompt version"]
+        l5 --> l6 --> l7 --> l8
+    end
+    brief["brief"]
+    req --> before --> after --> brief
+```
+
+*Figure: Validation layers between a request and a brief.*
 
 | Layer | What it does | Where | Measured |
 |---|---|---|---|
@@ -354,7 +506,34 @@ The design idea is that the model is never the last check. Layers 2, 5 and 6 are
 
 ## 5.1 The closed loop
 
-![Continuous-learning loop: from source changes to models, index and KPIs.](figures/learning_loop.svg)
+```mermaid
+flowchart LR
+    subgraph ingest["Step 1: ingest changes"]
+        direction TB
+        apis["APIs (awards, notices, documents)"]
+        bronze["bronze<br/>daily MERGE; row hash keeps<br/>unchanged rows untouched"]
+        keys["changed keys<br/>(Change Data Feed)"]
+        silver["silver rows of those keys"]
+        apis --> bronze --> keys --> silver
+    end
+    subgraph refresh["Step 2: refresh changes"]
+        direction LR
+        kg["KG nodes / edges<br/>(incremental MERGE)"]
+        stats["timelines, supplier stats<br/>(affected contracts / entities)"]
+        chunks["document chunks<br/>(embed only new or changed)"]
+    end
+    subgraph learn["Step 3: learn and measure"]
+        direction TB
+        drift["drift checks (PSI, KS)"]
+        chall["challenger trained<br/>(p07 recipe)"]
+        champ["champion / challenger<br/>gate -> @champion"]
+        kpis["pilot KPIs + user feedback<br/>-> back to the backlog"]
+        drift -->|"retrain trigger"| chall --> champ --> kpis
+    end
+    ingest --> refresh --> learn
+```
+
+*Figure: Continuous-learning loop: from source changes to models, index and KPIs.*
 
 1. A daily job loads awards and notices with `MERGE`. Unchanged rows are not rewritten, so the Change Data Feed holds only real changes.
 2. The changed keys flow downstream. The graph neighbourhood of changed notices is updated with one `MERGE`, so readers never see a half-applied state. Affected timelines and supplier statistics go to a refresh queue.
