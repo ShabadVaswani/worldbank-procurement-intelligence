@@ -1,6 +1,10 @@
 ---
 config:
   layout: elk
+  htmlLabels: false
+  flowchart:
+    htmlLabels: false
+    wrappingWidth: 600
 ---
 flowchart TD
     api["Documents API (pdfurl)"]
@@ -11,7 +15,7 @@ flowchart TD
     el["proc_silver.doc_elements<br/>(heading / text / table, in reading order, with section path and page)"]
     nc["narrative chunks<br/>(sentences of ONE section)"]
     tc["table chunks<br/>(whole table, or row groups with the header repeated)"]
-    hdr["each prefixed by a contextual header<br/>project > section > sub-section [> table caption]"]
+    hdr["each prefixed by a contextual header<br/>project / section / sub-section [/ table caption]"]
     out["proc_silver.doc_chunks_v2<br/>(+ GTE embedding; section_id = parent for parent-child retrieval)"]
     api --> pdf --> lay --> hd --> tb --> el
     el --> nc --> hdr
