@@ -1,5 +1,5 @@
 {
-  "_about": "Evaluation packages for the procurement agent (p08). Each 'package' entry was written by hand as a new package description, paraphrasing a real contract (source_contract_id) without copying its text; the source contract's project is held out from retrieval during evaluation, so its sibling lots cannot be trivial matches. Country, method and category are those of the source contract. 'guard' entries are off-topic or injection cases that the input guard should refuse.",
+  "_about": "Evaluation packages for the procurement agent (p08). Each 'package' entry was written by an AI agent during the build as a new package description, paraphrasing a real contract (source_contract_id) without copying its text; the source contract's project is held out from retrieval during evaluation, so its sibling lots cannot be trivial matches. Country, method and category are those of the source contract. 'guard' entries are off-topic or injection cases that the input guard should refuse.",
   "packages": [
     {"id": "e01", "source_contract_id": "1862004", "country": "PH", "category": "CW", "method": "Request for Bids",
      "description": "Rehabilitation and concreting of a 12 km farm-to-market road connecting rural villages in Isabela province"},

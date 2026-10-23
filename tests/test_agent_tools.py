@@ -29,6 +29,7 @@ from proc_intel.agent_tools import (
     resolve_country,
     resolve_method,
     search_text,
+    tool_log_record,
     unsupported_numbers,
     validate_brief,
 )
@@ -181,6 +182,28 @@ def _brief(**over):
          "evidence_gaps": [], "status": "complete"}
     b.update(over)
     return b
+
+
+def test_tool_log_records_are_citable_and_stable():
+    a = tool_log_record("similar_past_contracts", "no contract passed the precedent rule", candidates_checked=30)
+    b = tool_log_record("similar_past_contracts", "no contract passed the precedent rule", candidates_checked=30)
+    assert a == b and is_record_id(a["record_id"]) and a["record_id"].startswith("tool_log:similar_past_contracts-")
+    assert a["type"] == "tool_log" and a["candidates_checked"] == 30
+
+
+def test_validate_brief_checks_ids_cited_in_evidence_gaps():
+    log = tool_log_record("tender_benchmark", "country peer group skipped: 12 contracts (< 20)")
+    recs = {**RECORDS, log["record_id"]: log}
+    b = _brief(evidence_gaps=[f"no country benchmark [{log['record_id']}]", "lessons thin [tool_log:lessons_learned-0000000000]"])
+    clean, rep = validate_brief(b, recs)
+    assert clean["evidence_gaps"] == [f"no country benchmark [{log['record_id']}]", "lessons thin"]
+    assert log["record_id"] in rep["cited_ids"] and "tool_log:lessons_learned-0000000000" in rep["invalid_citations"]
+
+
+def test_validate_brief_cites_the_search_log_in_the_added_no_precedent_gap():
+    log = tool_log_record("similar_past_contracts", "no contract passed the precedent rule", candidates_checked=30)
+    clean, rep = validate_brief(_brief(precedents=[]), {**RECORDS, log["record_id"]: log})
+    assert clean["evidence_gaps"][0] == f"{NO_PRECEDENT_GAP} [{log['record_id']}]" and log["record_id"] in rep["cited_ids"]
 
 
 def test_validate_brief_keeps_a_fully_cited_brief_unchanged():

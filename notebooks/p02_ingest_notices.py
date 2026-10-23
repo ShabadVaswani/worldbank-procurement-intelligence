@@ -1,8 +1,8 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # p02_ingest_notices — procurement notices → `proc_bronze.procurement_notices`
+# MAGIC # p02_ingest_notices: procurement notices → `proc_bronze.procurement_notices`
 # MAGIC
-# MAGIC Source: World Bank **procurement notices** search API (`search.worldbank.org/api/v2/procnotices`): every notice published through STEP since 2005 — invitations for bids, requests for expressions of interest, contract award notices, general procurement notices. About 423k notices.
+# MAGIC Source: World Bank **procurement notices** search API (`search.worldbank.org/api/v2/procnotices`): every notice published through STEP since 2005: invitations for bids, requests for expressions of interest, contract award notices, general procurement notices. About 423k notices.
 # MAGIC
 # MAGIC | Step | Output |
 # MAGIC |---|---|

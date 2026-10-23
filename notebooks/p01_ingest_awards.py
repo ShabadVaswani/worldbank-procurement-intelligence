@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # p01_ingest_awards — contract awards → `proc_bronze.contract_awards`
+# MAGIC # p01_ingest_awards: contract awards → `proc_bronze.contract_awards`
 # MAGIC
 # MAGIC Source: World Bank **Contract Awards in Investment Project Financing** (FinancesOne dataset `DS00005`): every contract signed under an IPF project since FY2020, about 295k rows, refreshed daily.
 # MAGIC
@@ -97,8 +97,8 @@ assert saved_rows == total, "snapshot is incomplete"
 # MAGIC ## 2. Read the pages into a DataFrame with lineage
 # MAGIC
 # MAGIC **What:** reads all page files with an **explicit schema**, explodes the `data` array into rows and adds:
-# MAGIC - `award_row_key` — the deterministic key (Step 2 above);
-# MAGIC - `_row_hash` — change detector over the business columns;
+# MAGIC - `award_row_key`: the deterministic key (Step 2 above);
+# MAGIC - `_row_hash`: change detector over the business columns;
 # MAGIC - lineage: `_source` (dataset id), `_source_file` (the page file), `_ingested_at`, `_snapshot_date`, and `as_of_date` parsed to a date.
 # MAGIC
 # MAGIC **Why:** an explicit schema stops Spark guessing types differently from one snapshot to the next (for example reading `supplier_id` as a number would turn hashed ids into nulls). Lineage columns let anyone trace a bronze row back to the exact file and day it came from.
@@ -169,7 +169,7 @@ print("first MERGE :", first)
 # MAGIC
 # MAGIC **What:** runs the identical `MERGE` again, then counts rows, keys and withdrawn rows.
 # MAGIC
-# MAGIC **Why:** the second `MERGE` must insert 0 and update 0 rows — that is what "idempotent" means in practice. The key checks prove the key really is unique; the snapshot comparison proves bronze holds exactly what the API reported.
+# MAGIC **Why:** the second `MERGE` must insert 0 and update 0 rows: that is what "idempotent" means in practice. The key checks prove the key really is unique; the snapshot comparison proves bronze holds exactly what the API reported.
 
 # COMMAND ----------
 

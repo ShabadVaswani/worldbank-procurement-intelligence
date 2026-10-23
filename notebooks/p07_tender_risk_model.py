@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # p07_tender_risk_model — how long will a tender take, and will it run late?
+# MAGIC # p07_tender_risk_model: how long will a tender take, and will it run late?
 # MAGIC
 # MAGIC Module 2 of the brief (timeline benchmarking and risk scoring). For an openly competed tender, predict the days from the tender notice to the signed contract as a **range** (P10 / P50 / P90), and the probability that it is **slow** for its kind of procurement. Every input is known on the day the notice is published.
 
@@ -15,7 +15,7 @@
 # MAGIC %md
 # MAGIC ### Output tables (the interface for the agent's tools)
 # MAGIC
-# MAGIC `proc_gold.tender_benchmarks` — one row per peer group. Read it with `proc_intel.risk.benchmark_lookup(rows, country, method, category)`, which returns the finest group with at least 30 contracts and says which level it used.
+# MAGIC `proc_gold.tender_benchmarks`: one row per peer group. Read it with `proc_intel.risk.benchmark_lookup(rows, country, method, category)`, which returns the finest group with at least 30 contracts and says which level it used.
 # MAGIC
 # MAGIC | Column | Type | Meaning |
 # MAGIC |---|---|---|
@@ -29,7 +29,7 @@
 # MAGIC | `window_start`, `window_end` | date | notice dates covered |
 # MAGIC | `built_at` | timestamp | build time |
 # MAGIC
-# MAGIC `proc_gold.open_tender_scores` — one row per open tender notice (published in the last 730 days, openly competed method, no contract linked yet).
+# MAGIC `proc_gold.open_tender_scores`: one row per open tender notice (published in the last 730 days, openly competed method, no contract linked yet).
 # MAGIC
 # MAGIC | Column | Type | Meaning |
 # MAGIC |---|---|---|
@@ -309,7 +309,7 @@ display(data[NUMERIC].describe().T.round(2).reset_index())
 # MAGIC - target `y` = notice -> signing days capped at 730 (1.5% of the cohort took longer);
 # MAGIC - train = notices before 2023-07-01, test = notices 2023-07-01 .. 2024-10-13 (the newest fully observable ones);
 # MAGIC - **slow** = `y` above the P75 of its method x category in the training years (category P75 when the group has fewer than 30 contracts). The threshold is fixed on training data, so the test base rate can drift;
-# MAGIC - baselines: the global training quantiles, and the **peer-group** quantiles (country x method x category, falling back to region, method x category, category; at least 30 contracts) — the benchmark a procurement analyst would look up today.
+# MAGIC - baselines: the global training quantiles, and the **peer-group** quantiles (country x method x category, falling back to region, method x category, category; at least 30 contracts), the benchmark a procurement analyst would look up today.
 # MAGIC
 # MAGIC **Why:** a planner's question is relative ("slow for an RFB works contract?"), so slowness is defined against the peer group, not in absolute days. The peer-group table is the baseline a model has to beat.
 

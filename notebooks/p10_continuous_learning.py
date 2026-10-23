@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # p10_continuous_learning — incremental updates, refresh rules and the pilot KPIs
+# MAGIC # p10_continuous_learning: incremental updates, refresh rules and the pilot KPIs
 # MAGIC
 # MAGIC The platform is only useful if new notices, awards, supervision documents and amendments reach the graph, the models and the retrieval index without a full rebuild every day, and if someone can tell when a model has gone stale. This notebook shows the loop on real tables:
 

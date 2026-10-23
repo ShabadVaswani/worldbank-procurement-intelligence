@@ -1,0 +1,15 @@
+---
+config:
+  layout: elk
+  htmlLabels: false
+  flowchart:
+    htmlLabels: false
+    wrappingWidth: 600
+---
+flowchart TD
+    test["p11 test period<br/>notices from 2023-07-01, openly competed, with a measured duration"]
+    cand["candidates<br/>minus every contract, tender notice and project of p11's 300-package sample<br/>(the 30 review packages are inside it), minus packages without a usable notice description"]
+    pick["pick_holdout: 10 slots cycling CW, GO, CS, NC, fixed hash order (seed 11)<br/>prefer a new region, then a new region x category, then a new method<br/>one package per notice and per project"]
+    replay["replay exactly as p11 / p16<br/>tools as of the notice date, own project held out, cutoff benchmarks and cutoff model A<br/>writer (thinking on), validate_brief, factcheck_brief"]
+    score["p16's scoring<br/>timeline range vs actual, relevance judge, groundedness judge, fact-check counts"]
+    test --> cand --> pick --> replay --> score

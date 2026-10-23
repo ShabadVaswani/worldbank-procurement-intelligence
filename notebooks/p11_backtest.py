@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # p11_backtest — replaying history: would the system have helped on real tenders?
+# MAGIC # p11_backtest: replaying history (would the system have helped on real tenders?)
 # MAGIC
 # MAGIC Before a pilot, a team would ask one question of this platform: *if it had existed when these tenders were launched, would its timeline, precedents and lessons have been right?* This notebook answers it by **replaying real, already-finished tenders** as if each were a new package on its notice date, and comparing what the system would have said with what actually happened.
 
@@ -866,7 +866,7 @@ def contract_side(cid):
 for name, opts in PROXY_VARIANTS.items():
     labels[name] = [proxy_relevant(contract_side(s), contract_side(c), **opts)
                     # the proxy compares the contract a p08 package was written from with the candidate, the same pair
-                    # the hand label judged
+                    # the agent reference label judged
                     for s, c in zip(labels["source_contract_id"], labels["contract_id"], strict=True)]
 
 
@@ -879,8 +879,8 @@ proxy_vs_human = agreement(labels["proxy"].tolist(), labels["human_relevant"].as
 judged = got.dropna(subset=["judge", "proxy"])
 proxy_vs_judge = {v: agreement(g["proxy"].astype(bool).tolist(), g["judge"].astype(bool).tolist())
                   for v, g in judged.groupby("variant")}
-print(f"proxy vs hand labels (30 pairs): agreement {proxy_vs_human['agreement']:.2f}, kappa {proxy_vs_human['kappa']:.2f}")
-display(confusion(labels["proxy"], labels["human_relevant"].astype(bool), "proxy", "hand label"))
+print(f"proxy vs agent reference labels (30 pairs): agreement {proxy_vs_human['agreement']:.2f}, kappa {proxy_vs_human['kappa']:.2f}")
+display(confusion(labels["proxy"], labels["human_relevant"].astype(bool), "proxy", "agent reference label"))
 for v, a in proxy_vs_judge.items():
     print(f"proxy vs judge, {v} ({a['n']} precedents): agreement {a['agreement']:.2f}, kappa {a['kappa']:.2f}")
 display(confusion(judged["proxy"].astype(bool), judged["judge"].astype(bool), "proxy", "judge"))
@@ -899,14 +899,14 @@ for name in PROXY_VARIANTS:
         add_result("precedents", name, "agreement_with_hand_labels", h["agreement"], "hand_labels_p08", n=h["n"])
         add_result("precedents", name, "kappa_with_judge", j["kappa"], "sample", n=j["n"])
 spot_pairs_file = os.path.join(DATA_DIR, "human_review", "precedent_spotcheck_labels.csv")
-if os.path.exists(spot_pairs_file):      # 23 backtest pairs (hash order) labelled by hand, blind to the judge
+if os.path.exists(spot_pairs_file):      # 23 backtest pairs (hash order) labelled by an AI agent, blind to the judge
     sp = pd.read_csv(spot_pairs_file, dtype={"row_id": str, "contract_id": str}).merge(
         got.drop_duplicates(["row_id", "contract_id"]).astype({"row_id": str, "contract_id": str}), on=["row_id", "contract_id"])
     for who in ("judge", "proxy"):
         a = agreement(sp[who].astype(bool).tolist(), sp["hand_relevant"].astype(bool).tolist())
-        print(f"{who} vs hand labels on {a['n']} backtest pairs: agreement {a['agreement']:.2f}, kappa {a['kappa']:.2f}")
+        print(f"{who} vs agent reference labels on {a['n']} backtest pairs: agreement {a['agreement']:.2f}, kappa {a['kappa']:.2f}")
         add_result("precedents", who, "agreement_with_hand_labels", a["agreement"], "hand_labels_backtest", n=a["n"])
-print(f"share judged relevant: {judged['judge'].astype(float).mean():.2f} | which condition of the rule disagrees with people:")
+print(f"share judged relevant: {judged['judge'].astype(float).mean():.2f} | which condition of the rule disagrees with reference labels:")
 display(pd.DataFrame(conditions).round(3))
 display(labels[labels["proxy"] != labels["human_relevant"].astype(bool)][["eval_id", "contract_id", "human_relevant", "proxy",
                                                                           "proxy_without_sector", "note"]])
@@ -1126,14 +1126,14 @@ if os.path.exists(spot_file):
     chk = spot.assign(row_id=spot["row_id"].astype(str)).merge(hand, on="row_id")
     a4 = agreement(chk["verdict"].tolist(), chk["hand_verdict"].tolist())
     a2 = agreement((chk["verdict"] == "yes").tolist(), (chk["hand_verdict"] == "yes").tolist())
-    print(f"hand check on {a4['n']} cases: 4-way agreement {a4['agreement']:.2f} (kappa {a4['kappa']:.2f}); "
+    print(f"judge vs agent reference labels on {a4['n']} cases: 4-way agreement {a4['agreement']:.2f} (kappa {a4['kappa']:.2f}); "
           f"yes vs not {a2['agreement']:.2f} (kappa {a2['kappa']:.2f})")
     display(pd.crosstab(chk["verdict"], chk["hand_verdict"]))
     add_result("lessons", "judge_vs_hand", "agreement_4way", a4["agreement"], "spot_check", n=a4["n"])
     add_result("lessons", "judge_vs_hand", "kappa_4way", a4["kappa"], "spot_check", n=a4["n"])
     add_result("lessons", "judge_vs_hand", "agreement_yes_vs_not", a2["agreement"], "spot_check", n=a2["n"])
 else:
-    print("no hand labels yet:", spot_file)
+    print("no agent reference labels yet:", spot_file)
 
 # COMMAND ----------
 
@@ -1392,7 +1392,7 @@ none_ = val("precedents", AGENT_VARIANT, "no_precedent", "sample")
 lines.append(("Precedents as the agent shows them", f"{pa_.value:.0%} of listed precedents relevant; {anyj.value:.0%} of packages "
               f"get at least one relevant precedent; {none_.value:.0%} get none listed"))
 ph = val("precedents", "proxy", "agreement_with_hand_labels", "hand_labels_p08")
-lines.append(("Rule-based relevance proxy", f"agrees with hand labels on {ph.value:.0%} of {int(ph.n)} pairs"))
+lines.append(("Rule-based relevance proxy", f"agrees with agent reference labels on {ph.value:.0%} of {int(ph.n)} pairs"))
 ly, lc = val("lessons", "retrieved", "share_yes", "lesson_cases"), val("lessons", "control", "share_yes", "lesson_cases")
 lines.append(("Lessons, 100 projects", f"retrieved lessons named a problem that actually occurred in {ly.value:.0%} of cases "
               f"vs {lc.value:.0%} for random passages (strict judge)"))

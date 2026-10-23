@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # p14_execution_monitoring — early warnings for active projects
+# MAGIC # p14_execution_monitoring: early warnings for active projects
 # MAGIC
 # MAGIC During execution a task team wants to know, before the next supervision mission, which projects are slipping: tenders stuck long past their expected signing, contracts that took far longer than their peers, money not flowing, closing dates being pushed, supervision ratings turning, fiduciary risk going up. This notebook builds those six indicators from open data for every active project with procurement activity, combines them into a rule-based alert with reasons and citations, and checks on closed projects whether the ISR-based signals foreshadowed a poor final evaluation.
 

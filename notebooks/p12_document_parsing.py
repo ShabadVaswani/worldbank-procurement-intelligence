@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # p12_document_parsing — structure-aware parsing and chunking of long project reports
+# MAGIC # p12_document_parsing: structure-aware parsing and chunking of long project reports
 # MAGIC
 # MAGIC Project Appraisal Documents (PADs) and completion reports run to 60-140 pages: a datasheet, numbered narrative sections, a results framework, and annexes full of tables (costs, procurement thresholds, procurement packages, risk matrices). The document chunks reused from the outcome project were cut from the **plain-text rendering** by sentence packing, and chunks that looked like tables were filtered out. This notebook parses the **PDF layout** of 10 real PADs instead, keeps headings, annexes and tables as structure, and measures what the plain-text chunks lost on the same documents.
 
@@ -420,7 +420,7 @@ print(f"tables with testable rows: {per_table.size}; {per_table.value_counts().t
 # MAGIC %md
 # MAGIC ## 6. Embeddings and a retrieval test on table facts
 # MAGIC
-# MAGIC **What:** the new chunks' `embed_text` (contextual header + text) are embedded with GTE-large (the model of the old chunks), paced at 10 texts per second. Then 12 questions written by hand from facts that sit **in tables** of these PADs (thresholds, costs, allocations, ratios, statuses), each with the exact answer string, are embedded and searched with cosine similarity
+# MAGIC **What:** the new chunks' `embed_text` (contextual header + text) are embedded with GTE-large (the model of the old chunks), paced at 10 texts per second. Then 12 questions written for this test by an AI agent from facts that sit **in tables** of these PADs (thresholds, costs, allocations, ratios, statuses), each with the exact answer string, are embedded and searched with cosine similarity
 # MAGIC - within the right document (as the agent filters by project), and
 # MAGIC - across all 10 documents,
 # MAGIC
@@ -479,7 +479,7 @@ print(f"embedded {len(newc)} new chunks in {time.time() - t0:.0f} s ({USAGE['emb
 
 # COMMAND ----------
 
-# written by hand from facts that sit in tables of these PADs; the third value is the string a correct chunk must
+# written for this test by an AI agent from facts that sit in tables of these PADs; the third value is the string a correct chunk must
 # contain
 QUESTIONS = [
     ("31084172", "What is the prior review threshold for works contracts in the DRC Multisectoral Nutrition and Health Project?", "5,000,000"),

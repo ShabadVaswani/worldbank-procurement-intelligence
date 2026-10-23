@@ -19,6 +19,7 @@ I did not want to propose an architecture I had not tried. Every module below ha
 | Tender duration model | error 76 days vs 88 for the peer-group lookup on 6,624 test tenders; P10-P90 interval covers 80.7% of them |
 | Cited procurement agent | 82% of cited precedents relevant; 19 of 20 briefs judged grounded; code drops any citation a tool did not return |
 | Backtest: 300 real tenders replayed as of their notice date | timeline error 87 days vs 100 for the peer lookup; retrieved lessons named a problem that really happened in 38% of cases vs 8% for random passages |
+| Code fact-check of the facts in each brief | briefs with an unsupported concrete claim fell from 5 of 30 to 2 of 30; 1 of 10 on new holdout briefs not used for tuning (three-tier labels) |
 | Tender design checks | 672 of 1,939 international tenders advertised below the 30-business-day minimum drew 4.9 bidders vs 5.6, and a single bidder 28.5% of the time vs 20.3% |
 | Execution early warnings | 1,340 active projects scored: 73 red, 238 amber, each alert with its reasons and cited records |
 | Conflicting evidence | 35 of 68 projects that IEG rated unsatisfactory still had a satisfactory last ISR; a written resolution policy decides which source answers which question |
@@ -50,7 +51,7 @@ How to read this document: sections 2 to 5 follow the brief's four modules. Each
 - **Measure before trusting.** Each step has an acceptance check on real data: a labelled sample (method in 1.5), a holdout window, or an equality proof. The numbers in this document come from those checks.
 - **A consistent scope over a longer one.** Older contract-award data (FY2001–2016) covers only major, prior-reviewed contracts and leaves a FY2017–2019 gap, so the project uses the complete FY2020+ series rather than mixing two different populations.
 - **Leakage and truncation are design inputs.** The awards feed starts in FY2020, so old tenders look slow and new ones look fast. The models are trained only on cohorts that can be fully observed (section 3.1).
-- **Small pure functions, tested.** The logic shared by notebooks lives in `src/proc_intel` with 323 unit tests, run in CI with a linter on every push.
+- **Small pure functions, tested.** The logic shared by notebooks lives in `src/proc_intel` with 371 unit tests, run in CI with a linter on every push.
 
 ## 1.3 End-to-end architecture
 
@@ -123,6 +124,7 @@ The headline labelled results (supplier pairs and the 30-brief review pack) need
 
 - **Why this design.** Every item gets the same rubric, so labels are consistent. Judges from different families are calibrated against each other: where all three agree the label stands (Fleiss' kappa 0.86 on pairs), and only real disagreements get the deeper look, 24 of 220 fields. Every escalated decision carries written evidence a reviewer can check.
 - **What the adjudicator changed.** Of 24 escalated items, it overturned 7 of the 22 panel majorities, confirmed 15, and settled the 2 with no majority. Checking disputed claims against award-notice firm counts and project ids, it confirmed 2 real errors in the agent's briefs from the data: a precedent wrongly described as "same project" (review-pack brief r06) and an overstated firm-count range (brief r10).
+- **Later rounds.** The same escalation labelled the briefs written again after the fact-check and 10 holdout briefs (3.2). For them the briefs rubric treats mitigations as advice, checks evidence gaps against the cited records, and shows the judges each cited record's facts line. 9 fields on 9 briefs and 6 fields on 5 briefs were escalated. In one brief (r30) the adjudicator found a wrong count that the panel had passed unanimously; because the adjudicator normally decides only escalated items, it was counted as unsupported only after the author approved it.
 - **Limits.** The adjudicator is an AI agent, and the rubrics were sharpened after seeing the judges' answers on these items. Independent validation by procurement specialists is part of the pilot plan (5.2).
 - Some smaller checks (30 precedent-relevance labels for the agent, 23 precedent pairs and 15 lesson cases in the backtest, and the link audits) use reference labels made by an AI agent. They are called agent reference labels below.
 
@@ -343,7 +345,19 @@ The question that matters is: had the platform existed when a tender was adverti
 - The model beats the peer table overall but not for consulting services (134 vs 127 days). For those, the brief should lead with the peer group.
 - 19% of packages get no precedent at all, and 47% of non-consulting-services packages. Real notice texts are terse ("Concrete poles"), and later contracts are hidden.
 - A rule-based relevance proxy (same category, method family and sector) did not work: it agreed with the 30 agent reference labels on 16 of 30 pairs (kappa 0.21). Comparable goods are bought by projects in other sectors and with other methods, and metadata cannot see what was bought. Relevance needs a judge or a person.
-- **Review pack.** 30 full briefs run as of the notice date, with the actual outcome next to each: 22 complete and 8 partial; the actual duration fell inside the cited range in 20 of 30. On the final three-tier labels, 22 briefs list precedents (3.3 relevant on average, 90% of those listed) and 8 list none; there are 3.4 relevant risks per brief; and 5 of 30 (17%) contain an unsupported claim. The single LLM judge used in the backtest had flagged 9: the adjudicator cleared claims such as "20 firms participated" against the award notices' firm counts, and confirmed two real errors, a precedent described as "same project" that belongs to another project (r06), and "recent similar contracts in the same project attracted between 2 and 6 bidding firms" where the same-project contracts had 2 and 5 (r10). One brief cites a supplier's contract signed after the notice, because the supplier profile reads the whole graph, not an as-of view. These are the failure modes the pilot's human review has to catch.
+- **Review pack.** 30 full briefs run as of the notice date, with the actual outcome next to each: 22 complete and 8 partial; the actual duration fell inside the cited range in 20 of 30. On the final three-tier labels, 22 briefs list precedents (3.3 relevant on average, 90% of those listed) and 8 list none; there are 3.4 relevant risks per brief; and 5 of 30 (17%) contained an unsupported claim in this first version of the brief writer. The single LLM judge used in the backtest had flagged 9: the adjudicator cleared claims such as "20 firms participated" against the award notices' firm counts, and confirmed two real errors, a precedent described as "same project" that belongs to another project (r06), and "recent similar contracts in the same project attracted between 2 and 6 bidding firms" where the same-project contracts had 2 and 5 (r10). One brief cites a supplier's contract signed after the notice, because the supplier profile reads the whole graph, not an as-of view. These are the failure modes the pilot's human review has to catch.
+- **After the fact-check.** The errors were small factual embellishments next to real citations, so the fix is in code and data rather than another judge (4.1, layer 6). Contract records now carry a facts line (project, country, region, method, signing year, firms in the award notice); the writer may state counts, methods and relations only from those fields; and a code fact-check reads every cited sentence against the cited records' facts and fixes or removes what they do not support. The same 30 packages were replayed exactly as before (p16), and 10 new holdout packages (p17) were drawn from the same test period with no contract, tender notice or project shared with the 300 backtest packages; nothing was tuned on them. All are labelled by the same three-tier escalation (1.5).
+
+| Measure, final three-tier labels | First version | First version, re-judged with the same rubric and facts lines | After the fact-check | Holdout, 10 new briefs |
+|---|---|---|---|---|
+| Actual duration inside the cited range | 20 of 30 | 20 of 30 | 20 of 30 | 7 of 10 |
+| Share of listed precedents relevant | 90% | 88% | 88% | 93% |
+| Relevant risks per brief | 3.4 | 3.3 | 3.6 | 3.4 |
+| Briefs with an unsupported concrete claim | 5 of 30 | 5 of 30 | 2 of 30 | 1 of 10 |
+
+- Briefs with an unsupported concrete claim fell from 5 of 30 to 2 of 30, and the holdout has 1 of 10. The like-for-like baseline, the first briefs re-judged with the same rubric and facts lines, is also 5 of 30, but on different briefs: once the judges could see each record's region and method, they found region and method claims that the first labelling had missed. Duration coverage, precedent relevance and risk relevance held.
+- The writer also ran with the model's reasoning mode on, so the improvement is the combined effect of the facts lines, the writer rule, reasoning and the check. On the final pack the check changed none of the 30 briefs: the writer no longer made the errors it looks for, and the check stays as a safety net. On the holdout it removed one true sentence, a claim that precedents used "QCBS or Consultant Qualification Selection", because it tests each method on its own.
+- What is left: one brief calls a Request for Proposals package consistent with a precedent that used Request for Bids (r18); one says "4 of 5" contracts used Request for Quotations when all five did (r30); one holdout brief states a detail of a lesson passage that is cut off in the record the judges see (h08). Two decisions (r26 and h07) rest on warehouse data that the cited records do not show; read strictly on the visible records, the counts would be 3 of 30 and 2 of 10. Thirty and ten briefs are small samples, which is why the pilot's larger labelled set matters.
 
 ## 3.3 Agentic retrieval for a new procurement package
 
@@ -462,7 +476,7 @@ flowchart LR
 | 3. Evidence only from tools | records are passed as delimited blocks with ids; prompts say tool output is data, not instructions | writer prompt | |
 | 4. Evidence strength | computed in code; weak evidence gives "insufficient evidence", not a brief; only close precedents are listed, 0 to 5 | `evidence_strength`, precedent rule | 82% of cited precedents relevant |
 | 5. Citation validation | ids that no tool returned are dropped; risks left without a citation are removed; the brief's status is lowered when anything is removed | `validate_brief` | 1 malformed id in 20 briefs, dropped |
-| 6. Numeric check | timeline numbers must equal the cited benchmark or forecast; code computes the difference between them | `validate_brief`, `compare_medians` | enforced in every brief |
+| 6. Numeric check | timeline numbers must equal the cited benchmark or forecast; code computes the difference between them. A fact-check then reads the counts, methods, regions and project ids in each cited sentence against the cited records' facts lines, replaces a wrong count with the verified value and removes any other unsupported claim | `validate_brief`, `compare_medians`, `factcheck_brief` | enforced in every brief; briefs with an unsupported claim 5 of 30 before, 2 of 30 after, 1 of 10 on the holdout (3.2) |
 | 7. Conflict flags | when sources disagree, both are shown with a flag | `resolve_evidence` | section 4.3 |
 | 8. Trace and human review | one MLflow trace per run with every tool call and record; user feedback stored with the model and prompt version | MLflow, `pilot_feedback` | |
 
@@ -498,8 +512,8 @@ The design idea is that the model is never the last check. Layers 2, 5 and 6 are
 
 ## 4.4 Results, limits and next steps
 
-- **Measured.** Citation validity 0.995 before code checks (one malformed id, which code drops), groundedness 19 of 20, guard 3 of 3, parser accuracy 381 of 381 against IEG's dataset. On the 30 replayed briefs of the backtest, 5 contain an unsupported concrete claim on the final three-tier labels (the single backtest judge alone flagged 9); that is the number to drive down in phase 0.
-- **Limits.** Validation checks that a cited record exists and that numbers match. It does not prove that a passage supports a sentence; that is left to the groundedness judge and to human review. The conflict sample covers closed projects only, so the "current status" path has not been tested on many active projects.
+- **Measured.** Citation validity 0.995 before code checks (one malformed id, which code drops), groundedness 19 of 20, guard 3 of 3, parser accuracy 381 of 381 against IEG's dataset. On the 30 replayed briefs of the backtest, 5 contained an unsupported concrete claim on the final three-tier labels in the first version (the single backtest judge alone flagged 9). After the code fact-check and the facts lines, 2 of 30 do, and 1 of 10 on holdout briefs that were not used for tuning (3.2); that is the number to keep driving down in phase 0.
+- **Limits.** Validation checks that a cited record exists and that numbers match, and the fact-check covers counts, methods, regions and project ids. Neither proves that a passage supports a sentence; that is left to the groundedness judge and to human review. The conflict sample covers closed projects only, so the "current status" path has not been tested on many active projects.
 - **Next.** A sentence-level entailment check between each risk and its cited passage, and a review queue where specialists label disputed briefs. The labels become the next evaluation set.
 
 # 5. Module 4: continuous learning and implementation
@@ -567,7 +581,7 @@ KPIs are stored in `proc_gold.pilot_kpis` with their definition, baseline, targe
 | Planning cycle time | median days from first tender notice to signing, open competition, last 12 months | 160 days | 10% lower in pilot units after two quarters |
 | Benchmark error | mean absolute error of the duration forecast on the newest window, from a model refit at the cutoff | 75 to 76 days on the test window | below the peer-median baseline (88) |
 | Retrieval precision@5 | share of top-5 precedents judged relevant | 0.75 on the 20 evaluation packages; 0.66 on 300 real notices | at least 0.70 |
-| Valid citations | share of answers whose every citation resolves and supports the claim | resolves: 1.00 after code checks; supports: 25 of 30 replayed briefs (final three-tier labels) | at least 0.95 |
+| Valid citations | share of answers whose every citation resolves and supports the claim | resolves: 1.00 after code checks; supports: 28 of 30 replayed briefs after the fact-check (25 of 30 before) and 9 of 10 holdout briefs (final three-tier labels) | at least 0.95 |
 | Re-tender rate, proxy | contracts with two or more tender notices 30+ days apart | 1.25%, a lower bound | 20% lower in pilot units |
 | Evidence conflicts surfaced | share of conflicts shown with both sources | 28.8% of sampled projects have one | 100% surfaced |
 | Data freshness | monitored tables within SLA, bronze 24 h, gold 30 h | 1.0 | at least 0.95 of days |
@@ -606,7 +620,7 @@ What costs money is embedding and LLM calls, not storage. The design keeps both 
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| Users trust a confident brief that is wrong | medium | deterministic citation and number checks; conflict flags; "insufficient evidence" instead of guessing; specialists decide in phase 1 |
+| Users trust a confident brief that is wrong | medium | deterministic citation and number checks; a code fact-check of counts, methods and relations; conflict flags; "insufficient evidence" instead of guessing; specialists decide in phase 1 |
 | Source APIs change format or limits, as the notices API did | high | page files kept in volumes; completeness checks against API totals; freshness alerts |
 | Evaluation leaks because a deployed model was refit on the test period | high, already seen | backtests always refit at the cutoff; in-sample scores shown only as a labelled contrast |
 | Truncated or censored history biases models | high, already seen | observable training windows, survival view for open tenders, drift windows by signing date |
@@ -634,7 +648,7 @@ What costs money is embedding and LLM calls, not storage. The design keeps both 
 | Agentic RAG for a new package | p08, `proc_rag_core` | `agent_eval_results`, `run_agent()`; `src/proc_intel/agent_tools.py`, `forecast.py` |
 | Tender design cross-check | p13 | `tender_requirements`, `tender_design_peers`, `tender_design_flags`; `src/proc_intel/tender_checks.py` |
 | Execution early warnings | p07, p14 | `open_tender_scores`, `loan_statements`, `monitoring_isr_documents`, `early_warnings`; `src/proc_intel/monitoring.py` |
-| Validation layers against hallucination | p08, `proc_rag_core` | `validate_brief`, `input_guard`, MLflow traces |
+| Validation layers against hallucination | p08, p16, p17, `proc_rag_core` | `validate_brief`, `input_guard`, MLflow traces; `src/proc_intel/factcheck.py`; the fact-checked and holdout review briefs and their labels in `data/human_review/` |
 | Conflicting evidence, ICR vs ISR | p09 | `project_ratings_evidence`, `project_evidence_resolution`; `src/proc_intel/evidence.py` |
 | Closed feedback loop | p10, `databricks.yml` | Change Data Feed, `pipeline_checkpoints`, `drift_reports`; `src/proc_intel/freshness.py` |
 | Phased pilot and KPIs | p10 | `pilot_kpis`, `pilot_feedback` |

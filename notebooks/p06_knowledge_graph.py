@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # p06_knowledge_graph — the procurement knowledge graph as Delta node and edge tables
+# MAGIC # p06_knowledge_graph: the procurement knowledge graph as Delta node and edge tables
 # MAGIC
 # MAGIC Connects the structured procurement model to the outcome project's documents and risk scores in one typed graph:
 
@@ -82,7 +82,7 @@ def edge(df: DataFrame, src_type: str, src_key: str, edge_type: str, dst_type: s
 # MAGIC
 # MAGIC **What:** one DataFrame per node type with its display name and key properties, unioned into `kg_nodes`.
 # MAGIC
-# MAGIC **Why:** projects carry the outcome-model risk band, contracts their method/category/amount, supplier entities their activity, chunks their document type and section — the attributes the demo questions filter on.
+# MAGIC **Why:** projects carry the outcome-model risk band, contracts their method/category/amount, supplier entities their activity, chunks their document type and section. These are the attributes the demo questions filter on.
 
 # COMMAND ----------
 
@@ -198,7 +198,7 @@ display(dq_report([
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 4. Question 1 — suppliers of civil works in high-risk projects, and their other contracts
+# MAGIC ## 4. Question 1: suppliers of civil works in high-risk projects, and their other contracts
 # MAGIC
 # MAGIC **What:** path `supplier_entity <-AWARDED_TO- contract -PART_OF-> project` where the project is flagged **High** risk by the outcome model and the contract is civil works; then, for each such supplier, all its other contracts and projects.
 # MAGIC
@@ -266,7 +266,7 @@ except Exception as exc:  # the JVM package is not on every runtime
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. Question 2 — a new road tender in Kenya: similar past contracts and what the project documents say
+# MAGIC ## 5. Question 2: a new road tender in Kenya: similar past contracts and what the project documents say
 # MAGIC
 # MAGIC **What:** past civil-works contracts in Kenya whose description mentions roads, with their project; then, for those projects that have documents in the outcome project's index, the chunks that mention procurement, contractors, bidding, delays or implementation arrangements most often (`contract <-` `-PART_OF-> project <-DESCRIBES- document_chunk`).
 # MAGIC
@@ -308,7 +308,7 @@ display(evidence.withColumn("rn", F.row_number().over(Window.partitionBy("projec
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 6. Question 3 — who keeps bidding against whom?
+# MAGIC ## 6. Question 3: who keeps bidding against whom?
 # MAGIC
 # MAGIC **What:** pairs of supplier entities named together in many award notices (`supplier -BID_ON-> notice <-BID_ON- supplier`), with how often each of them won.
 # MAGIC
@@ -338,7 +338,7 @@ display(q3.orderBy(F.desc("shared_notices")).select("name_a", "name_b", "country
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 7. Question 4 — supplier entities winning across many borrower countries
+# MAGIC ## 7. Question 4: supplier entities winning across many borrower countries
 # MAGIC
 # MAGIC **What:** `supplier_entity <-AWARDED_TO- contract -PART_OF-> project -IN_COUNTRY-> country`, counting distinct borrower countries per supplier entity.
 # MAGIC

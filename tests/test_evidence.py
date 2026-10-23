@@ -2,7 +2,7 @@ import pytest
 
 from proc_intel.evidence import disconnect, normalise_rating, parse_icrr_ratings, parse_isr_ratings, resolve_evidence
 
-# Hand-made snippets that copy the fixed-width layouts of the documents' .txt renderings.
+# Snippets written for these tests that copy the fixed-width layouts of the documents' .txt renderings.
 ISR_TEXT = """
  EASTERN AND SOUTHERN AFRICA | Congo | Urban Global Practice | FY 2017 | Seq No: 12 | ARCHIVED on 12-Jan-2023 | ISR54772 |
 

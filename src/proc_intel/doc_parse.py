@@ -1,7 +1,7 @@
 """Structure-aware parsing and chunking of long project documents (PADs, ICRs).
 
 Pure Python, no PDF library: the notebook (p12) reads the PDF with PyMuPDF and passes plain lines, spans and
-table cell grids to these functions, so the rules can be tested on hand-made inputs.
+table cell grids to these functions, so the rules can be tested on small constructed inputs.
 
 Element  = one heading, paragraph line group or table of a document, in reading order.
 Chunk    = what is embedded: a narrative chunk (sentences of one section) or a table chunk (a whole small table,

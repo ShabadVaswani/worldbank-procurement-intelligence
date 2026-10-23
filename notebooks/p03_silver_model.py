@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # p03_silver_model — the procurement data model (`proc_silver`)
+# MAGIC # p03_silver_model: the procurement data model (`proc_silver`)
 # MAGIC
 # MAGIC Turns the two raw feeds into a small, keyed, documented model. Every table states its **grain** (what one row is) and its **primary key**; relationships are declared as Unity Catalog foreign keys and then *counted*, because Databricks does not enforce them.
 # MAGIC
@@ -274,7 +274,7 @@ print("contracts:", n_contracts)
 # MAGIC ## 5. `notices` and `notice_bidders`
 # MAGIC
 # MAGIC **What:**
-# MAGIC - `notices`: one row per notice dated 2018-01-01 or later, with typed dates, the mapped country code, method and category, the normalised reference and STEP activity id, and — for Contract Award notices — the award-notification date, contract duration and number of firms named.
+# MAGIC - `notices`: one row per notice dated 2018-01-01 or later, with typed dates, the mapped country code, method and category, the normalised reference and STEP activity id, and (for Contract Award notices) the award-notification date, contract duration and number of firms named.
 # MAGIC - `notice_bidders`: one row per firm named in an award notice, with its role (awarded / evaluated / rejected), name and country as printed.
 # MAGIC
 # MAGIC **Why:** typed dates make the timeline arithmetic in `p05` safe. Empty strings from the API become nulls. `notice_text` stays in bronze (joined by `notice_id` when needed) to keep silver light; the parsing happens once, here.
@@ -584,7 +584,7 @@ print("foreign keys declared:", len(FOREIGN_KEYS))
 # MAGIC
 # MAGIC **What:** one table of explicit counts: primary-key duplicates and nulls, orphans for every foreign key, the "constant within a contract" claim from Step 2, amount sanity, date ranges, and coverage of the mappings (unmapped countries and methods, projects unknown to the outcome project).
 # MAGIC
-# MAGIC **Why:** declared keys are not enforced, so this table is the actual guarantee. `info` rows are facts to know, not failures — for example, regional programmes legitimately have no country code.
+# MAGIC **Why:** declared keys are not enforced, so this table is the actual guarantee. `info` rows are facts to know, not failures. For example, regional programmes legitimately have no country code.
 
 # COMMAND ----------
 

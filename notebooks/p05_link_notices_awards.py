@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # p05_link_notices_awards — from tender notice to signed contract
+# MAGIC # p05_link_notices_awards: from tender notice to signed contract
 # MAGIC
 # MAGIC Links each contract to the notices that advertised it (Invitation for Bids, Request for Expression of Interest, Invitation for Prequalification) and to the Contract Award notice that announced it, then derives the procurement timeline of every contract. The timeline table is the training target for the phase-2 delay and risk model.
 # MAGIC
@@ -38,7 +38,7 @@
 # MAGIC |---|---|---|
 # MAGIC | Both exact tiers kept (project + reference, and STEP activity id); links where the notice is published after signing are stored, flagged, and never used for durations | A notice after signing indicates a reference re-used for a later round, not the tender of this contract | Exact project + reference matches found tender notices for about 61,500 contracts; the STEP id added only about 2,300 more; about 6,000 links had the notice published after signing |
 # MAGIC | The similarity ratio replaced by a structural rule: references must be equal after deleting one block of 1-3 letters (never digits) from the longer one, implemented as an equi-join on generated deletion keys | Ratio >= 0.9 also matched different packages one character apart; the rule needs no pairwise comparison | Lot markers ("17B/W/DNAAS/2018" for tender "17/W/DNAAS/2018") versus false matches ("TCP/CON/QCBS/B1/G" vs ".../B1/D", "ENU-02-22" vs "ENU-03-22") |
-# MAGIC | Description matching only for contracts without a STEP id, with >= 0.8 similarity and a clear margin over the second-best notice; the tier is measured separately in the hand audit | Descriptions are the only bridge when the contract reference is the borrower's own number, but they confuse near-identical packages | Even at >= 0.9, wrong-package matches occurred ("Civil Work Package (CWP) 7" vs "CWP 8", "Fish Landing in Brgy. Taruk" vs "Brgy. Tapian"); bridging matches read correctly ("Audit externe des comptes du projet PRAPS-II NE ...") |
+# MAGIC | Description matching only for contracts without a STEP id, with >= 0.8 similarity and a clear margin over the second-best notice; the tier is measured separately in the agent audit | Descriptions are the only bridge when the contract reference is the borrower's own number, but they confuse near-identical packages | Even at >= 0.9, wrong-package matches occurred ("Civil Work Package (CWP) 7" vs "CWP 8", "Fish Landing in Brgy. Taruk" vs "Brgy. Tapian"); bridging matches read correctly ("Audit externe des comptes du projet PRAPS-II NE ...") |
 # MAGIC | An award link is kept when the notice's awarded supplier id is one of the contract's suppliers (confirmed), or when the pair is one-to-one and the notice names no awardee | One reference is shared by all lots and call-offs of a tender | Reference-only matching produced about 980,000 award-notice/contract pairs (section 3); one reference appears on 188 contracts; the confirmed share among one-to-one pairs with a named awardee is the automatic precision check |
 # MAGIC | Coverage reported per competition level; the phase 2 timeline model to be trained on openly competed contracts | Most contracts are never publicly advertised | Request for Quotations, direct selection and individual consultants make up about 80% of contracts |
 # MAGIC
@@ -275,9 +275,9 @@ display(L.groupBy("link_role", "match_tier").agg(F.count("*").alias("links"), F.
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. Hand audit of tender links
+# MAGIC ## 5. Agent audit of tender links
 # MAGIC
-# MAGIC **What:** a reproducible sample per tier (ordered by a hash of the pair) with both descriptions side by side, labelled by hand in `data/tender_link_audit.csv` (1 = this notice advertised this contract, or the tender of which it is a lot). Prints the share correct per tier with a Wilson interval.
+# MAGIC **What:** a reproducible sample per tier (ordered by a hash of the pair) with both descriptions side by side, labelled by an AI agent during the build (agent reference labels) in `data/tender_link_audit.csv` (1 = this notice advertised this contract, or the tender of which it is a lot). Prints the share correct per tier with a Wilson interval.
 # MAGIC
 # MAGIC **Why:** there is no ground truth for tender links; reading pairs is the only direct check, and doing it per tier shows which tiers can be trusted for the timeline.
 

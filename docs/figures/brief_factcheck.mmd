@@ -1,0 +1,15 @@
+---
+config:
+  layout: elk
+  htmlLabels: false
+  flowchart:
+    htmlLabels: false
+    wrappingWidth: 600
+---
+flowchart TD
+    tools["tools, as of the notice date<br/>each contract record carries a facts line:<br/>project | country | region | method | year | firms in award notice (or not recorded)"]
+    writer["writer (Qwen 3.5, thinking on)<br/>sees PACKAGE FACTS and each contract's facts line<br/>rule 10: no count, range or relation that is not in a cited record's fields"]
+    val["validate_brief<br/>citations, timeline numbers, precedents"]
+    fc["factcheck_brief<br/>counts, ranges, days, %, project ids, methods,<br/>same project / country / region, against the cited records"]
+    brief["brief"]
+    tools --> writer --> val --> fc --> brief

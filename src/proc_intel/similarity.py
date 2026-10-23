@@ -152,7 +152,7 @@ def connected_components(n: int, edges: Iterable[tuple[int, int]]) -> list[int]:
 
 def precision_recall(labels: Sequence[bool], predicted: Sequence[bool],
                      weights: Sequence[float] | None = None) -> dict[str, float]:
-    """Precision, recall and F1 of `predicted` against hand `labels` (True = same entity).
+    """Precision, recall and F1 of `predicted` against reference `labels` (True = same entity).
 
     With `weights`, each pair counts as that many pairs: used when the labelled sample was drawn
     stratified by score band, so each pair stands for (pairs in its band / pairs sampled from it).

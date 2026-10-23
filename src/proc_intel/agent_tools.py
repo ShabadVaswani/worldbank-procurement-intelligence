@@ -31,8 +31,10 @@ from sklearn.pipeline import make_pipeline
 # Record ids
 # ---------------------------------------------------------------------------------------------------------
 
-RECORD_TYPES = ("contract", "supplier_entity", "document_chunk", "lesson_chunk", "benchmark", "forecast")
-_ID_RE = re.compile(r"^(contract|supplier_entity|document_chunk|lesson_chunk|benchmark|forecast):[A-Za-z0-9_.\-|]+$")
+RECORD_TYPES = ("contract", "supplier_entity", "document_chunk", "lesson_chunk", "benchmark", "forecast", "tool_log")
+_ID_RE = re.compile(r"^(contract|supplier_entity|document_chunk|lesson_chunk|benchmark|forecast|tool_log):[A-Za-z0-9_.\-|]+$")
+# a record id written inside free text (evidence gaps cite the tool_log record that states an absence)
+_INLINE_ID = re.compile(r"\b(?:contract|supplier_entity|document_chunk|lesson_chunk|benchmark|forecast|tool_log):[A-Za-z0-9_.\-|]+")
 NO_PRECEDENT_GAP = "no close precedent found"
 
 
@@ -44,6 +46,14 @@ def record_id(kind: str, key: Any) -> str:
 
 def is_record_id(text: str) -> bool:
     return bool(_ID_RE.match(text or ""))
+
+
+def tool_log_record(tool: str, label: str, **facts: Any) -> dict:
+    """A citable record of what a tool did NOT find ('no contract passed the precedent rule, 30 candidates checked',
+    'peer group skipped: 12 contracts < 20'), so an evidence gap can cite its source like any other statement."""
+    # the id hashes the tool, label and facts, so the same absence gets the same id on every run
+    key = hashlib.sha1(json.dumps([tool, label, facts], sort_keys=True, default=str).encode()).hexdigest()[:10]
+    return {"record_id": record_id("tool_log", f"{tool}-{key}"), "type": "tool_log", "tool": tool, "label": label, **facts}
 
 
 def benchmark_key(level: str, country: str | None, method: str | None, category: str | None) -> str:
@@ -522,14 +532,33 @@ def validate_brief(brief: dict, records: dict[str, dict], package_text: str = ""
     if not precedents:
         flags.append("no_close_precedent")
         if not any(NO_PRECEDENT_GAP in str(g).lower() for g in b["evidence_gaps"]):
-            b["evidence_gaps"].insert(0, NO_PRECEDENT_GAP)
+            # cite the similar_past_contracts tool_log record so the added gap has a source too
+            log = next((r["record_id"] for r in records.values()
+                        if r.get("type") == "tool_log" and r.get("tool") == "similar_past_contracts"), None)
+            b["evidence_gaps"].insert(0, NO_PRECEDENT_GAP + (f" [{log}]" if log else ""))
+
+    # ids written inside gap text are checked like any citation: known ids count as cited, unknown ones are
+    # removed from the text and counted as invalid
+    gap_ids: list[str] = []
+    gaps = []
+    for g in b["evidence_gaps"]:
+        g = str(g)
+        for rid in _INLINE_ID.findall(g):
+            if rid in known:
+                gap_ids.append(rid)
+            else:
+                invalid.append(rid)
+                g = g.replace(rid, "")
+        # tidy the brackets a removed id leaves behind ("[, x]" -> "[x]", "[]" -> "")
+        gaps.append(re.sub(r"\s*\[[\s,;]*\]", "", re.sub(r"\[\s*[,;]\s*", "[", g)).strip())
+    b["evidence_gaps"] = [g for g in gaps if g]
 
     if invalid:
         flags.append("invalid_citation")
     if b["status"] == "complete" and (_PROBLEM_FLAGS & set(flags) or not risks):
         b["status"] = "partial"
     cited = sorted(set(tl["citations"] + ma["citations"] + [c for r in risks for c in r["citations"]]
-                       + [p["record_id"] for p in precedents]))
+                       + [p["record_id"] for p in precedents] + gap_ids))
     # validity = valid distinct ids / (valid distinct ids + invalid mentions)
     n_cited_raw = len(cited) + len(invalid)
     report = {"invalid_citations": sorted(set(invalid)), "flags": sorted(set(flags)), "cited_ids": cited,

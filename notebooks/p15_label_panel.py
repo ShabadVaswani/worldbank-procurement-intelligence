@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # p15_label_panel — evaluation labels from a three-tier escalation: code checks, a panel of three model judges, an AI adjudicator for disagreements
+# MAGIC # p15_label_panel: evaluation labels from a three-tier escalation (code checks, a panel of three model judges, an AI adjudicator for disagreements)
 # MAGIC
 # MAGIC Two evaluations in this project rest on labelled items: the 100 supplier-name pairs that chose the entity-resolution threshold in p04, and the 30 replayed agent briefs of the p11 review pack. The pair labels were first written by the AI agent that built the pipeline, and the briefs were scored by single judges. This notebook replaces both with the project's labelling method, a three-tier escalation that can be audited: (1) what code can decide is computed, such as the timeline check from the numbers the judges read; (2) three judges from different model families label every item independently with one written rubric, and where they agree their answer is the label; (3) where they disagree, the item escalates to an AI adjudicator agent with access to the warehouse tables and the web, which records written evidence for each decision (section 10). `adjudicate.html` shows only the escalated items (blind first, the judges' votes on request) and remains usable by a human reviewer; independent validation by procurement specialists is part of the pilot plan.
 
@@ -56,9 +56,9 @@ dbutils.library.restartPython()
 # MAGIC %md
 # MAGIC ## Settings
 # MAGIC
-# MAGIC **What:** the two panels, the label files, the cache of raw judge answers and the output table.
+# MAGIC **What:** the two panels, the label files, the cache of raw judge answers and the output table. The briefs file is a parameter: `review_briefs.csv` (the default) labels pairs and briefs into `proc_gold.label_panel` and `panel_labels.csv`; a re-measured review pack such as `review_briefs_v2.csv` is labelled by the same panel B with the same rubric into outputs with the same suffix (`proc_gold.label_panel_v2`, `panel_labels_v2.csv`), and its pairs are not relabelled (their final labels are those of the first run). The briefs rubric is versioned: v1 is the rubric of the first run; v2 (`BRIEF_RUBRIC_V2`, `CLAIM_RUBRIC_V2`) adds a facts line for the package and for each cited contract, treats every mitigation or piece of advice as no claim, and checks evidence-gap statements against cited tool-log records, or else only for consistency with the cited records. A v2 run on the first run's briefs gets its own suffix (for example `_v1r`), so v1 and v2 briefs are compared under the same rubric. The executed copy of this notebook is the first run (default parameters, written before the parameters were added); the final labels of the re-measured packs come from job runs with rubric v2 on the workspace endpoints: 299490207975907 (`review_briefs_v2_full.csv`, outputs `_v2`) and 787757469996550 (`review_briefs_holdout_full.csv`, outputs `_holdout`).
 # MAGIC
-# MAGIC **Why:** the panels are fixed here so that every number below names its judges. Part B leaves out Qwen 3.5 because it wrote the briefs (a judge tends to prefer text from its own model); that puts two Meta models on panel B. The workspace also serves Anthropic (Claude) and Google (Gemma 3 12B) models: Claude is left out because a Claude agent built this pipeline and wrote the earlier pair labels the panel is compared with, and Gemma 3 12B is a much smaller model than the rest. Raw answers are cached in the volume, so a re-run reuses them instead of asking again.
+# MAGIC **Why:** the panels are fixed here so that every number below names its judges. Part B leaves out Qwen 3.5 because it wrote the briefs (a judge tends to prefer text from its own model); that puts two Meta models on panel B. The workspace also serves Anthropic (Claude) and Google (Gemma 3 12B) models: Claude is left out because a Claude agent built this pipeline and wrote the earlier pair labels the panel is compared with, and Gemma 3 12B is a much smaller model than the rest. Raw answers are cached in the volume, so a re-run reuses them instead of asking again. The same three judge models can also be called through OpenRouter (the `backend` parameter) to label faster; every answer records which service and provider served it, and a throttled or failed OpenRouter call falls back to the workspace endpoint of the same model. The default is `databricks`.
 
 # COMMAND ----------
 
@@ -84,20 +84,41 @@ FAMILY = {"databricks-gpt-oss-120b": "OpenAI", "databricks-llama-4-maverick": "M
           "databricks-meta-llama-3-3-70b-instruct": "Meta", "databricks-qwen35-122b-a10b": "Alibaba"}
 SHORT = {"databricks-gpt-oss-120b": "gpt-oss-120b", "databricks-llama-4-maverick": "llama-4-maverick",
          "databricks-meta-llama-3-3-70b-instruct": "llama-3.3-70b", "databricks-qwen35-122b-a10b": "qwen3.5-122b"}
+dbutils.widgets.text("briefs_file", "review_briefs.csv")
+dbutils.widgets.dropdown("rubric", "v1", ["v1", "v2"])
+dbutils.widgets.text("out_tag", "")
+BRIEFS_FILE = dbutils.widgets.get("briefs_file").strip() or "review_briefs.csv"
+RUBRIC = dbutils.widgets.get("rubric")
+# every re-measurement writes to suffixed outputs, so the first run's table and files cannot be overwritten by mistake
+TAG = pn.output_tag(BRIEFS_FILE, RUBRIC, dbutils.widgets.get("out_tag"))   # "" only for review_briefs.csv + rubric v1
+BRIEF_RUBRIC, CLAIM_RUBRIC, PACKAGE_FACTS = pn.RUBRIC_VERSIONS[RUBRIC]
+WITH_PAIRS = TAG == ""            # a re-measured review pack relabels the briefs only
 DATA_DIR = os.path.join(os.path.dirname(SRC_DIR), "data")
 PAIRS_PATH = os.path.join(DATA_DIR, "supplier_pair_labels.csv")
-BRIEFS_PATH = os.path.join(DATA_DIR, "human_review", "review_briefs.csv")
+BRIEFS_PATH = os.path.join(DATA_DIR, "human_review", BRIEFS_FILE)
 OUT_DIR = f"{RAW_VOLUME}/label_panel"
 CACHE_PATH = f"{OUT_DIR}/judge_cache.json"
-PANEL_TABLE = f"{GOLD}.label_panel"
+PANEL_TABLE = f"{GOLD}.label_panel{TAG}"
+PANEL_CSV = f"{OUT_DIR}/panel_labels{TAG}.csv"
+# a briefs-only run needs only panel B to be served
+JUDGES = sorted(set(PANEL_A) | set(PANEL_B)) if WITH_PAIRS else sorted(PANEL_B)
 CONTRACTS_PER_RECORD = 3
-WORKERS = 4
+dbutils.widgets.dropdown("backend", "databricks", ["databricks", "openrouter"])
+BACKEND = dbutils.widgets.get("backend")    # openrouter: the same models through OpenRouter, Databricks as fallback
+# the workspace endpoints' per-minute limits are shared with other users; OpenRouter takes more parallel calls
+WORKERS = 30 if BACKEND == "openrouter" else 4
 MAX_DBU = 15.0                    # hard stop for the panel's token spend
+OR_MAX_USD = 0.5                  # hard stop for one run's OpenRouter spend, then Databricks endpoints
+OR_SLUG = {"databricks-gpt-oss-120b": "openai/gpt-oss-120b", "databricks-llama-4-maverick": "meta-llama/llama-4-maverick",
+           "databricks-meta-llama-3-3-70b-instruct": "meta-llama/llama-3.3-70b-instruct",
+           "databricks-qwen35-122b-a10b": "qwen/qwen3.5-122b-a10b"}
 # DBU per million tokens (input, output) of the pay-per-token endpoints; Maverick assumed equal to Llama 3.3
 DBU_PER_M = {"databricks-gpt-oss-120b": (2.143, 8.571), "databricks-llama-4-maverick": (7.143, 21.429),
              "databricks-meta-llama-3-3-70b-instruct": (7.143, 21.429), "databricks-qwen35-122b-a10b": (3.143, 31.429)}
 os.makedirs(OUT_DIR, exist_ok=True)
 assert set(PANEL_A) | set(PANEL_B) <= set(DBU_PER_M)
+print(f"briefs: {BRIEFS_FILE} | briefs rubric {RUBRIC} | pairs relabelled: {WITH_PAIRS} | backend {BACKEND} | "
+      f"outputs: {PANEL_TABLE}, {PANEL_CSV}")
 
 # COMMAND ----------
 
@@ -119,10 +140,10 @@ LEDGER = {}                       # endpoint -> [prompt tokens, completion token
 SCHEMA_OK = {}                    # endpoint -> accepts response_format json_schema
 
 served = {e.name: (e.state.ready.value if e.state and e.state.ready else None) for e in WorkspaceClient().serving_endpoints.list()}
-for name in sorted(set(PANEL_A) | set(PANEL_B)):
+for name in JUDGES:
     print(f"{name:42s} {FAMILY[name]:8s} {served.get(name)}")
 # stop before any labelling if a judge is missing or not ready, rather than end up with a two-judge panel
-missing = [n for n in set(PANEL_A) | set(PANEL_B) if served.get(n) != "READY"]
+missing = [n for n in JUDGES if served.get(n) != "READY"]
 assert not missing, f"endpoints missing or not ready: {missing}"
 
 
@@ -150,8 +171,79 @@ def _post(endpoint, body, timeout=180, max_retries=8):
         time.sleep(min(30, 0.5 * 2 ** attempt) + random.random() * 0.5)
 
 
+_LOCAL = threading.local()        # served_by of the last answer on this thread
+OR_STATE = {"usd": 0.0, "off": None, "fallbacks": 0}
+OR_LEDGER = {}                    # endpoint -> [prompt tokens, completion tokens, calls, USD]
+if BACKEND == "openrouter":
+    _OR_KEY = dbutils.secrets.get("procurement", "openrouter_api_key")
+    _k = requests.get("https://openrouter.ai/api/v1/key", headers={"Authorization": f"Bearer {_OR_KEY}"}, timeout=30).json()["data"]
+    print(f"OpenRouter key: usage {_k.get('usage')} of limit {_k.get('limit')} (remaining {_k.get('limit_remaining')})")
+
+
+class _Fallback(Exception):
+    pass
+
+
+def _openrouter_chat(endpoint, system, user, schema, max_tokens):
+    """The same model through OpenRouter (strict schema required of the provider); _Fallback -> Databricks endpoint."""
+    with _LOCK:
+        if OR_STATE["usd"] > OR_MAX_USD:
+            OR_STATE["off"] = "run budget reached"
+        if OR_STATE["off"]:
+            raise _Fallback(OR_STATE["off"])
+    body = {"model": OR_SLUG[endpoint], "max_tokens": max_tokens, "temperature": 0.0, "response_format": schema,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "usage": {"include": True}, "provider": {"require_parameters": True}}
+    if "gpt-oss" in endpoint:
+        body["reasoning"] = {"effort": "low"}
+    if "qwen" in endpoint:
+        body["reasoning"] = {"enabled": False}          # thinking off, as on the workspace endpoint
+    j, err = None, ""
+    for attempt in range(3):
+        try:
+            r = requests.post("https://openrouter.ai/api/v1/chat/completions", json=body, timeout=120,
+                              headers={"Authorization": f"Bearer {_OR_KEY}"})
+            if r.status_code == 402:
+                with _LOCK:
+                    OR_STATE["off"] = "HTTP 402 (credit)"
+                raise _Fallback("402")
+            if r.status_code == 429:
+                raise _Fallback("429")
+            if r.status_code == 200 and "choices" in (r.json() or {}):
+                j = r.json()
+                break
+            err = f"HTTP {r.status_code}: {r.text[:120]}"
+        except requests.exceptions.RequestException as e:
+            err = type(e).__name__
+        time.sleep(1 + attempt * 2)
+    if j is None:
+        raise _Fallback(f"3 failed attempts ({err})")
+    content = j["choices"][0]["message"].get("content")
+    if isinstance(content, list):
+        content = "".join(b.get("text", "") for b in content if b.get("type") == "text")
+    if not (content or "").strip():
+        raise _Fallback("empty answer")
+    u = j.get("usage") or {}
+    with _LOCK:
+        row = OR_LEDGER.setdefault(endpoint, [0, 0, 0, 0.0])
+        row[0] += u.get("prompt_tokens") or 0
+        row[1] += u.get("completion_tokens") or 0
+        row[2] += 1
+        row[3] += u.get("cost") or 0.0
+        OR_STATE["usd"] += u.get("cost") or 0.0
+    _LOCAL.served_by = f"openrouter:{j.get('provider') or 'unknown'}"
+    return content.strip()
+
+
 def chat(endpoint, system, user, schema, max_tokens):
     """Text of one judge answer; the strict schema is sent when the endpoint accepts it."""
+    if BACKEND == "openrouter":
+        try:
+            return _openrouter_chat(endpoint, system, user, schema, max_tokens)
+        except _Fallback:
+            with _LOCK:
+                OR_STATE["fallbacks"] += 1
+    _LOCAL.served_by = "databricks"
     if dbu_spent() > MAX_DBU:
         raise RuntimeError("panel spend cap reached")
     body = {"messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -181,7 +273,7 @@ def chat(endpoint, system, user, schema, max_tokens):
     return (content or "").strip()
 
 
-for name in sorted(set(PANEL_A) | set(PANEL_B)):
+for name in JUDGES:
     t0 = time.time()
     text = chat(name, pn.PAIR_RUBRIC, pn.pair_message("ACME TRADING LTD", "ACME TRADING LIMITED", "GH"), pn.PAIR_SCHEMA, 600)
     print(f"{SHORT[name]:18s} schema accepted: {SCHEMA_OK.get(name, True)!s:5s} {time.time() - t0:5.1f} s  {text[:140]}")
@@ -199,43 +291,55 @@ for name in sorted(set(PANEL_A) | set(PANEL_B)):
 # COMMAND ----------
 
 pairs = pd.read_csv(PAIRS_PATH, dtype=str, keep_default_na=False)
+if not WITH_PAIRS:                # a re-measured review pack: the pairs keep the first run's final labels
+    pairs = pairs.iloc[0:0].copy()
 briefs = pd.read_csv(BRIEFS_PATH, dtype=str, keep_default_na=False)
 briefs["n_precedents"] = briefs["n_precedents"].astype(int)
 briefs["n_risks"] = [pn.listed_items(t, "Risks and mitigations") for t in briefs["brief_text"]]
 # the count parsed from the brief text must match p11's stored count, or the per-item votes below would not line up
 assert (briefs["n_precedents"] == [pn.listed_items(t, "Similar precedents") for t in briefs["brief_text"]]).all()
 
-records = spark.createDataFrame(
-    pd.concat([pairs[["supplier_id_a", "name_a"]].set_axis(["supplier_id", "name"], axis=1),
-               pairs[["supplier_id_b", "name_b"]].set_axis(["supplier_id", "name"], axis=1)]).drop_duplicates())
-contract_lines = (spark.table(f"{SILVER}.contract_suppliers").select("contract_id", "supplier_id", F.col("supplier_name").alias("name"))
-                  .join(records, ["supplier_id", "name"])
-                  .join(spark.table(f"{SILVER}.contracts").select("contract_id", "project_id", "signing_date",
-                                                                  "procurement_category_code", "contract_description"), "contract_id")
-                  .select("supplier_id", "name", F.col("signing_date").alias("d"),
-                          F.concat_ws(" ", F.year("signing_date"), "project_id", "procurement_category_code",
-                                      F.substring("contract_description", 1, 90)).alias("line")))
-notice_lines = (spark.table(f"{SILVER}.notice_bidders").select("notice_id", "supplier_id", F.col("firm_name").alias("name"), "role")
-                .join(records, ["supplier_id", "name"])
-                .join(spark.table(f"{SILVER}.notices").select("notice_id", "project_id", "notice_date", "bid_description"), "notice_id")
-                .select("supplier_id", "name", F.col("notice_date").alias("d"),
-                        F.concat_ws(" ", F.year("notice_date"), "project_id", F.concat(F.lit("award notice, "), "role"),
-                                    F.substring("bid_description", 1, 90)).alias("line")))
-ctx = {}
-for source in (contract_lines, notice_lines):
-    for r in source.orderBy(F.desc("d")).collect():
-        key = (r.supplier_id, r.name)
-        # award-notice lines only for records that never signed a contract; contracts are the stronger evidence
-        if source is notice_lines and key in ctx and ctx[key][0] == "contract":
-            continue
-        kind, lines = ctx.setdefault(key, ("contract" if source is contract_lines else "notice", []))
-        if len(lines) < CONTRACTS_PER_RECORD:
-            lines.append("  " + r.line)
+
+def record_lines(pairs):
+    """(supplier_id, name) -> (kind, up to CONTRACTS_PER_RECORD lines, newest first) for every record of the pairs."""
+    records = spark.createDataFrame(
+        pd.concat([pairs[["supplier_id_a", "name_a"]].set_axis(["supplier_id", "name"], axis=1),
+                   pairs[["supplier_id_b", "name_b"]].set_axis(["supplier_id", "name"], axis=1)]).drop_duplicates())
+    contract_lines = (spark.table(f"{SILVER}.contract_suppliers").select("contract_id", "supplier_id", F.col("supplier_name").alias("name"))
+                      .join(records, ["supplier_id", "name"])
+                      .join(spark.table(f"{SILVER}.contracts").select("contract_id", "project_id", "signing_date",
+                                                                      "procurement_category_code", "contract_description"), "contract_id")
+                      .select("supplier_id", "name", F.col("signing_date").alias("d"),
+                              F.concat_ws(" ", F.year("signing_date"), "project_id", "procurement_category_code",
+                                          F.substring("contract_description", 1, 90)).alias("line")))
+    notice_lines = (spark.table(f"{SILVER}.notice_bidders").select("notice_id", "supplier_id", F.col("firm_name").alias("name"), "role")
+                    .join(records, ["supplier_id", "name"])
+                    .join(spark.table(f"{SILVER}.notices").select("notice_id", "project_id", "notice_date", "bid_description"), "notice_id")
+                    .select("supplier_id", "name", F.col("notice_date").alias("d"),
+                            F.concat_ws(" ", F.year("notice_date"), "project_id", F.concat(F.lit("award notice, "), "role"),
+                                        F.substring("bid_description", 1, 90)).alias("line")))
+    ctx = {}
+    for source in (contract_lines, notice_lines):
+        for r in source.orderBy(F.desc("d")).collect():
+            key = (r.supplier_id, r.name)
+            # award-notice lines only for records that never signed a contract; contracts are the stronger evidence
+            if source is notice_lines and key in ctx and ctx[key][0] == "contract":
+                continue
+            kind, lines = ctx.setdefault(key, ("contract" if source is contract_lines else "notice", []))
+            if len(lines) < CONTRACTS_PER_RECORD:
+                lines.append("  " + r.line)
+    return ctx
+
+
+ctx = record_lines(pairs) if WITH_PAIRS else {}
+n_records = len(pd.concat([pairs[["supplier_id_a", "name_a"]].set_axis(["supplier_id", "name"], axis=1),
+                           pairs[["supplier_id_b", "name_b"]].set_axis(["supplier_id", "name"], axis=1)]).drop_duplicates())
 pairs["contracts_a"] = ["\n".join(ctx.get((s, n), ("", []))[1]) for s, n in zip(pairs["supplier_id_a"], pairs["name_a"])]
 pairs["contracts_b"] = ["\n".join(ctx.get((s, n), ("", []))[1]) for s, n in zip(pairs["supplier_id_b"], pairs["name_b"])]
-print(f"pairs {len(pairs)} | records with contract or notice lines: {len(ctx)} of {records.count()} | "
+print(f"pairs {len(pairs)} | records with contract or notice lines: {len(ctx)} of {n_records} | "
       f"briefs {len(briefs)}, precedents listed {briefs['n_precedents'].sum()}, risks listed {briefs['n_risks'].sum()}")
-print(pn.pair_message(*pairs.loc[87, ["name_a", "name_b", "country_code", "contracts_a", "contracts_b"]]))
+if WITH_PAIRS:
+    print(pn.pair_message(*pairs.loc[87, ["name_a", "name_b", "country_code", "contracts_a", "contracts_b"]]))
 
 # COMMAND ----------
 
@@ -252,6 +356,8 @@ try:
     CACHE = json.load(open(CACHE_PATH))
 except FileNotFoundError:
     CACHE = {}
+SERVED = []                       # (endpoint, served_by, from cache) per judgement of this run
+# served_by is cached with the answer, so a re-run from the cache still reports who answered originally
 
 
 def judge(endpoint, system, user, schema, max_tokens):
@@ -261,6 +367,7 @@ def judge(endpoint, system, user, schema, max_tokens):
     key = hashlib.sha1(json.dumps([endpoint, system, user]).encode()).hexdigest()
     with _LOCK:
         if key in CACHE:
+            SERVED.append((endpoint, CACHE[key].get("served_by", "databricks"), True))
             return CACHE[key]["answer"], CACHE[key]["text"]
     answer, text = None, ""
     for _ in (1, 2):
@@ -273,15 +380,17 @@ def judge(endpoint, system, user, schema, max_tokens):
         answer = pn.parse_json_object(text)
         if answer is not None:
             break
+    served_by = getattr(_LOCAL, "served_by", "databricks")
     with _LOCK:
-        CACHE[key] = {"answer": answer, "text": text[:4000]}
+        CACHE[key] = {"answer": answer, "text": text[:4000], "served_by": served_by}
+        SERVED.append((endpoint, served_by, False))
     return answer, text
 
 
 jobs = ([("pair", r.pair_id, j, pn.PAIR_RUBRIC,
           pn.pair_message(r.name_a, r.name_b, r.country_code, r.contracts_a, r.contracts_b), pn.PAIR_SCHEMA, 700)
          for r in pairs.itertuples() for j in PANEL_A]
-        + [("brief", r["review_id"], j, pn.BRIEF_RUBRIC, pn.brief_message(r), pn.BRIEF_SCHEMA, 2000)
+        + [("brief", r["review_id"], j, BRIEF_RUBRIC, pn.brief_message(r, PACKAGE_FACTS), pn.BRIEF_SCHEMA, 2000)
            for r in briefs.to_dict("records") for j in PANEL_B])
 t0 = time.time()
 with ThreadPoolExecutor(max_workers=WORKERS) as pool:
@@ -308,17 +417,26 @@ for r in briefs.to_dict("records"):
     # pool every claim any judge quoted; each judge then checks the same list, so a split means a real disagreement, not
     # one judge missing a claim
     pooled[r["review_id"]] = pn.candidate_claims([f if isinstance(f, list) else [] for f in found])
-claim_jobs = [(r["review_id"], j, pn.claim_message(r, pooled[r["review_id"]]))
+claim_jobs = [(r["review_id"], j, pn.claim_message(r, pooled[r["review_id"]], PACKAGE_FACTS))
               for r in briefs.to_dict("records") if pooled[r["review_id"]] for j in PANEL_B]
 t0 = time.time()
 with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-    claim_answers = list(pool.map(lambda job: judge(job[1], pn.CLAIM_RUBRIC, job[2], pn.CLAIM_SCHEMA, 1200), claim_jobs))
+    claim_answers = list(pool.map(lambda job: judge(job[1], CLAIM_RUBRIC, job[2], pn.CLAIM_SCHEMA, 1200), claim_jobs))
 json.dump(CACHE, open(CACHE_PATH, "w"))
 claim_vote = {(rid, j): pn.claim_vote(a, pooled[rid]) for (rid, j, _), (a, _) in zip(claim_jobs, claim_answers, strict=True)}
 print(f"briefs with a quoted claim: {sum(bool(c) for c in pooled.values())} of {len(briefs)}; pooled claims: "
       f"{sum(map(len, pooled.values()))}; {len(claim_jobs)} checks in {time.time() - t0:.0f} s")
-display(pd.DataFrame([{"endpoint": m, "calls": c, "prompt_tokens": p, "completion_tokens": o,
-                       "dbu": round((p * DBU_PER_M[m][0] + o * DBU_PER_M[m][1]) / 1e6, 3)} for m, (p, o, c) in LEDGER.items()]))
+served_df = (pd.DataFrame(SERVED, columns=["judge", "served_by", "from_cache"]).assign(judge=lambda d: d["judge"].map(SHORT))
+             .value_counts().rename("answers").reset_index().sort_values(["judge", "served_by", "from_cache"]))
+served_df.to_csv(f"{OUT_DIR}/panel_providers{TAG}.csv", index=False)
+print(served_df.to_string(index=False))
+if OR_LEDGER:
+    print("OpenRouter:", {SHORT[m]: {"calls": c, "prompt_tokens": p, "completion_tokens": o, "usd": round(u, 4)}
+                          for m, (p, o, c, u) in OR_LEDGER.items()}, "| fallbacks to Databricks:", OR_STATE["fallbacks"],
+          "| switched off:", OR_STATE["off"])
+if LEDGER:                        # Databricks endpoint calls of this run (none when OpenRouter served everything)
+    display(pd.DataFrame([{"endpoint": m, "calls": c, "prompt_tokens": p, "completion_tokens": o,
+                           "dbu": round((p * DBU_PER_M[m][0] + o * DBU_PER_M[m][1]) / 1e6, 3)} for m, (p, o, c) in LEDGER.items()]))
 
 # COMMAND ----------
 
@@ -354,7 +472,7 @@ n_panel = publish_table(
     PANEL_TABLE,
     "Label panel (p15): one judge's answer to one rubric question about one evaluation item. "
     "Grain: item_type x item_id x judge x field.",
-    {"item_type": "pair (data/supplier_pair_labels.csv) or brief (data/human_review/review_briefs.csv)",
+    {"item_type": f"pair (data/supplier_pair_labels.csv) or brief (data/human_review/{BRIEFS_FILE})",
      "item_id": "pair_id or review_id",
      "judge": "Serving endpoint that answered",
      "field": "same_firm | timeline_ok | precedents_relevant | risks_relevant | any_unsupported_claim",
@@ -434,28 +552,32 @@ display(agg[agg["needs_owner"]].groupby(["item_type", "field", "reason"]).size()
 
 # COMMAND ----------
 
-ids = list(set(pairs["supplier_id_a"]) | set(pairs["supplier_id_b"]))
-entity = {r.supplier_id: r.supplier_entity_id for r in
-          spark.table(f"{SILVER}.supplier_entity_map").filter(F.col("supplier_id").isin(ids)).collect()}
-# same entity id in the published map, so chained merges (A~B, B~C) count as "same" exactly as the pipeline applies them
-pairs["pipeline_same"] = [entity.get(a) is not None and entity.get(a) == entity.get(b)
-                          for a, b in zip(pairs["supplier_id_a"], pairs["supplier_id_b"])]
-old = precision_recall(pairs["label_same_entity"].eq("1").tolist(), pairs["pipeline_same"].tolist())
-print(f"pipeline vs earlier labels: tp {old['tp']} fp {old['fp']} fn {old['fn']} | precision {old['precision']:.3f} recall {old['recall']:.3f}")
-# guard: p04's published numbers on the earlier labels; if the entity map was rebuilt differently, stop before comparing
-# with the panel
-assert (old["tp"], old["fp"], old["fn"]) == (36, 1, 4), "the published entity map no longer matches p04's evaluation"
+if WITH_PAIRS:                    # a re-measured review pack keeps the first run's pair labels and metrics
+    ids = list(set(pairs["supplier_id_a"]) | set(pairs["supplier_id_b"]))
+    entity = {r.supplier_id: r.supplier_entity_id for r in
+              spark.table(f"{SILVER}.supplier_entity_map").filter(F.col("supplier_id").isin(ids)).collect()}
+    # same entity id in the published map, so chained merges (A~B, B~C) count as "same" exactly as the pipeline applies
+    # them
+    pairs["pipeline_same"] = [entity.get(a) is not None and entity.get(a) == entity.get(b)
+                              for a, b in zip(pairs["supplier_id_a"], pairs["supplier_id_b"])]
+    old = precision_recall(pairs["label_same_entity"].eq("1").tolist(), pairs["pipeline_same"].tolist())
+    print(f"pipeline vs earlier labels: tp {old['tp']} fp {old['fp']} fn {old['fn']} | precision {old['precision']:.3f} recall {old['recall']:.3f}")
+    # guard: p04's published numbers on the earlier labels; if the entity map was rebuilt differently, stop before
+    # comparing with the panel
+    assert (old["tp"], old["fp"], old["fn"]) == (36, 1, 4), "the published entity map no longer matches p04's evaluation"
 
-pa = agg[agg["item_type"] == "pair"].set_index("item_id")
-settled = pairs[pairs["pair_id"].map(lambda p: not pa.at[p, "needs_owner"])]
-y = pn.er_labels([pa.at[p, "panel_value"] for p in settled["pair_id"]])
-# pairs the panel settled as "unsure" carry no label and are left out of precision and recall
-keep = [v is not None for v in y]
-pr = precision_recall([v for v, k in zip(y, keep) if k], [p for p, k in zip(settled["pipeline_same"], keep) if k])
-p_lo, p_hi = wilson_interval(pr["tp"], pr["tp"] + pr["fp"])
-r_lo, r_hi = wilson_interval(pr["tp"], pr["tp"] + pr["fn"])
-print(f"pipeline vs panel on {sum(keep)} settled pairs: tp {pr['tp']} fp {pr['fp']} fn {pr['fn']} | "
-      f"precision {pr['precision']:.3f} ({p_lo:.2f}-{p_hi:.2f}) recall {pr['recall']:.3f} ({r_lo:.2f}-{r_hi:.2f})")
+    pa = agg[agg["item_type"] == "pair"].set_index("item_id")
+    settled = pairs[pairs["pair_id"].map(lambda p: not pa.at[p, "needs_owner"])]
+    y = pn.er_labels([pa.at[p, "panel_value"] for p in settled["pair_id"]])
+    # pairs the panel settled as "unsure" carry no label and are left out of precision and recall
+    keep = [v is not None for v in y]
+    pr = precision_recall([v for v, k in zip(y, keep) if k], [p for p, k in zip(settled["pipeline_same"], keep) if k])
+    p_lo, p_hi = wilson_interval(pr["tp"], pr["tp"] + pr["fp"])
+    r_lo, r_hi = wilson_interval(pr["tp"], pr["tp"] + pr["fn"])
+    print(f"pipeline vs panel on {sum(keep)} settled pairs: tp {pr['tp']} fp {pr['fp']} fn {pr['fn']} | "
+          f"precision {pr['precision']:.3f} ({p_lo:.2f}-{p_hi:.2f}) recall {pr['recall']:.3f} ({r_lo:.2f}-{r_hi:.2f})")
+else:
+    print("pairs not relabelled in this run: entity resolution is scored on the first run's final pair labels")
 
 # COMMAND ----------
 
@@ -486,8 +608,8 @@ for r in agg.to_dict("records"):                     # job order: pairs by pair_
         row[f"why_{k}"] = why.get((r["item_type"], r["item_id"], j, r["field"]), "")[:200] if r["needs_owner"] else ""
     out_rows.append(row)
 panel_csv = pd.DataFrame(out_rows)
-panel_csv.to_csv(f"{OUT_DIR}/panel_labels.csv", index=False)
-print(f"{OUT_DIR}/panel_labels.csv: {len(panel_csv)} rows, {os.path.getsize(f'{OUT_DIR}/panel_labels.csv') / 1024:.0f} KB, "
+panel_csv.to_csv(PANEL_CSV, index=False)
+print(f"{PANEL_CSV}: {len(panel_csv)} rows, {os.path.getsize(PANEL_CSV) / 1024:.0f} KB, "
       f"{int(panel_csv['needs_owner'].sum())} to adjudicate")
 
 # COMMAND ----------
@@ -545,7 +667,9 @@ assert (dq["status"] != "FAIL").all()
 
 summary = {"panel_rows": n_panel, "to_adjudicate": {t: int(g.groupby("item_id")["needs_owner"].any().sum()) for t, g in agg.groupby("item_type")},
            "agreement": stats_df[["item_type", "field", "pairwise_agreement", "fleiss_kappa"]].round(3).to_dict("records"),
-           "calls": {SHORT[m]: c for m, (_, _, c) in LEDGER.items()}, "dbu": round(dbu_spent(), 2)}
+           "calls": {SHORT[m]: c for m, (_, _, c) in LEDGER.items()}, "dbu": round(dbu_spent(), 2),
+           "openrouter_calls": {SHORT[m]: c for m, (_, _, c, _) in OR_LEDGER.items()},
+           "openrouter_usd": round(OR_STATE["usd"], 4), "openrouter_fallbacks": OR_STATE["fallbacks"]}
 print(json.dumps(summary, default=str))
 
 # COMMAND ----------

@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # p08_procurement_agent — contextual retrieval for a new procurement package
+# MAGIC # p08_procurement_agent: contextual retrieval for a new procurement package
 # MAGIC
 # MAGIC When a task team starts a new procurement package, this agent gathers the evidence a procurement specialist would look for and writes a short, cited planning brief:
 # MAGIC
@@ -617,12 +617,12 @@ if os.path.exists(LABEL_FILE):
     labels = pd.read_csv(LABEL_FILE, dtype={"contract_id": str, "eval_id": str})
     chk = sample.merge(labels, on=["eval_id", "contract_id"], how="inner")
     agree = (chk.relevant.astype(bool) == chk.human_relevant.astype(bool)).mean()
-    print(f"\nhand labels: {len(chk)} of {len(sample)} sample pairs labelled; judge agrees on {agree:.0%}; "
-          f"relevant share: human {chk.human_relevant.mean():.2f}, judge {chk.relevant.astype(float).mean():.2f}")
+    print(f"\nagent reference labels: {len(chk)} of {len(sample)} sample pairs labelled; judge agrees on {agree:.0%}; "
+          f"relevant share: reference {chk.human_relevant.mean():.2f}, judge {chk.relevant.astype(float).mean():.2f}")
     display(chk[chk.relevant.astype(bool) != chk.human_relevant.astype(bool)]
             [["eval_id", "contract_id", "relevant", "human_relevant", "judge_reason", "note"]])
 else:
-    print("no hand-label file yet")
+    print("no agent reference label file yet")
 
 # COMMAND ----------
 

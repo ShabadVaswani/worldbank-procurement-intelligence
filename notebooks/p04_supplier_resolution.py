@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # p04_supplier_resolution — which supplier ids are the same firm?
+# MAGIC # p04_supplier_resolution: which supplier ids are the same firm?
 # MAGIC
 # MAGIC A `supplier_id` is a registration, not a firm: the same company is often registered several times, with names spelled differently ("ERNST & YOUNG LLP", "ERNST AND YOUNG LLP", "ERNST & YOUNG (EY) LLP, INDIA"). This notebook groups supplier ids into **supplier entities** with explainable rules, measures how well that works against labelled pairs, and publishes:
 # MAGIC
@@ -117,7 +117,7 @@ display(records.sample(10, random_state=1)[["supplier_id", "name", "country_code
 # MAGIC
 # MAGIC **What:** for every id with more than one name record, the lowest trigram cosine between its spellings; how many ids look like spelling variants (>= 0.5), how many carry a dissimilar name, and how many span several countries. Then the most dissimilar examples.
 # MAGIC
-# MAGIC **Why:** this is the evidence for Step 1 — the id is used as a link, so its failure rate should be known.
+# MAGIC **Why:** this is the evidence for Step 1: the id is used as a link, so its failure rate should be known.
 
 # COMMAND ----------
 

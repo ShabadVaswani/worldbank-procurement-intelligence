@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # p13_tender_design_checks — tender design and packaging checked against policy and past tenders
+# MAGIC # p13_tender_design_checks: tender design and packaging checked against policy and past tenders
 # MAGIC
 # MAGIC Before an invitation for bids goes out, a procurement specialist asks: is the advertising period long enough, is the package sized for the market, are the bid security and qualification requirements in line with similar tenders? This notebook answers those questions from data: it reads the requirements printed in real IFB / RFB notices, builds peer statistics from past tenders, flags unusual designs, and checks against observed outcomes (number of bidders, time to signing, re-advertisement) whether a flag is worth raising.
 
@@ -143,7 +143,7 @@ display(pool.groupBy("category", "market_approach").agg(
 # MAGIC
 # MAGIC **What:** 400 notices of the population in hash order of the notice id; `tc.extract_requirements()` on each notice's text.
 # MAGIC
-# MAGIC **Why:** a bounded sample keeps the hand checks and the model calls small; hash order is unrelated to the outcomes.
+# MAGIC **Why:** a bounded sample keeps the spot checks and the model calls small; hash order is unrelated to the outcomes.
 
 # COMMAND ----------
 

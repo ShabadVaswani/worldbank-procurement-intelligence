@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # p00_setup — schemas, volume and libraries for the procurement work
+# MAGIC # p00_setup: schemas, volume and libraries for the procurement work
 # MAGIC
 # MAGIC Creates three new schemas next to the outcome project's `bronze` / `silver` / `gold` in catalog `dbw_wb_outcome`, plus a volume for raw API snapshots, then smoke-tests the libraries and both APIs. Safe to re-run: every step is idempotent, and nothing outside the three new schemas is created or changed.
 

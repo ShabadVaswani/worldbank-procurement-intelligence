@@ -1,13 +1,13 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # proc_common — shared settings and Spark helpers for the procurement notebooks
+# MAGIC # proc_common: shared settings and Spark helpers for the procurement notebooks
 # MAGIC
 # MAGIC Every `p0x` notebook starts with `%run ./proc_common`. It holds three things:
 # MAGIC
 # MAGIC | Item | Purpose |
 # MAGIC |---|---|
 # MAGIC | constants | catalog, schema, volume and table names, API addresses, the notice date cutoff |
-# MAGIC | `sys.path` entry for `../src` (and the same package shipped to Spark's Python workers) | so notebooks and UDFs `import proc_intel` — the pure-Python package that pytest covers locally |
+# MAGIC | `sys.path` entry for `../src` (and the same package shipped to Spark's Python workers) | so notebooks and UDFs `import proc_intel`, the pure-Python package that pytest covers locally |
 # MAGIC | Spark helpers | UDF wrapper, idempotent `MERGE`, publishing a documented table, primary/foreign keys, a data-quality table |
 # MAGIC
 # MAGIC Pure logic (name normalisation, reference matching, similarity, clustering) lives in `src/proc_intel/` and is imported, not copied, so the tested code and the code that runs here are the same file.

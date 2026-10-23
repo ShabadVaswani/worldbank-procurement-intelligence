@@ -263,7 +263,7 @@ def proxy_relevant(package: Mapping, precedent: Mapping, use_method: bool = True
     same procurement category AND same method family AND at least one shared canonical sector.
     Both mappings carry 'category', 'method' and 'sectors' (a set). None when the sector rule is used and the package
     has no known sector (the rule cannot be applied). `use_method` / `use_sector` switch a condition off, to see
-    which condition drives disagreements with human labels."""
+    which condition drives disagreements with the reference labels."""
     if use_sector and not package.get("sectors"):
         return None
     ok = package.get("category") == precedent.get("category")

@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # p09_conflicting_evidence — when supervision ratings and the final evaluation disagree
+# MAGIC # p09_conflicting_evidence: when supervision ratings and the final evaluation disagree
 # MAGIC
 # MAGIC A project is rated several times in its life, by different people, for different purposes. The agent and the analysts will meet all of these ratings in documents, and they often disagree. This notebook collects them for a sample of closed projects, **measures** how often they disagree, and implements a resolution policy that never hides the disagreement.
 
@@ -21,7 +21,7 @@
 # MAGIC
 # MAGIC ## Interface for the agent: `resolve_evidence()`
 # MAGIC
-# MAGIC `from proc_intel.evidence import resolve_evidence` — a pure function, no Spark, unit-tested in `tests/test_evidence.py`.
+# MAGIC `from proc_intel.evidence import resolve_evidence`: a pure function, no Spark, unit-tested in `tests/test_evidence.py`.
 # MAGIC
 # MAGIC **Input** `resolve_evidence(records, question_type, reference_date=None)`
 # MAGIC
@@ -62,7 +62,7 @@
 # MAGIC | One column-position parser for both tables: columns from the header line, words assigned to the column under which they start, placeholders (`---`, `Not Rated`) matched, the "Reason for disagreement" column cut off | A line regex reads the wrong column when cells wrap | In ICR Reviews a cell such as "Moderately Satisfactory" is often split over two lines, above and below the row label |
 # MAGIC | A column starts 8 characters before its title (never before the second word of the previous column's rating); the header regex accepts both ISR templates; private-use characters replaced by a space; both layouts unit-tested | Two layout variants broke the parser; falling back to an older ISR would have silently replaced the last ISR for a quarter of the sample | Run 1 read IEG's outcome correctly for 364 of 376 ICR Reviews (all 12 mismatches: IEG cells up to 5 characters left of the title); for 91 of 400 projects the newest ISR had "no ratings" (2024 template: "Previous / Current" header, private-use icon prefixes); section 4 re-checks IEG |
 # MAGIC | 400 of the eligible projects in hash order of `project_id`; per project the last ISR, the ISR nearest the middle of supervision and the ICR Review, with counted fallbacks | Reproducible and unrelated to the ratings, so disagreement rates are not biased by the selection | 1,368 closed projects in the procurement data have an IEG outcome rating (evaluated FY2019-2027) |
-# MAGIC | A documented source hierarchy per question type; every other record returned as supporting or conflicting with its date and citation, plus a flag and a confidence label | The question decides the authoritative source: IEG for "how did the project do", the latest ISR for "how is it going now" | Tested on hand-made cases in `tests/test_evidence.py` |
+# MAGIC | A documented source hierarchy per question type; every other record returned as supporting or conflicting with its date and citation, plus a flag and a confidence label | The question decides the authoritative source: IEG for "how did the project do", the latest ISR for "how is it going now" | Tested on cases written for the tests in `tests/test_evidence.py` |
 # MAGIC
 # MAGIC Full reasoning: docs/decision_log.md
 

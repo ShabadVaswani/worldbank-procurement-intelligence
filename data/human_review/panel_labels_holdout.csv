@@ -1,0 +1,41 @@
+item_type,item_id,field,panel_value,needs_owner,reason,earlier_label,n_listed,pipeline_same,contracts_a,contracts_b,judge_1,vote_1,why_1,judge_2,vote_2,why_2,judge_3,vote_3,why_3
+brief,h01,timeline_ok,no,0,,no,,,,,gpt-oss-120b,no,,llama-4-maverick,no,,llama-3.3-70b,no,
+brief,h01,precedents_relevant,5,0,,0,5.0,,,,gpt-oss-120b,5,,llama-4-maverick,5,,llama-3.3-70b,5,
+brief,h01,risks_relevant,4,0,,,4.0,,,,gpt-oss-120b,4,,llama-4-maverick,4,,llama-3.3-70b,4,
+brief,h01,any_unsupported_claim,no,1,judges differ,no,,,,,gpt-oss-120b,yes,"unsupported: ""Model forecast assumes Invitation for Bids notice type, 28-day advertising period, 7862-ch"". Claim 1 lacks supporting record",llama-4-maverick,no,all 3 checked claims supported.,llama-3.3-70b,no,all 3 checked claims supported. All claims are supported by the cited records and package text.
+brief,h02,timeline_ok,yes,0,,yes,,,,,gpt-oss-120b,yes,,llama-4-maverick,yes,,llama-3.3-70b,yes,
+brief,h02,precedents_relevant,3,1,counts differ by 2 or more,1,4.0,,,,gpt-oss-120b,3,"relevant: contract:1760388, contract:1747630, contract:1641903; not relevant: 1. Three contracts involve wireless equipment procurement, matching the package; the ERP turnkey contract does not.",llama-4-maverick,4,"relevant: contract:1760388, contract:1747630, contract:1641903, contract:1705055; not relevant: 0. All precedents are relevant as they involve procurement of similar items (wireless network systems or",llama-3.3-70b,1,"relevant: contract:1705055; not relevant: 3. Only contract:1705055 is relevant because it is the only precedent that bought the same kind of works, goods or services (turnkey hardware and consultancy)"
+brief,h02,risks_relevant,3,0,,,4.0,,,,gpt-oss-120b,3,,llama-4-maverick,4,,llama-3.3-70b,3,
+brief,h02,any_unsupported_claim,no,0,,no,,,,,gpt-oss-120b,no,,llama-4-maverick,no,,llama-3.3-70b,no,
+brief,h03,timeline_ok,yes,0,,yes,,,,,gpt-oss-120b,yes,,llama-4-maverick,yes,,llama-3.3-70b,yes,
+brief,h03,precedents_relevant,5,0,,4,5.0,,,,gpt-oss-120b,5,,llama-4-maverick,5,,llama-3.3-70b,5,
+brief,h03,risks_relevant,4,1,counts differ by 2 or more,,4.0,,,,gpt-oss-120b,4,"relevant: 1, 2, 3, 4; not relevant: 0. Each risk pertains to procurement or contract‑delivery issues relevant to a consultancy for BES procurement",llama-4-maverick,2,"relevant: 1, 4; not relevant: 2. Risks 2 and 3 are not relevant as they pertain to contractor capacity and equipment supply delays, which are not directly related to the consultancy services being pro",llama-3.3-70b,4,"relevant: 1, 2, 3, 4; not relevant: 0. All listed risks are relevant and sensible as they pertain to potential issues that could arise during the procurement and implementation of the consultancy serv"
+brief,h03,any_unsupported_claim,no,0,,no,,,,,gpt-oss-120b,no,,llama-4-maverick,no,,llama-3.3-70b,no,
+brief,h04,timeline_ok,no,0,,no,,,,,gpt-oss-120b,no,,llama-4-maverick,no,,llama-3.3-70b,no,
+brief,h04,precedents_relevant,3,0,,3,3.0,,,,gpt-oss-120b,3,,llama-4-maverick,3,,llama-3.3-70b,3,
+brief,h04,risks_relevant,4,0,,,4.0,,,,gpt-oss-120b,4,,llama-4-maverick,4,,llama-3.3-70b,4,
+brief,h04,any_unsupported_claim,no,0,,no,,,,,gpt-oss-120b,no,,llama-4-maverick,no,,llama-3.3-70b,no,
+brief,h05,timeline_ok,yes,0,,yes,,,,,gpt-oss-120b,yes,,llama-4-maverick,yes,,llama-3.3-70b,yes,
+brief,h05,precedents_relevant,5,1,counts differ by 2 or more,5,5.0,,,,gpt-oss-120b,5,"relevant: contract:1767515, contract:1819784, contract:1699831, contract:1767514, contract:1803579; not relevant: 0. All listed contracts involve market shed construction, matching the package's works",llama-4-maverick,1,"relevant: contract:1699831; not relevant: 4. Only contract:1699831 is relevant as it involves market shed construction in South Asia, similar to the package.",llama-3.3-70b,5,"relevant: contract:1767515, contract:1819784, contract:1699831, contract:1767514, contract:1803579; not relevant: 0. All the listed precedents are relevant because they all involve market shed constru"
+brief,h05,risks_relevant,3,0,,,3.0,,,,gpt-oss-120b,3,,llama-4-maverick,3,,llama-3.3-70b,3,
+brief,h05,any_unsupported_claim,no,1,judges differ,no,,,,,gpt-oss-120b,no,all 3 checked claims supported.,llama-4-maverick,no,all 3 checked claims supported.,llama-3.3-70b,yes,"unsupported: ""using Request for Bids method in Eastern and Southern Africa"". Claims 1 is unsupported because the package is for South Asia region using Request for Bids method, while claims 2 and 3 ar"
+brief,h06,timeline_ok,yes,0,,yes,,,,,gpt-oss-120b,yes,,llama-4-maverick,yes,,llama-3.3-70b,yes,
+brief,h06,precedents_relevant,5,0,,5,5.0,,,,gpt-oss-120b,5,,llama-4-maverick,5,,llama-3.3-70b,5,
+brief,h06,risks_relevant,3,0,,,3.0,,,,gpt-oss-120b,3,,llama-4-maverick,2,,llama-3.3-70b,3,
+brief,h06,any_unsupported_claim,no,0,,no,,,,,gpt-oss-120b,no,,llama-4-maverick,no,,llama-3.3-70b,no,
+brief,h07,timeline_ok,yes,0,,yes,,,,,gpt-oss-120b,yes,,llama-4-maverick,yes,,llama-3.3-70b,yes,
+brief,h07,precedents_relevant,5,0,,5,5.0,,,,gpt-oss-120b,5,,llama-4-maverick,5,,llama-3.3-70b,5,
+brief,h07,risks_relevant,3,0,,,3.0,,,,gpt-oss-120b,3,,llama-4-maverick,3,,llama-3.3-70b,3,
+brief,h07,any_unsupported_claim,no,1,judges differ,no,,,,,gpt-oss-120b,yes,"unsupported: ""Independent Verification Agent contract with larger amount ($1,972,700)."". Claim 1 lacks a cited record stating the $1,972,700 amount",llama-4-maverick,no,all 2 checked claims supported.,llama-3.3-70b,no,all 2 checked claims supported. All claims are supported by the cited records.
+brief,h08,timeline_ok,no,0,,no,,,,,gpt-oss-120b,no,,llama-4-maverick,no,,llama-3.3-70b,no,
+brief,h08,precedents_relevant,2,0,,3,3.0,,,,gpt-oss-120b,3,,llama-4-maverick,2,,llama-3.3-70b,2,
+brief,h08,risks_relevant,4,0,,,4.0,,,,gpt-oss-120b,4,,llama-4-maverick,4,,llama-3.3-70b,4,
+brief,h08,any_unsupported_claim,yes,0,,no,,,,,gpt-oss-120b,yes,,llama-4-maverick,yes,,llama-3.3-70b,yes,
+brief,h09,timeline_ok,yes,0,,yes,,,,,gpt-oss-120b,yes,,llama-4-maverick,yes,,llama-3.3-70b,yes,
+brief,h09,precedents_relevant,5,0,,5,5.0,,,,gpt-oss-120b,5,,llama-4-maverick,5,,llama-3.3-70b,5,
+brief,h09,risks_relevant,3,0,,,3.0,,,,gpt-oss-120b,3,,llama-4-maverick,3,,llama-3.3-70b,3,
+brief,h09,any_unsupported_claim,no,0,,no,,,,,gpt-oss-120b,no,,llama-4-maverick,no,,llama-3.3-70b,no,
+brief,h10,timeline_ok,yes,0,,yes,,,,,gpt-oss-120b,yes,,llama-4-maverick,yes,,llama-3.3-70b,yes,
+brief,h10,precedents_relevant,n/a,0,,n/a,0.0,,,,gpt-oss-120b,n/a,,llama-4-maverick,n/a,,llama-3.3-70b,n/a,
+brief,h10,risks_relevant,3,0,,,3.0,,,,gpt-oss-120b,3,,llama-4-maverick,3,,llama-3.3-70b,3,
+brief,h10,any_unsupported_claim,no,0,,no,,,,,gpt-oss-120b,no,,llama-4-maverick,no,,llama-3.3-70b,no,
