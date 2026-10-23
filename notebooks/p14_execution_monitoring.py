@@ -45,24 +45,6 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC <details><summary>Text version of the diagram</summary>
-# MAGIC
-# MAGIC ```
-# MAGIC  proc_gold.open_tender_scores (p07) ------> 1 stalled tenders      open longer than their P90
-# MAGIC  proc_gold.tender_timelines + benchmarks -> 2 slow signings       recent contracts above the slow threshold
-# MAGIC  FinancesOne loan / credit statements ----> 3 disbursement lag    disbursed share vs peers at the same point in time
-# MAGIC   (IBRD DS00975, IDA DS00976; Sep 2026  -> 4 closing extended   closing date moved since the Sep 2024 statement
-# MAGIC    and Sep 2024 snapshots)
-# MAGIC  latest ISR text (Documents API) ---------> 5 ISR ratings        PDO / IP below MS, or downgraded
-# MAGIC                                         -> 6 fiduciary risk      SORT fiduciary High, or Substantial and raised
-# MAGIC                                                    |
-# MAGIC                         proc_intel.monitoring.indicators() -> alert(): red / amber / watch / none
-# MAGIC                                                    v
-# MAGIC                          proc_gold.early_warnings (reasons + citations per project)
-# MAGIC ```
-# MAGIC
-# MAGIC </details>
-# MAGIC
 # MAGIC | Output | Grain | Key |
 # MAGIC |---|---|---|
 # MAGIC | `proc_bronze.loan_statements` | one IBRD loan or IDA credit in one monthly statement snapshot | `loan_id, end_of_period` |
@@ -74,32 +56,17 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## How it was built and tested
+# MAGIC ## Key design decisions
 # MAGIC
-# MAGIC **Step 1 — Is there a procurement rating in the ISR?**
-# MAGIC - **Question:** the brief asks for procurement-specific supervision signals; do ISRs rate procurement?
-# MAGIC - **What we found:** in the 400 last ISRs that p09 read (closed projects, 2017-2025), not one prints a "Procurement" rating line (older ISR templates had one; these do not). 398 of 400 print the SORT risk table, whose **Fiduciary** row (financial management and procurement together) gives the rating at approval, the last approved rating and the proposed one.
-# MAGIC - **Decision:** the procurement signal from the ISR is the SORT fiduciary rating, next to PDO and implementation-progress ratings (previous and current in the same ISR, so a downgrade is visible from one document).
+# MAGIC | Decision | Rationale | Evidence |
+# MAGIC |---|---|---|
+# MAGIC | The ISR procurement signal is the SORT Fiduciary rating, next to PDO and implementation-progress ratings (previous and current in the same ISR) | Current ISR templates have no procurement rating line; a downgrade is visible from one document | In the 400 last ISRs that p09 read (closed projects, 2017-2025) none prints a "Procurement" rating line; 398 of 400 print the SORT risk table, whose Fiduciary row gives the rating at approval, the last approved and the proposed one |
+# MAGIC | Disbursement and closing dates from FinancesOne (latest and two years earlier); the Projects API only for the lending instrument; disbursement lag judged for investment projects only | The Projects API's financial fields lag and keep no history; development policy and Program-for-Results operations disburse in tranches or against results | For P160446 the Projects API shows US$ 90.08 million on one loan and closing 30 June 2025, equal to the FinancesOne statement of September 2024, while September 2026 says US$ 133.9 million and 31 December 2025; FinancesOne statements are monthly snapshots (end of period 30 September 2026) and older snapshots can be selected |
+# MAGIC | Fixed thresholds: stalled = an open tender past its P90; slow signings = half or more of 3+ recent timed contracts above the peer slow threshold; disbursement lag = disbursed share at least 20 points below the peer median at the same elapsed decile (after the first quarter); closing extended = moved 6+ months in two years; ISR = PDO or IP below Moderately Satisfactory, or downgraded; fiduciary = High, or Substantial and raised since approval. Red = 3+ indicators, or ISR ratings with a disbursement lag; amber = 2; watch = 1 | Fixed thresholds are easy to explain and audit; disbursement needs a peer reference | Projects disburse slowly at first |
+# MAGIC | Indicators 5 and 6 backtested on the mid-period ISRs of p09's 400 closed projects against IEG's unsatisfactory rate (section 6) | Tests whether ISR signals warn early, at no extra download | These projects have a mid-period ISR text in the volume and IEG's outcome rating |
+# MAGIC | A second parser for the cell-per-line layout (`monitoring.parse_isr_cells`; the SORT parser reads both layouts); layout stored per ISR; fallback count shown in section 4 | A layout change otherwise causes a silent fallback to older ISRs; a further change would show as a jump in `needed_fallback` | An initial run needed an older ISR for 119 of 300 projects: for 127 of the 300 the newest ISR used the 2026 cell-per-line layout (8 more list no ISR at all); p09 saw the same with the 2024 template |
 # MAGIC
-# MAGIC **Step 2 — Where is disbursement data?**
-# MAGIC - **Question:** the Projects API has disbursement fields; are they usable?
-# MAGIC - **What we found:** the Projects API's financial fields lag: for P160446 its disbursement (US$ 90.08 million on one loan) and closing date (30 June 2025) equal the FinancesOne statement of September **2024**, while the September 2026 statement says US$ 133.9 million and 31 December 2025. Its rating fields are lists without the ISR they came from, and it keeps no history. The FinancesOne statements of IBRD loans and IDA credits are monthly snapshots (end of period 30 September 2026) with original, cancelled and disbursed amounts and the current closing date per loan, and an older snapshot can be selected with a filter.
-# MAGIC - **Decision:** disbursement and closing dates from FinancesOne (latest and two years earlier); the Projects API only for the lending instrument, which does not change. Disbursement lag is judged for investment projects only: development policy and Program-for-Results operations disburse in tranches or against results.
-# MAGIC
-# MAGIC **Step 3 — Thresholds and the alert**
-# MAGIC - **Question:** what counts as a warning?
-# MAGIC - **What we found:** fixed thresholds are easy to explain and to audit; the disbursement threshold needs a peer reference because projects disburse slowly at first.
-# MAGIC - **Decision:** stalled = at least one open tender past its P90; slow signings = half or more of 3+ recent timed contracts above their peer group's slow threshold; disbursement lag = disbursed share at least 20 points below the peer median at the same elapsed decile (after the first quarter of the period); closing extended = moved 6+ months in two years; ISR = PDO or IP below Moderately Satisfactory, or downgraded; fiduciary = High, or Substantial and raised since approval. Red = 3+ indicators, or ISR ratings together with a disbursement lag; amber = 2; watch = 1.
-# MAGIC
-# MAGIC **Step 4 — Do the ISR signals warn early?**
-# MAGIC - **Question:** is an ISR signal at mid-term informative about the final outcome?
-# MAGIC - **What we found:** the 400 closed projects of p09 have a mid-period ISR text in the volume and IEG's outcome rating.
-# MAGIC - **Decision:** section 6 parses the same signals from those mid-period ISRs and compares IEG's unsatisfactory rate for flagged and unflagged projects: a backtest of indicators 5 and 6 at no extra download.
-# MAGIC
-# MAGIC **Step 5 — The ISR text layout changed again in 2026**
-# MAGIC - **Question:** why did the first run need an older ISR for 119 of 300 projects?
-# MAGIC - **What we found:** for 127 of the 300 projects the newest ISR's text rendering prints the ratings table one cell per line ("Progress towards achievement of PDO" / "Moderately Unsatisfactory" / "Moderately Satisfactory") instead of fixed-width columns, so p09's parser read nothing and the code silently fell back to an older ISR (8 more projects list no ISR at all). The same happened in p09 with the 2024 template.
-# MAGIC - **Decision:** a second parser for the cell-per-line layout (`monitoring.parse_isr_cells`; the SORT parser reads both layouts), the layout stored per ISR, and the fallback count shown in section 4, so a third layout change would show up as a jump in `needed_fallback` instead of passing unnoticed.
+# MAGIC Full reasoning: docs/decision_log.md
 
 # COMMAND ----------
 
@@ -145,6 +112,7 @@ BEFORE = date(2024, 9, 30)                   # comparison statement for closing-
 STATEMENTS = {"DS00975": "IBRD loans", "DS00976": "IDA credits and grants"}
 ACTIVE_STATUSES = ("Disbursing", "Disbursing&Repaying", "Effective", "Signed", "Approved")
 ISR_SAMPLE = 300
+# "recent" signings for indicator 2: the last 24 months before the statement date
 RECENT_DAYS = 730
 DOCS_URL = "https://search.worldbank.org/api/v3/wds"
 PROJECTS_URL = "https://search.worldbank.org/api/v2/projects"
@@ -168,6 +136,7 @@ HTTP = requests.Session()
 # COMMAND ----------
 
 def pull_statement(ds: str, period: date) -> list[dict]:
+    # the FinancesOne filter expects the end_of_period date in the feed's own dd-Mon-yyyy text format
     label = period.strftime("%d-%b-%Y")
     path = f"{MON_DIR}/statements/{ds}_{period.isoformat()}.json"
     if os.path.exists(path):
@@ -175,6 +144,7 @@ def pull_statement(ds: str, period: date) -> list[dict]:
             return json.load(f)
     rows, skip = [], 0
     while True:
+        # same FinancesOne endpoint as the awards feed, different dataset; the resource id mirrors the dataset id
         body = get_json(AWARDS_URL, {"datasetId": ds, "resourceId": ds.replace("DS", "RS"), "type": "json", "top": 5000,
                                      "skip": skip, "filter": f"end_of_period='{label}'"}, session=HTTP)
         rows += body["data"]
@@ -188,6 +158,7 @@ def pull_statement(ds: str, period: date) -> list[dict]:
 
 def normalise(r: dict, ds: str) -> dict:
     ida = ds == "DS00976"
+    # the IDA statement has amounts in several currencies; its US$ columns end in "_us_"
     g = (lambda k: r.get(f"{k}_us_")) if ida else r.get
     return {"loan_id": r.get("credit_number") if ida else r.get("loan_number"), "source": STATEMENTS[ds],
             "project_id": r.get("project_id"), "status": r.get("credit_status") if ida else r.get("loan_status"),
@@ -247,6 +218,7 @@ def project_instruments() -> dict:
 
 
 instruments = project_instruments()
+# active by the loan statement: an active status and a closing date not yet passed on the statement date
 active_loans = L.filter((F.col("end_of_period") == F.lit(AS_OF)) & F.col("status").isin(*ACTIVE_STATUSES)
                         & (F.col("closing_date") >= F.lit(AS_OF)))
 active = (spark.table(f"{SILVER}.dim_project").select("project_id", "project_name", "country_code", "region", "major_sector",
@@ -280,6 +252,7 @@ stalled = {}
 for r in (spark.table(f"{GOLD}.open_tender_scores").filter("past_p90").filter(F.col("project_id").isin(pids))
           .select("project_id", "notice_id", "days_elapsed", "p90_days").collect()):
     stalled.setdefault(r.project_id, []).append({"notice_id": r.notice_id, "days_elapsed": int(r.days_elapsed), "p90_days": int(r.p90_days)})
+# p07's slow threshold is defined per method x category, so only that level is read
 slow_thr = (spark.table(f"{GOLD}.tender_benchmarks").filter("benchmark_level = 'method_category'")
             .select("procurement_method_name", "procurement_category_code", "slow_threshold_days"))
 recent = (spark.table(f"{GOLD}.tender_timelines")
@@ -291,6 +264,7 @@ recent_by = {r.project_id: r for r in recent.groupBy("project_id").agg(
     F.count("*").alias("n"), F.sum(F.col("slow").cast("int")).alias("n_slow"),
     F.slice(F.collect_list(F.when(F.col("slow"), F.col("contract_id"))), 1, 3).alias("slow_ids")).collect()}
 
+# cancelled and terminated loans would pull the disbursed share down without saying anything about progress
 stmt = L.filter(~F.col("status").isin("Fully Cancelled", "Terminated")).toPandas()
 now, before = stmt[stmt.end_of_period == AS_OF], stmt[stmt.end_of_period == BEFORE]
 position, closing = {}, {}
@@ -298,10 +272,14 @@ for pid, g in now[now.project_id.isin(pids)].groupby("project_id"):
     pos = mon.disbursement_position(g.to_dict("records"), AS_OF)
     if pos:
         position[pid] = {**pos, "loan_ids": sorted(g.loan_id)}
+    # compare closing dates only over loans present in both statements; a new loan added later is not an extension
     common = before[(before.project_id == pid) & before.loan_id.isin(g.loan_id)]
     if len(common):
         closing[pid] = (g[g.loan_id.isin(common.loan_id)].closing_date.max(), common.closing_date.max())
+# the peer curve uses investment projects only: development policy and program-for-results financing disburse on a
+# different pattern
 ipf = [p for p in position if info[p].get("instrument") == "Investment Project Financing"]
+# min(..., 9): a project exactly at (or past) its closing date belongs in the last decile
 deciles = pd.DataFrame([{"d": min(int(position[p]["elapsed_share"] * 10), 9), "s": position[p]["disbursed_share"]} for p in ipf])
 curve = deciles.groupby("d").s.median().to_dict()
 display(deciles.groupby("d").s.agg(["count", "median"]).rename_axis("elapsed decile").reset_index().round(3))
@@ -323,6 +301,7 @@ def get_text(url: str, max_retries: int = 5) -> str | None:
     for attempt in range(max_retries + 1):
         try:
             resp = HTTP.get(url, timeout=120)
+            # some listed documents have no text rendering; that is an answer, not an error to retry
             if resp.status_code in (403, 404, 410):
                 return None
             if resp.status_code not in RETRYABLE_STATUS:
@@ -347,6 +326,7 @@ def latest_isr(project_id: str) -> dict:
                       key=lambda d: d.get("docdt") or "", reverse=True)
         with open(lpath, "w") as f:
             json.dump(docs, f)
+    # up to three newest ISRs: the newest one sometimes has no readable ratings block
     for tried, d in enumerate(docs[:3], start=1):
         path = f"{MON_DIR}/isr_docs/{d['id']}.txt"
         if os.path.exists(path + ".missing"):
@@ -361,6 +341,8 @@ def latest_isr(project_id: str) -> dict:
         with open(path, encoding="utf-8") as f:
             text = f.read()
         r, s, layout = parse_isr_ratings(text), mon.parse_sort_ratings(text), "fixed-width"
+        # the 2026 text renderings print one table cell per line; fall back to that parser when the fixed-width one
+        # finds nothing
         if not (r.get("pdo_current") or r.get("ip_current")):
             r, layout = mon.parse_isr_cells(text), "cell-per-line"
         if r.get("pdo_current") or r.get("ip_current"):
@@ -378,6 +360,7 @@ def latest_isr(project_id: str) -> dict:
 recent_ids = {r.project_id for r in recent.select("project_id").distinct().collect()}
 open_ids = {r.project_id for r in spark.table(f"{GOLD}.open_tender_scores").select("project_id").distinct().collect()}
 with_activity = sorted(p for p in pids if p in recent_ids or p in open_ids)
+# hash order keeps the sample unrelated to how the projects are doing
 isr_pids = sorted(with_activity, key=lambda p: hashlib.sha256(p.encode()).hexdigest())[:ISR_SAMPLE]
 t0 = time.time()
 with ThreadPoolExecutor(max_workers=4) as pool:
@@ -426,6 +409,7 @@ for pid in pids:
     is_ipf = info[pid].get("instrument") == "Investment Project Financing"
     p = {"as_of": AS_OF, "stalled_tenders": stalled.get(pid, []),
          "recent_timed": rec.n if rec else 0, "recent_slow": rec.n_slow if rec else 0, "recent_slow_ids": rec.slow_ids if rec else [],
+         # non-investment projects get no disbursement-lag judgement (no_data), as their disbursement pattern differs
          "disbursed_share": pos["disbursed_share"] if pos and is_ipf else None,
          "elapsed_share": pos["elapsed_share"] if pos and is_ipf else None,
          "expected_share": mon.expected_share(curve, pos["elapsed_share"]) if pos and is_ipf else None,
@@ -435,6 +419,8 @@ for pid in pids:
          "isr": None if not isr else {"doc_id": isr["doc_id"], "pdo_prev": isr["pdo_previous"], "pdo_cur": isr["pdo_current"],
                                       "ip_prev": isr["ip_previous"], "ip_cur": isr["ip_current"],
                                       "fiduciary_approval": isr["fiduciary_approval"], "fiduciary_current": isr["fiduciary_current"],
+                                      # the archive date is when the ratings were given; the document date is only a
+                                      # fallback
                                       "as_of": date.fromisoformat(isr["archived_on"] or isr["doc_date"])}}
     inds = mon.indicators(p)
     a = mon.alert(inds)
@@ -473,6 +459,7 @@ display(dq_report([
     (ISR_TABLE, "sampled projects", n_isr, f"<= {ISR_SAMPLE}"),
     (WARN_TABLE, "active projects", n_warn, "info"),
     (WARN_TABLE, "duplicate project_id", duplicate_keys(W, ["project_id"]), "== 0"),
+    # every triggered indicator must point to a record a user can open
     (WARN_TABLE, "triggered alerts without a citation", W.filter("n_triggered > 0 AND size(citations) = 0").count(), "== 0"),
     (WARN_TABLE, "orphan project_id", orphan_count(W, "project_id", spark.table(f"{SILVER}.dim_project"), "project_id"), "== 0"),
 ]))
@@ -508,6 +495,7 @@ display(W.filter("alert_level = 'red' AND isr_doc_id IS NOT NULL")
 
 mid = (spark.table(f"{BRONZE}.rating_documents").filter("role = 'isr_earlier' AND file_path IS NOT NULL")
        .select("project_id", "file_path", "pdo_previous", "pdo_current", "ip_previous", "ip_current").toPandas())
+# backtest ground truth: IEG's outcome from p09; below 4 (Moderately Satisfactory) counts as unsatisfactory
 ieg = {r.project_id: r.score for r in spark.table(f"{SILVER}.project_ratings_evidence").filter("source_type = 'ieg_validation'").collect()}
 bt = []
 for r in mid.itertuples():
@@ -522,6 +510,8 @@ for r in mid.itertuples():
                "fiduciary_substantial_or_high": mon.RISK_SCALE.get(fid.get("current") or "", 0) >= 3})
 bt = pd.DataFrame(bt)
 rows = []
+# fiduciary signals are compared only where the mid-period ISR printed a SORT table, so "unknown" is not counted as "no
+# signal"
 for sig, base in [("isr_signal", bt), ("fiduciary_signal", bt[bt.fiduciary_known]), ("fiduciary_substantial_or_high", bt[bt.fiduciary_known])]:
     for flag in (True, False):
         g = base[base[sig] == flag]

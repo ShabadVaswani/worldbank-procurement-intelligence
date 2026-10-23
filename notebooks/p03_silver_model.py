@@ -116,62 +116,6 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC <details><summary>Text version of the diagram</summary>
-# MAGIC
-# MAGIC ```
-# MAGIC  cardinality at each end: 1 = exactly one, 0..1 = zero or one, 0..N = zero or more, 1..N = one or more
-# MAGIC
-# MAGIC  +------------------------+  0..N        1  +----------------------+  1        0..N  +----------------------+
-# MAGIC  | notices                |---------------->| dim_project          |<----------------| contracts            |
-# MAGIC  | PK notice_id           |                 | PK project_id        |                 | PK contract_id       |
-# MAGIC  | FK project_id          |                 +----------------------+                 | FK project_id        |
-# MAGIC  +------------------------+                                                          +----------------------+
-# MAGIC     | 1          | 1                                                                     1 |            | 1
-# MAGIC     |            |                +-------------------------------+                        |            |
-# MAGIC     |            +------ 0..N --->| notice_contract_links  (p05)  |<--- 0..N --------------+            |
-# MAGIC     |                             | PK notice_id, contract_id     |  notices N:M contracts              |
-# MAGIC     |                             +-------------------------------+                                     |
-# MAGIC     | 0..N                                                                                         1..N |
-# MAGIC  +------------------------+                                                          +----------------------+
-# MAGIC  | notice_bidders         |                                                          | contract_suppliers   |
-# MAGIC  | PK notice_id,          |                                                          | PK contract_id,      |
-# MAGIC  |    supplier_id         |                                                          |    supplier_id       |
-# MAGIC  | role: awarded /        |                                                          +----------------------+
-# MAGIC  |  evaluated / rejected  |                                                                     | 0..N
-# MAGIC  +------------------------+                                                                     |
-# MAGIC     | 0..N                                  1  +----------------------+  1                      |
-# MAGIC     +----------------------------------------->| suppliers            |<------------------------+
-# MAGIC                                                | PK supplier_id       |
-# MAGIC                                                +----------------------+
-# MAGIC                                                           | 1
-# MAGIC                                                           | 1     p04 entity resolution: every supplier is mapped
-# MAGIC                                                +----------------------+
-# MAGIC                                                | supplier_entity_map  |
-# MAGIC                                                | PK supplier_id       |
-# MAGIC                                                | FK supplier_entity_id|
-# MAGIC                                                +----------------------+
-# MAGIC                                                           | 1..N
-# MAGIC                                                           | 1
-# MAGIC                                                +----------------------+
-# MAGIC                                                | supplier_entities    |
-# MAGIC                                                | PK supplier_entity_id|
-# MAGIC                                                +----------------------+
-# MAGIC
-# MAGIC  Lookups (child N : parent 1 when the FK is always set, N : 0..1 when it may be null):
-# MAGIC    dim_country (PK country_code)        <- dim_project.country_code, notices.country_code,
-# MAGIC                                            contracts.borrower_country_code, suppliers.supplier_country_code,
-# MAGIC                                            supplier_entities.country_code, contract_suppliers.supplier_country_code,
-# MAGIC                                            notice_bidders.firm_country_code                       (all N : 0..1)
-# MAGIC    dim_procurement_method (PK method_name)       <- contracts (N : 1), notices (N : 0..1)
-# MAGIC    dim_procurement_category (PK category_code)   <- contracts (N : 1), notices (N : 0..1)
-# MAGIC  Every dim_project row is referenced by at least one notice or contract.
-# MAGIC  Reused from the outcome project by join, not copied:
-# MAGIC    silver.country_year (WGI + macro)  on (country_code = country_iso2, year)
-# MAGIC    silver.projects, gold.active_project_scores, silver.rag_chunks  on project_id
-# MAGIC ```
-# MAGIC
-# MAGIC </details>
-# MAGIC
 # MAGIC notice_bidders keeps the strongest role per firm per notice (awarded > evaluated > rejected; see the dedup in section 5, `notices` and `notice_bidders`); per-lot outcomes would need the lot in the key.
 # MAGIC
 # MAGIC Every `dim_project` row is referenced by at least one notice or contract. Reused from the outcome project by join, not copied: `silver.country_year` (WGI + macro) on (`country_code` = `country_iso2`, year); `silver.projects`, `gold.active_project_scores` and `silver.rag_chunks` on `project_id`.
@@ -179,37 +123,18 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## How it was built and tested
+# MAGIC ## Key design decisions
 # MAGIC
-# MAGIC **Step 1 — Is the amount per supplier or per contract?**
-# MAGIC - **Question:** a joint-venture contract has one row per member, each with `supplier_contract_amount_usd`. Is that the member's share, or the contract value repeated?
-# MAGIC - **What we found:** in 7,083 of the 8,864 multi-supplier contracts every row carries the identical amount. In the other 1,781 the two values differ by a fixed ratio, almost always exactly 1.0303 or 1.0003 — a conversion artefact, not a split. Example: contract 1543858 lists AIRES INGEGNERIA and ALL INGEGNERIA, both at US$161,538.89.
-# MAGIC - **Decision:** the amount is the **contract value repeated per member**. `contracts.contract_amount_usd` holds it once (the maximum of the rows, with `amount_spread_ratio` kept as a quality flag). Summing the raw column would double-count every joint venture.
+# MAGIC | Decision | Rationale | Evidence |
+# MAGIC |---|---|---|
+# MAGIC | `contracts.contract_amount_usd` holds the amount once per contract (the maximum of the rows), with `amount_spread_ratio` kept as a quality flag | `supplier_contract_amount_usd` is the contract value repeated per joint-venture member; summing the raw column would double-count every joint venture | In 7,083 of the 8,864 multi-supplier contracts every row carries the identical amount; in the other 1,781 the values differ by a fixed ratio, almost always exactly 1.0303 or 1.0003 (a conversion artefact, not a split); contract 1543858 lists AIRES INGEGNERIA and ALL INGEGNERIA, both at US$161,538.89 |
+# MAGIC | Project, method, category, dates and reference stored once in `contracts`; `contract_suppliers` keeps only what varies by member | These attributes are contract-level | For all 282,890 contracts each of these columns has exactly one value (re-checked in the quality table) |
+# MAGIC | One crosswalk (`proc_intel.countries`) maps every code and name to ISO alpha-2, or to the Bank's regional code | Without it, five borrowers would silently lose their governance indicators | The feed uses Bank codes: DR Congo `ZR`, Serbia `YF`, Yemen `RY`, Timor-Leste `TP`, West Bank and Gaza `GZ` (ISO `CD`, `RS`, `YE`, `TL`, `PS`); Côte d'Ivoire and Somalia rows have no code (4,972 and 2,837 rows); regional codes such as `3W`; notices use names with their own spellings ("Turkey", "Türkiye", "Vietnam", "Somalia") |
+# MAGIC | `suppliers` has one row per `supplier_id` with a flag for anonymised individuals; grouping ids into firms is done in `p04`; the award row without an id gets a surrogate id `NOID-<hash>` | `supplier_id` is a registration id, not a firm identity | Individual consultants are anonymised ("INDIVIDUAL CONSULTANT", 16-character hashed id, 65,121 rows); 6,648 names occur under more than one id |
+# MAGIC | Firm ids, names, countries and roles parsed from award notices into `notice_bidders`; beneficial-ownership tables never read; bidders that never won a contract still get a `suppliers` row | Losing bidders are a competition signal; ownership tables name private persons; the foreign key must hold | Award-notice HTML lists awarded, evaluated and rejected firms as "NAME (supplier id)", plus the award notification date and contract duration; some notices carry beneficial-ownership tables |
+# MAGIC | Primary and foreign keys declared, and duplicates and orphans counted in the closing quality table | Unity Catalog keys are informational, not enforced | Nothing stops a duplicate or an orphan from being written |
 # MAGIC
-# MAGIC **Step 2 — Contract attributes really are contract-level**
-# MAGIC - **Question:** can project, method, category, dates and reference move from the row level to one row per contract without losing information?
-# MAGIC - **What we found:** for all 282,890 contracts each of these columns has exactly one value (re-checked below in the quality table).
-# MAGIC - **Decision:** `contracts` holds them once; `contract_suppliers` keeps only what varies by member.
-# MAGIC
-# MAGIC **Step 3 — Country codes do not line up**
-# MAGIC - **Question:** does the awards feed's country code join to the governance indicators?
-# MAGIC - **What we found:** the feed uses the Bank's own codes. DR Congo is `ZR`, Serbia `YF`, Yemen `RY`, Timor-Leste `TP`, West Bank and Gaza `GZ`, while the indicators use ISO (`CD`, `RS`, `YE`, `TL`, `PS`). Côte d'Ivoire and Somalia rows arrive with **no code at all** (4,972 and 2,837 rows). Regional programmes have codes such as `3W` (Western and Central Africa). The notices feed only has names, with its own spellings ("Turkey", "Türkiye", "Vietnam", "Somalia").
-# MAGIC - **Decision:** one crosswalk (`proc_intel.countries`) maps every code and name to ISO alpha-2, or to the Bank's regional code. Without it, five borrowers would silently lose their governance indicators.
-# MAGIC
-# MAGIC **Step 4 — Who is a supplier?**
-# MAGIC - **Question:** is `supplier_id` an identity?
-# MAGIC - **What we found:** individual consultants are anonymised: supplier "INDIVIDUAL CONSULTANT" with a 16-character hashed id (65,121 rows). Otherwise `supplier_id` is a registration id: stable in spelling for most ids, but one firm often holds several ids (6,648 names occur under more than one id).
-# MAGIC - **Decision:** `suppliers` has one row per `supplier_id` (with a flag for anonymised individuals); grouping ids into real firms is entity resolution, done in `p04`. One award row has no id (its supplier text is a broken fragment); it gets a surrogate id `NOID-<hash>` so the bridge keeps its key.
-# MAGIC
-# MAGIC **Step 5 — Award notices name the losing bidders too**
-# MAGIC - **Question:** what is inside a Contract Award notice besides the winner?
-# MAGIC - **What we found:** the HTML lists awarded, evaluated and rejected firms, each as "NAME (supplier id)", plus the date the award notification was issued and the contract duration. Some notices also carry beneficial-ownership tables naming private persons.
-# MAGIC - **Decision:** parse firm ids, names, countries and roles into `notice_bidders` (a competition signal for phase 2), and **never** read the ownership tables. Bidders that never won a contract in the awards feed still get a `suppliers` row, so the foreign key holds.
-# MAGIC
-# MAGIC **Step 6 — Keys that are declared but not enforced**
-# MAGIC - **Question:** what do primary and foreign keys guarantee on Databricks?
-# MAGIC - **What we found:** Unity Catalog keys are informational. Nothing stops a duplicate or an orphan from being written.
-# MAGIC - **Decision:** declare them (documentation, lineage, optimizer hints) **and** count duplicates and orphans in the quality table at the end of this notebook.
+# MAGIC Full reasoning: docs/decision_log.md
 
 # COMMAND ----------
 
@@ -259,10 +184,12 @@ award_schema = StructType([
 ])
 award_udf = as_udf(parse_award_notice, award_schema)
 
+# soft-deleted bronze rows stay for the audit trail but must not reach the model
 awards = spark.table(f"{BRONZE}.contract_awards").filter("_removed_at_source IS NULL")
 raw_notices = spark.table(f"{BRONZE}.procurement_notices")
 INDIVIDUAL_ID = "^[0-9a-f]{16}$"     # anonymised individual consultants
 
+# foreign keys pointing at a parent table block overwriting it, so drop them all first and redeclare them in section 9
 dropped_fks = drop_foreign_keys(SILVER)
 print("foreign keys dropped before rebuild:", dropped_fks)
 
@@ -300,11 +227,13 @@ print("categories:", n_categories)
 notice_methods = (raw_notices.select(method_udf("procurement_method_name").alias("method_name"),
                                      F.nullif(F.trim("procurement_method_code"), F.lit("")).alias("code"))
                   .filter("method_name IS NOT NULL"))
+# a name can appear with more than one code in the notices feed; keep its most frequent code
 method_codes = (notice_methods.filter("code IS NOT NULL").groupBy("method_name", "code").count()
                 .withColumn("rn", F.row_number().over(Window.partitionBy("method_name").orderBy(F.desc("count"))))
                 .filter("rn = 1").select("method_name", F.col("code").alias("method_code")))
 methods = (awards.select(method_udf("procurement_method").alias("method_name"))
            .groupBy("method_name").agg(F.count("*").alias("n_award_rows"))
+           # full join: some methods occur in only one of the two feeds
            .join(notice_methods.groupBy("method_name").agg(F.count("*").alias("n_notices")), "method_name", "full")
            .filter("method_name IS NOT NULL")
            .join(method_codes, "method_name", "left")
@@ -338,6 +267,8 @@ award_names = (awards.select(to_iso2_udf("borrower_country_code", "borrower_coun
                .unionByName(awards.select(to_iso2_udf("supplier_country_code", "supplier_country").alias("country_code"),
                                           F.col("supplier_country").alias("name")))
                .filter("country_code IS NOT NULL AND name IS NOT NULL").distinct())
+# only for codes already seen in the awards: the indicators table also holds aggregates ("World", regions) that are not
+# countries
 indicator_names = (spark.table(OUTCOME_INDICATORS).filter("country_iso2 <> ''")
                    .groupBy(F.col("country_iso2").alias("country_code"))
                    .agg(F.first("country_name").alias("indicator_name"))
@@ -348,6 +279,7 @@ name_to_code = (award_names.unionByName(alias_names)
                 .unionByName(indicator_names.select("country_code", F.col("indicator_name").alias("name")))
                 .unionByName(regional_names).distinct().cache())
 ambiguous = name_to_code.groupBy("name").agg(F.countDistinct("country_code").alias("codes")).filter("codes > 1")
+# a spelling that maps to two codes would duplicate rows in every join on this lookup
 assert ambiguous.count() == 0, f"country names mapping to several codes: {ambiguous.collect()}"
 country_lookup = name_to_code.withColumnRenamed("name", "_cname")
 print("country spellings:", name_to_code.count(), "| codes:", name_to_code.select("country_code").distinct().count())
@@ -363,6 +295,7 @@ print("country spellings:", name_to_code.count(), "| codes:", name_to_code.selec
 
 # COMMAND ----------
 
+# first() is safe for the contract-level columns: section 10 checks that none of them varies within a contract
 contracts = (awards.groupBy(F.col("wb_contract_number").alias("contract_id")).agg(
         F.first("project_id").alias("project_id"),
         F.first("borrower_country_code").alias("_bcode"), F.first("borrower_country").alias("borrower_country_name"),
@@ -371,7 +304,9 @@ contracts = (awards.groupBy(F.col("wb_contract_number").alias("contract_id")).ag
         F.first("review_type").alias("review_type"),
         F.first("borrower_contract_reference_number").alias("borrower_reference"),
         F.first("contract_description").alias("contract_description"),
+        # max, not sum: the feed repeats the contract value on every joint-venture member row
         F.max("supplier_contract_amount_usd").alias("contract_amount_usd"),
+        # spread is usually 1.0; ~1.03 or ~1.0003 is a known conversion artefact, not a split between members
         (F.max("supplier_contract_amount_usd") / F.nullif(F.min("supplier_contract_amount_usd"), F.lit(0.0)))
             .alias("amount_spread_ratio"),
         F.count("*").alias("n_suppliers"),
@@ -431,6 +366,7 @@ def blank_to_null(col: str):
     return F.nullif(F.trim(F.col(col)), F.lit(""))
 
 
+# bronze also holds pre-2018 rows from the last page of each country; silver keeps the 2018+ window only
 in_window = (raw_notices.withColumn("notice_date", F.to_date("noticedate", "dd-MMM-yyyy"))
              .filter(F.col("notice_date") >= F.lit(NOTICE_CUTOFF)))
 # Parse only award notices: a Python UDF inside F.when would still run on every row.
@@ -440,6 +376,7 @@ notices_typed = (in_window.join(award_parsed, "id", "left")
                  .join(country_lookup, F.col("project_ctry_name") == F.col("_cname"), "left"))
 notices = notices_typed.select(
     F.col("id").alias("notice_id"), blank_to_null("notice_type").alias("notice_type"), "notice_date",
+    # these fields arrive as timestamps in text; the first 10 characters are the ISO date
     F.to_date(F.substring("submission_date", 1, 10)).alias("published_date"),
     F.to_date(F.substring("submission_deadline_date", 1, 10)).alias("submission_deadline"),
     blank_to_null("project_id").alias("project_id"),
@@ -459,9 +396,11 @@ notices = notices_typed.select(
     F.col("award.contract_duration_days").alias("contract_duration_days"),
     F.size("award.firms").alias("n_named_firms"),
     F.col("award.firms").alias("_firms"))
+# reused twice below (notices table and the exploded bidders), and the award UDF is the expensive part
 notices.cache()
 
 n_notices = publish_table(
+    # size() of a null array is -1, so blank the count on non-award notices instead of showing -1
     notices.drop("_firms").withColumn("n_named_firms", F.when(F.col("notice_type") == "Contract Award",
                                                              F.col("n_named_firms"))),
     f"{SILVER}.notices",
@@ -524,6 +463,7 @@ print("notices:", n_notices, "| notice_bidders:", n_bidders)
 
 # COMMAND ----------
 
+# one award row has no supplier_id; a surrogate keyed on its text keeps the bridge's primary key non-null
 supplier_key = F.coalesce("supplier_id", F.concat(F.lit("NOID-"), F.substring(F.sha2("supplier", 256), 1, 12)))
 contract_suppliers = (awards.select(
         F.col("wb_contract_number").alias("contract_id"), supplier_key.alias("supplier_id"),
@@ -541,6 +481,7 @@ n_cs = publish_table(
 
 cs = spark.table(f"{SILVER}.contract_suppliers")
 contract_value = spark.table(f"{SILVER}.contracts").select("contract_id", "contract_amount_usd", "signing_date")
+# contracts carries the amount once per contract, so summing it per member does not double count within a joint venture
 award_side = (cs.join(contract_value, "contract_id")
               .groupBy("supplier_id").agg(
                   F.mode("supplier_name").alias("award_name"),
@@ -552,6 +493,7 @@ award_side = (cs.join(contract_value, "contract_id")
 notice_side = (spark.table(f"{SILVER}.notice_bidders").groupBy("supplier_id").agg(
                   F.mode("firm_name").alias("notice_name"), F.mode("firm_country_code").alias("notice_country"),
                   F.countDistinct("notice_id").alias("n_award_notices")))
+# full join so losing bidders that never won a contract still get a supplier row (no orphans in notice_bidders)
 suppliers = (award_side.join(notice_side, "supplier_id", "full").select(
     "supplier_id",
     F.coalesce("award_name", "notice_name").alias("supplier_name"),
@@ -608,11 +550,14 @@ risk = spark.table(RISK_SCORES).select("project_id", F.col("risk_band").alias("o
                                        F.col("risk_of_failure").alias("outcome_risk_of_failure"))
 contract_country = (spark.table(f"{SILVER}.contracts").groupBy("project_id")
                     .agg(F.mode("borrower_country_code").alias("contract_country")))
+# all left joins on project_id: each side is already one row per project, so the grain stays one row per project
 projects = (project_ids.join(award_proj, "project_id", "left").join(notice_proj, "project_id", "left")
             .join(outcome, "project_id", "left").join(risk, "project_id", "left")
             .join(contract_country, "project_id", "left")
             .select("project_id",
                     F.coalesce("award_project_name", "notice_project_name", "outcome_project_name").alias("project_name"),
+                    # prefer the crosswalked procurement codes; the outcome table's code goes through the same crosswalk
+                    # as a fallback
                     F.coalesce("contract_country", "notice_country", to_iso2_udf("outcome_country")).alias("country_code"),
                     F.coalesce("award_region", "outcome_region").alias("region"),
                     "global_practice", "major_sector", "approval_date", "approval_fy", "commitment_musd", "status",
@@ -736,6 +681,7 @@ checks += [(child, f"orphan {col} -> {parent}", orphan_count(T[child], col, T[pa
 
 per_contract_attrs = ["project_id", "contract_signing_date", "procurement_method", "procurement_category",
                       "borrower_contract_reference_number", "review_type", "borrower_country_code", "fiscal_year"]
+# re-checks the Step 2 claim on every run; nulls are counted as a value so null-vs-value also counts as varying
 varying = (awards.groupBy("wb_contract_number")
            .agg(*[F.countDistinct(F.coalesce(F.col(c).cast("string"), F.lit("<null>"))).alias(c) for c in per_contract_attrs])
            .filter(" OR ".join(f"{c} > 1" for c in per_contract_attrs)).count())
@@ -745,6 +691,7 @@ checks += [
     ("contracts", "rows in bronze (current)", awards.count(), "info"),
     ("contracts", "contract_amount_usd null", null_count(c, "contract_amount_usd"), "info"),
     ("contracts", "contract_amount_usd <= 0", c.filter("contract_amount_usd <= 0").count(), "info"),
+    # info only: very large contracts exist (e.g. big works), so this is a pointer for review, not an error
     ("contracts", "contract_amount_usd > 500 million", c.filter("contract_amount_usd > 5e8").count(), "info"),
     ("contracts", "amount_spread_ratio > 1.05 (members disagree by >5%)", c.filter("amount_spread_ratio > 1.05").count(), "info"),
     ("contracts", "signing_date null", null_count(c, "signing_date"), "== 0"),
@@ -777,6 +724,7 @@ checks += [
 ]
 dq = dq_report(checks)
 display(dq)
+# stop the job if any rule fails, so downstream notebooks never build on a broken model
 assert (dq["status"] != "FAIL").all(), dq[dq["status"] == "FAIL"]
 
 # COMMAND ----------

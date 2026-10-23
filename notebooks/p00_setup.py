@@ -34,22 +34,6 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC <details><summary>Text version of the diagram</summary>
-# MAGIC
-# MAGIC ```
-# MAGIC  dbw_wb_outcome
-# MAGIC   +-- bronze / silver / gold / ml      outcome project (read only from here)
-# MAGIC   +-- proc_bronze                      raw records as delivered by the APIs
-# MAGIC   |     +-- raw (volume)               untouched JSON pages, one folder per snapshot
-# MAGIC   +-- proc_silver                      cleaned, typed, keyed model (contracts, suppliers, notices, ...)
-# MAGIC   +-- proc_gold                        tender timelines and the knowledge graph (nodes / edges)
-# MAGIC ```
-# MAGIC
-# MAGIC </details>
-
-# COMMAND ----------
-
-# MAGIC %md
 # MAGIC ## 1. Schemas and volume
 # MAGIC
 # MAGIC **What:** creates `proc_bronze`, `proc_silver`, `proc_gold` and the volume `proc_bronze.raw`.

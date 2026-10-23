@@ -29,6 +29,7 @@ import sys
 import tempfile
 from datetime import date
 
+# notebooks run with the notebook folder as cwd, so ../src is the repo's src/ in both Repos and workspace copies
 SRC_DIR = os.path.abspath(os.path.join(os.getcwd(), "..", "src"))
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
@@ -51,6 +52,7 @@ RISK_SCORES = f"{CATALOG}.gold.active_project_scores"      # outcome-model risk 
 RAG_CHUNKS = f"{CATALOG}.silver.rag_chunks"                # 50k document chunks with embeddings
 
 AWARDS_URL = "https://datacatalogapi.worldbank.org/dexapps/fone/api/apiservice"
+# FinancesOne addresses a dataset by dataset + resource id; DS00005/RS00005 is the IPF contract-awards table
 AWARDS_PARAMS = {"datasetId": "DS00005", "resourceId": "RS00005", "type": "json"}
 AWARDS_SOURCE = "financesone/DS00005"
 NOTICES_URL = "https://search.worldbank.org/api/v2/procnotices"
@@ -83,6 +85,8 @@ def as_udf(fn, return_type):
 
 def row_hash(columns: list[str]):
     """SHA-256 over the given columns, null-safe, as a change detector."""
+    # coalesce to a placeholder first: concat_ws silently skips nulls, so (NULL, "x") and ("x", NULL) would hash the
+    # same
     return F.sha2(F.concat_ws("||", *[F.coalesce(F.col(c).cast("string"), F.lit("<null>")) for c in columns]), 256)
 
 
@@ -93,15 +97,18 @@ def merge_upsert(df: DataFrame, target: str, key: str, mark_removed: bool = Fals
         df = df.withColumn("_removed_at_source", F.lit(None).cast("timestamp"))
         changed += " OR t._removed_at_source IS NOT NULL"   # a withdrawn row that came back
     if not spark.catalog.tableExists(target):
+        # create an empty table with the source schema so the first run can go through the same MERGE path as later runs
         df.limit(0).write.saveAsTable(target)
     merge = (DeltaTable.forName(spark, target).alias("t")
              .merge(df.alias("s"), f"t.{key} = s.{key}")
              .whenMatchedUpdateAll(condition=changed)
              .whenNotMatchedInsertAll())
     if mark_removed:
+        # only rows not already flagged, so the original withdrawal timestamp is kept on later runs
         merge = merge.whenNotMatchedBySourceUpdate(condition="t._removed_at_source IS NULL",
                                                    set={"_removed_at_source": "current_timestamp()"})
     merge.execute()
+    # history(1) is the MERGE just executed; Delta stores the counts there rather than returning them from execute()
     metrics = DeltaTable.forName(spark, target).history(1).select("operationMetrics").first()[0]
     wanted = ["numSourceRows", "numTargetRowsInserted", "numTargetRowsUpdated",
               "numTargetRowsNotMatchedBySourceUpdated"]
@@ -128,6 +135,7 @@ def publish_table(df: DataFrame, table: str, comment: str, column_comments: dict
                   primary_key: list[str] | None = None) -> int:
     """Overwrite `table` with df, document it, declare its primary key; returns the row count."""
     missing = set(df.columns) - set(column_comments)
+    # refuse to publish an undocumented column rather than leave a gap in Catalog Explorer
     assert not missing, f"{table}: columns without a comment: {sorted(missing)}"
     (df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(table))
     spark.sql(f"COMMENT ON TABLE {table} IS '{_quote(comment)}'")
@@ -135,8 +143,10 @@ def publish_table(df: DataFrame, table: str, comment: str, column_comments: dict
         spark.sql(f"ALTER TABLE {table} ALTER COLUMN `{col}` COMMENT '{_quote(text)}'")
     if primary_key:
         name = f"pk_{table.split('.')[-1]}"
+        # an overwrite keeps the old constraint, so drop it before re-adding (otherwise ADD fails on re-runs)
         spark.sql(f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {name}")
         for col in primary_key:
+            # Unity Catalog only accepts a PRIMARY KEY on NOT NULL columns
             spark.sql(f"ALTER TABLE {table} ALTER COLUMN `{col}` SET NOT NULL")
         spark.sql(f"ALTER TABLE {table} ADD CONSTRAINT {name} PRIMARY KEY ({', '.join(primary_key)})")
     return spark.table(table).count()
@@ -193,6 +203,7 @@ def dq_report(checks: list[tuple]) -> pd.DataFrame:
     rows = []
     for table, check, value, rule in checks:
         if rule == "info":
+            # 'info' rows are context for the reader, never a pass/fail
             status = "info"
         else:
             op, bound = rule.split()

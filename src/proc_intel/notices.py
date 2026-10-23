@@ -43,6 +43,7 @@ def _firms_in(segment: str, role: str) -> list[dict]:
     segment = _OWNERSHIP.split(segment, maxsplit=1)[0]          # never read ownership tables
     firms: dict[str, dict] = {}
     for name, supplier_id, tail in _FIRM.findall(segment):
+        # a firm can be printed more than once in a section; keep its first entry
         if supplier_id in firms:
             continue
         country = _COUNTRY.search(tail)
@@ -72,6 +73,7 @@ def parse_award_notice(markup: str | None) -> dict:
     marks = list(_SECTION.finditer(markup))
     firms: list[dict] = []
     for i, mark in enumerate(marks):
+        # each section runs to the start of the next section header (or the end of the notice)
         end = marks[i + 1].start() if i + 1 < len(marks) else len(markup)
         firms.extend(_firms_in(markup[mark.end():end], mark.group(1).lower()))
     duration = _DURATION.search(markup)

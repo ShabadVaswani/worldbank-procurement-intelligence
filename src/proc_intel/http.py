@@ -24,6 +24,7 @@ def retry_delay(attempt: int, response_text: str = "", retry_after: str | None =
         return min(float(retry_after), cap)
     hint = _TRY_AGAIN.search(response_text or "")
     if hint:
+        # one extra second so the retry lands after the server's window, not on its edge
         return min(float(hint.group(1)) + 1.0, cap)
     return min(base * 2 ** attempt, cap)
 
@@ -51,6 +52,8 @@ def get_json(url: str, params: Mapping[str, Any], *, session: requests.Session |
         except (requests.ConnectionError, requests.Timeout, requests.JSONDecodeError) as exc:
             last_error = exc
             delay = retry_delay(attempt)
+        # no sleep after the last attempt: the caller gets the error straight away
         if attempt < max_retries:
+            # jitter so parallel workers (4 countries at once in p02) do not retry in lockstep
             sleep(delay + random.uniform(0, 1))
     raise RuntimeError(f"giving up on {url} {dict(params)} after {max_retries + 1} attempts") from last_error

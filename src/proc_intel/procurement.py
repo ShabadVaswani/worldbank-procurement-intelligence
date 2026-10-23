@@ -26,11 +26,13 @@ METHOD_COMPETITION = {
     "National Competitive Bidding": "open",
     "Request for Proposals": "open",
     "E-Auctions": "open",
+    # consultant selections that start with a public request for expressions of interest count as open
     "Quality And Cost-Based Selection": "open",
     "Quality Based Selection": "open",
     "Fixed Budget Selection": "open",
     "Least Cost Selection": "open",
     "Request for Quotations": "limited",
+    # CQS and individual selection compare a shortlist or CVs; no open advertisement of the contract itself
     "Consultant Qualification Selection": "limited",
     "Individual Consultant Selection": "limited",
     "Commercial Practices": "limited",

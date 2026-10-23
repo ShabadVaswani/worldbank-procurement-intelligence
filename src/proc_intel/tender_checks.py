@@ -94,6 +94,7 @@ def money_mentions(window: str) -> list[tuple[float, str]]:
     """(amount, currency) pairs in a text window; amounts below 100 are ignored (they are lot or clause numbers)."""
     out = []
     for m in MONEY_RE.finditer(window):
+        # MONEY_RE has two alternatives (currency before or after the amount); whichever matched fills its own groups
         if m.group(1):
             cur, num, scale = m.group(1), m.group(2), m.group(3)
         else:
@@ -133,6 +134,7 @@ def bid_security(text: str) -> dict:
     out = {"kind": None, "percent": None, "amount": None, "currency": None, "n_amounts": 0}
     matches = list(SECURITY_RE.finditer(text))
     windows = [text[m.start(): m.end() + 220] for m in matches]
+    # "bid security is not required" must win over any amount printed elsewhere in the notice
     if any(NOT_REQUIRED_RE.match(text, m.end()) for m in matches):
         out["kind"] = "not_required"
         return out
@@ -142,11 +144,14 @@ def bid_security(text: str) -> dict:
         return out
     for w in windows:
         p = PERCENT_RE.search(w[:140])
+        # bid security is a small share of the bid price; a larger percentage near the phrase is something else (e.g. a
+        # price preference)
         if p and 0 < float(p.group(1)) <= 10:
             out.update(kind="percent", percent=float(p.group(1)))
             return out
     amounts = [a for w in windows for a in money_mentions(w)]
     if amounts:
+        # several amounts usually means one per lot; the largest is kept and the count is reported
         value, cur = max(amounts)
         out.update(kind="amount", amount=value, currency=cur, n_amounts=len({a for a, _ in amounts}))
         return out
@@ -166,6 +171,7 @@ def n_lots(text: str) -> int | None:
 def bid_validity_days(text: str) -> int | None:
     m = re.search(r"valid(?:ity)?\s+(?:for\s+)?(?:a\s+)?(?:period\s+of\s+)?(\d{2,3})\s*(?:\(\w+\)\s*)?(?:calendar\s+)?days",
                   text or "", re.I)
+    # outside 28-365 days the number is more likely another period (e.g. a contract duration) than a bid validity
     return int(m.group(1)) if m and 28 <= int(m.group(1)) <= 365 else None
 
 
@@ -227,6 +233,7 @@ def quantile(values: list[float], q: float) -> float | None:
     v = sorted(x for x in values if x is not None)
     if not v:
         return None
+    # same linear interpolation as numpy's default quantile, without needing numpy here
     pos = (len(v) - 1) * q
     lo, hi = int(pos), min(int(pos) + 1, len(v) - 1)
     return v[lo] + (v[hi] - v[lo]) * (pos - lo)
@@ -258,6 +265,7 @@ def policy_min_calendar_days(approach: str | None, notice_type: str = "Invitatio
         bd = POLICY_MIN_BUSINESS_DAYS["international"]
     else:
         return None
+    # business days to calendar days: 5 working days per 7, public holidays ignored (30 -> 42)
     return round(bd * 7 / 5)
 
 
@@ -304,6 +312,7 @@ def check_tender_design(notice: dict, peers: dict) -> list[dict]:
             flags.append(_flag("advertising_below_policy_minimum", "high", adv, minimum,
                                f"advertising days < {minimum} calendar days ({POLICY_SOURCE})", source=src))
         stats, group = peer_lookup(peers, "advertising_days", keys)
+        # 60% of the peer median: clearly short for its peers, not just below the middle
         if stats and adv < 0.6 * stats["p50"]:
             flags.append(_flag("advertising_short_vs_peers", "medium", adv, round(stats["p50"]),
                                "advertising days < 60% of the peer median", group, src))
@@ -323,7 +332,9 @@ def check_tender_design(notice: dict, peers: dict) -> list[dict]:
         value = notice.get(metric)
         if value is None:
             continue
+        # these metrics come from the 400-notice text sample only, so a lower minimum group size (10) is accepted
         stats, group = peer_lookup(peers, metric, keys, min_n=10)
+        # the second test avoids flagging when P50 = P90 (a group where almost every notice states the same value)
         if stats and value > stats["p90"] and value > stats["p50"]:
             flags.append(_flag(check, "medium", value, stats["p90"], f"{label} above the peer P90", group, src))
     if notice.get("market_approach") == "international" and notice.get("electronic_submission") is False:

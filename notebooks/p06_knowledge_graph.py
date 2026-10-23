@@ -39,22 +39,6 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC <details><summary>Text version of the diagram</summary>
-# MAGIC
-# MAGIC ```
-# MAGIC                        IN_COUNTRY                         REGISTERED_IN
-# MAGIC        project -------------------------> country <------------------------ supplier_entity
-# MAGIC         ^   ^                                                                 ^      |
-# MAGIC         |   | FOR_PROJECT                                         AWARDED_TO  |      | BID_ON
-# MAGIC  DESCRIBES  |                                                                 |      | (role)
-# MAGIC         |   +------------ notice ----- ADVERTISES / ANNOUNCES ----> contract -+      v
-# MAGIC   document_chunk                        (tender / award)            |          notice
-# MAGIC   (silver.rag_chunks)                                    PART_OF    |
-# MAGIC                                                  project <----------+
-# MAGIC ```
-# MAGIC
-# MAGIC </details>
-# MAGIC
 # MAGIC | Table | Grain | Key |
 # MAGIC |---|---|---|
 # MAGIC | `proc_gold.kg_nodes` | one node: project, contract, supplier_entity, country, notice, document_chunk | `node_id` (`<type>:<natural key>`) |
@@ -75,22 +59,16 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## How it was built and tested
+# MAGIC ## Key design decisions
 # MAGIC
-# MAGIC **Step 1 — Which entities become nodes?**
-# MAGIC - **Question:** what grain should each node have?
-# MAGIC - **What we found:** suppliers must be **resolved entities**, not supplier ids: Ernst & Young India alone holds many ids, and an id-level graph would split its history.
-# MAGIC - **Decision:** supplier nodes are `supplier_entities` from `p04`; notices and contracts keep their own grain. Document chunks come from the outcome project's `silver.rag_chunks` (453 projects), linked by `project_id`; only chunks of projects that appear in the procurement data become nodes (the printed count shows the overlap).
+# MAGIC | Decision | Rationale | Evidence |
+# MAGIC |---|---|---|
+# MAGIC | Supplier nodes are resolved `supplier_entities` from `p04`; notices and contracts keep their own grain | An id-level graph would split a firm's history | Ernst & Young India alone holds many ids |
+# MAGIC | Document chunks from the outcome project's `silver.rag_chunks` (453 projects), linked by `project_id`, become nodes only for projects that appear in the procurement data | Only chunks connected to procurement records belong in the graph | The printed count shows the overlap |
+# MAGIC | One node table: common columns (`node_id`, `node_type`, `name`) plus a `properties` map of strings; exact numeric types stay one join away in silver | Six node types must share one queryable table | A wide table would be mostly empty; one table per type would make generic traversals awkward |
+# MAGIC | Demo questions written as DataFrame joins; one repeated as a GraphFrames motif when the library is available | Joins work on any runtime; the motif shows both styles give the same answer | The GraphFrames Python package ships with the ML runtime (checked in `p00`); loading of its JVM library is tested in the notebook |
 # MAGIC
-# MAGIC **Step 2 — Typed properties without a schema per node type**
-# MAGIC - **Question:** how can six node types share one table and still be queryable?
-# MAGIC - **What we found:** a wide table with every attribute of every type would be mostly empty, and one table per type would make generic traversals awkward.
-# MAGIC - **Decision:** common columns (`node_id`, `node_type`, `name`) plus a `properties` map of strings for type-specific attributes. Numbers stay one join away in the silver tables when exact types are needed.
-# MAGIC
-# MAGIC **Step 3 — GraphFrames on this runtime**
-# MAGIC - **Question:** can GraphFrames run here, or do we need recursive SQL?
-# MAGIC - **What we found:** the GraphFrames Python package ships with the ML runtime (checked in `p00`); whether its JVM library loads is tested below.
-# MAGIC - **Decision:** the demo questions are written as DataFrame joins, which work everywhere; one is repeated as a GraphFrames motif when the library is available, to show both styles give the same answer.
+# MAGIC Full reasoning: docs/decision_log.md
 
 # COMMAND ----------
 
@@ -108,6 +86,7 @@ NODES, EDGES = f"{GOLD}.kg_nodes", f"{GOLD}.kg_edges"
 def props(*cols: str):
     """String map of the given columns, dropping nulls."""
     pairs = [x for c in cols for x in (F.lit(c), F.col(c).cast("string"))]
+    # a map<string,string> lets six node types share one table; nulls are dropped so absent properties stay absent
     return F.map_filter(F.create_map(*pairs), lambda k, v: v.isNotNull())
 
 
@@ -117,6 +96,7 @@ def node(df: DataFrame, node_type: str, key: str, name, *prop_cols: str) -> Data
 
 
 def edge(df: DataFrame, src_type: str, src_key: str, edge_type: str, dst_type: str, dst_key: str, *prop_cols: str) -> DataFrame:
+    # an edge needs both ends; e.g. regional-programme projects have no country, so they get no IN_COUNTRY edge
     return (df.filter(F.col(src_key).isNotNull() & F.col(dst_key).isNotNull())
             .select(F.concat(F.lit(f"{src_type}:"), F.col(src_key)).alias("src_id"), F.lit(edge_type).alias("edge_type"),
                     F.concat(F.lit(f"{dst_type}:"), F.col(dst_key)).alias("dst_id"), props(*prop_cols).alias("properties")))
@@ -141,6 +121,7 @@ chunks = all_chunks.join(S["dim_project"].select("project_id"), "project_id", "l
 print(f"document chunks: {chunks.count():,} of {all_chunks.count():,} kept "
       f"({chunks.select('project_id').distinct().count()} of {all_chunks.select('project_id').distinct().count()} "
       f"indexed projects have procurement data)")
+# a short display name only; the full description stays in silver.contracts
 contract_view = S["contracts"].withColumn("description_short", F.substring("contract_description", 1, 200))
 nodes = (node(S["dim_project"], "project", "project_id", F.col("project_name"),
               "region", "major_sector", "approval_fy", "status", "outcome_risk_band", "outcome_risk_of_failure", "country_code")
@@ -190,8 +171,10 @@ display(spark.table(NODES).groupBy("node_type").count().orderBy(F.desc("count"))
 
 # COMMAND ----------
 
+# distinct: two ids of the same resolved firm on one joint venture would otherwise give a duplicate edge
 awarded_to = (S["contract_suppliers"].join(S["supplier_entity_map"], "supplier_id")
               .select("contract_id", "supplier_entity_id").distinct())
+# same rule as in p03, now at entity level: two ids of one firm on a notice keep the strongest role
 bid_on = (S["notice_bidders"].join(S["supplier_entity_map"], "supplier_id")
           .withColumn("_rank", F.when(F.col("role") == "awarded", 0).when(F.col("role") == "evaluated", 1).otherwise(2))
           .withColumn("_rn", F.row_number().over(Window.partitionBy("supplier_entity_id", "notice_id").orderBy("_rank")))
@@ -257,10 +240,12 @@ def edges_of(edge_type: str) -> DataFrame:
     return E.filter(F.col("edge_type") == edge_type).select("src_id", "dst_id")
 
 
+# the risk band comes from the outcome project's model (gold.active_project_scores), copied into dim_project
 high_risk = nodes_of("project").filter(F.col("properties")["outcome_risk_band"] == "High").select(F.col("node_id").alias("project"))
 cw = nodes_of("contract").filter(F.col("properties")["procurement_category_code"] == "CW").select(F.col("node_id").alias("contract"))
 part_of = edges_of("PART_OF").toDF("contract", "project")
 awarded = edges_of("AWARDED_TO").toDF("contract", "supplier")
+# grain here is contract x supplier (joint ventures give several rows), hence countDistinct below
 risky_cw = (cw.join(part_of, "contract").join(high_risk, "project").join(awarded, "contract"))
 all_work = awarded.join(part_of, "contract").join(nodes_of("project").select(
     F.col("node_id").alias("project"), F.col("properties")["outcome_risk_band"].alias("band")), "project")
@@ -317,6 +302,7 @@ except Exception as exc:  # the JVM package is not on every runtime
 
 COUNTRY, KEYWORD = "KE", "road"
 EVIDENCE_TERMS = "procurement|contractor|bidding|delay|implementation arrangement"
+# the country comes from the project node (IN_COUNTRY), so the path is contract -> project -> country
 in_country = edges_of("IN_COUNTRY").toDF("project", "country").filter(F.col("country") == f"country:{COUNTRY}")
 road_contracts = (nodes_of("contract")
                   .filter((F.col("properties")["procurement_category_code"] == "CW") & F.lower("name").contains(KEYWORD))
@@ -325,6 +311,7 @@ road_contracts = (nodes_of("contract")
                           F.col("properties")["procurement_method_name"].alias("method"),
                           F.col("properties")["signing_date"].alias("signed"))
                   .join(part_of, "contract").join(in_country, "project"))
+# prefix the key so it joins on graph node ids
 timeline = spark.table(f"{GOLD}.tender_timelines").select(F.concat(F.lit("contract:"), "contract_id").alias("contract"),
                                                            "days_notice_to_signing", "n_tender_notices")
 precedents = road_contracts.join(timeline, "contract", "left")
@@ -336,6 +323,7 @@ describes = edges_of("DESCRIBES").toDF("chunk", "project")
 evidence = (precedents.select("project").distinct().join(describes, "project")
             .join(spark.table(RAG_CHUNKS).select(F.concat(F.lit("document_chunk:"), "chunk_id").alias("chunk"),
                                                  "doc_type", "section", "chunk_text"), "chunk")
+            # counts every occurrence, not just presence, so chunks that discuss procurement at length rank first
             .withColumn("keyword_hits", F.size(F.expr(f"regexp_extract_all(lower(chunk_text), '{EVIDENCE_TERMS}', 0)")))
             .filter("keyword_hits > 0")
             .withColumn("excerpt", F.substring("chunk_text", 1, 240)))
@@ -357,11 +345,13 @@ display(evidence.withColumn("rn", F.row_number().over(Window.partitionBy("projec
 bids = (E.filter("edge_type = 'BID_ON'")
         .select(F.col("src_id").alias("supplier"), F.col("dst_id").alias("notice"), F.col("properties")["role"].alias("role")))
 pairs = (bids.alias("a").join(bids.alias("b"), "notice")
+         # "<" keeps each unordered pair once and drops self-pairs
          .filter(F.col("a.supplier") < F.col("b.supplier"))
          .groupBy(F.col("a.supplier").alias("supplier_a"), F.col("b.supplier").alias("supplier_b"))
          .agg(F.count("*").alias("shared_notices"),
               F.sum((F.col("a.role") == "awarded").cast("int")).alias("a_won"),
               F.sum((F.col("b.role") == "awarded").cast("int")).alias("b_won"))
+         # a screening cut-off, not a statistical test: it keeps only pairs that met often enough to be worth a look
          .filter("shared_notices >= 10"))
 names = nodes_of("supplier_entity").select(F.col("node_id"), F.col("name"), F.col("properties")["country_code"].alias("country"))
 q3 = (pairs.join(names.toDF("supplier_a", "name_a", "country_a"), "supplier_a")
@@ -388,6 +378,7 @@ q4 = (awarded.join(part_of, "contract").join(edges_of("IN_COUNTRY").toDF("projec
       .join(nodes_of("supplier_entity").select(F.col("node_id").alias("supplier"), F.col("name").alias("supplier_name"),
                                                F.col("properties")["country_code"].alias("registered_in"),
                                                F.col("properties")["n_supplier_ids"].alias("supplier_ids")), "supplier")
+      # anonymised individuals all share this name; they are not one firm
       .filter(~F.col("supplier_name").isin("INDIVIDUAL CONSULTANT")))
 print(f"supplier entities with contracts in 10+ borrower countries: {q4.filter('borrower_countries >= 10').count():,}")
 display(q4.orderBy(F.desc("borrower_countries"), F.desc("contracts")).limit(10))

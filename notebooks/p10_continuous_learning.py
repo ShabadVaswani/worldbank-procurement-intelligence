@@ -47,31 +47,6 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC <details><summary>Text version of the diagram</summary>
-# MAGIC
-# MAGIC ```
-# MAGIC   APIs (awards, notices, documents)
-# MAGIC        | daily MERGE (row hash: unchanged rows are not rewritten)
-# MAGIC        v
-# MAGIC   bronze  --Change Data Feed-->  changed keys  --> silver rows of those keys
-# MAGIC                                                         |
-# MAGIC                       +---------------------------------+------------------------------+
-# MAGIC                       v                                 v                              v
-# MAGIC               KG nodes / edges              timelines, supplier stats          document chunks
-# MAGIC               (incremental MERGE,           (refresh queue of affected         (embed only new or
-# MAGIC                section 3)                    contracts / entities)              changed chunks, section 6)
-# MAGIC                       |                                 |                              |
-# MAGIC                       +------------> drift checks (section 4) <------------------------+
-# MAGIC                                            | retrain trigger
-# MAGIC                                            v
-# MAGIC                            challenger trained (p07)  --gate (section 5)-->  @champion
-# MAGIC                                            |
-# MAGIC                                            v
-# MAGIC                               pilot KPIs + user feedback (section 7) --> back to the backlog
-# MAGIC ```
-# MAGIC
-# MAGIC </details>
-# MAGIC
 # MAGIC | Output | Grain | Key |
 # MAGIC |---|---|---|
 # MAGIC | Change Data Feed on the proc bronze, silver and gold tables | table property | - |
@@ -86,37 +61,20 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## How it was built and tested
+# MAGIC ## Key design decisions
 # MAGIC
-# MAGIC **Step 1 — Is Change Data Feed already on?**
-# MAGIC - **Question:** can downstream steps read "what changed since yesterday" from the tables?
-# MAGIC - **What we found:** no table in `proc_bronze`, `proc_silver` or `proc_gold` had `delta.enableChangeDataFeed` set. The bronze tables are loaded with `MERGE` and a row hash, so their change feed will contain only real changes. Silver and gold are rebuilt with `overwrite`, so their change feed would list every row as deleted and re-inserted.
-# MAGIC - **Decision:** turn the feed on for all of them (it is a table property, no data changes), read it on bronze, and make the downstream update incremental with `MERGE` on the affected keys. Silver steps that still overwrite are the next candidates for the same treatment.
+# MAGIC | Decision | Rationale | Evidence |
+# MAGIC |---|---|---|
+# MAGIC | Change Data Feed enabled on all `proc_bronze`, `proc_silver` and `proc_gold` tables; read on bronze; downstream updates made incremental with `MERGE` on the affected keys | Bronze is loaded with `MERGE` and a row hash, so its feed holds only real changes; overwritten silver and gold tables would list every row as deleted and re-inserted | No table had `delta.enableChangeDataFeed` set; the property changes no data; silver steps that still overwrite are the next candidates |
+# MAGIC | Only the neighbourhood of changed notices is recomputed in the knowledge graph | A daily batch is small relative to the stored data | A day brings a few hundred notices against about 417,000 stored (silver notices per notice date in October 2026: 21 to 226) |
+# MAGIC | Incremental path validated by replay in a separate `proc_sandbox` schema and compared with a full rebuild and with the production graph from `p06` | Writing a test batch into production would change what other components read mid-run | Replay: silver notices without the last 7 days and with 100 older notices in a "draft" version (half without a project id, half under a wrong project); today's batch = the held-back notices plus the corrected versions |
+# MAGIC | Drift windows by signing date: the latest 12 months vs the 24 months before | Cohorts by notice date make recent durations look short (censoring) | A tender advertised last month appears only if it was already signed |
+# MAGIC | Incremental path kept for change-feed correctness and scale; link, bidder and edge tables to be liquid-clustered by `notice_id` / `src_id` before relying on it for speed | At this size the incremental path is not faster, but it writes far less | Incremental 65-70 s vs full rebuild of the 1.36 million-edge neighbourhood 30-76 s over two runs; 3,290 inserts and 50 deletes instead of rewriting 1.36 million rows (3,340 changes in the feed) |
+# MAGIC | Freshness = the newest data commit (write, merge, update, delete, create-as-select) | Metadata commits make every table look fresh | Using the newest commit reported every table as 0.5 hours old, because of this notebook's own `SET TBLPROPERTIES` |
 # MAGIC
-# MAGIC **Step 2 — How big is a real day?**
-# MAGIC - **Question:** is incremental processing worth it?
-# MAGIC - **What we found:** section 2 reads the newest notices from the API and compares them with bronze; a day brings a few hundred notices against about 417,000 stored ones (silver notices per notice date in October 2026: 21 to 226).
-# MAGIC - **Decision:** for the knowledge graph, recompute only the neighbourhood of changed notices.
+# MAGIC Limitations: the incremental path still scans the whole link and bidder tables to find the changed rows, and the `MERGE` reads the whole target.
 # MAGIC
-# MAGIC **Step 3 — Proving incremental = full rebuild without touching production**
-# MAGIC - **Question:** how can the incremental path be tested on real data while two other components read the production tables?
-# MAGIC - **What we found:** writing a test batch into the production silver and gold tables would change what the delay model and the agent read mid-run.
-# MAGIC - **Decision:** a replay in a separate schema `proc_sandbox`: yesterday's state = silver notices without the last 7 days and with 100 older notices in an earlier "draft" version (half without a project id, half filed under a wrong project); today's batch = the held-back notices plus the corrected versions. The batch is merged, the change feed gives the affected notices, the notice neighbourhood of the graph is updated by one `MERGE`, and the result is compared with a full rebuild and with the production graph that `p06` built.
-# MAGIC
-# MAGIC **Step 4 — Drift on durations is partly an artefact**
-# MAGIC - **Question:** which windows should drift checks compare?
-# MAGIC - **What we found:** cohorts by **notice** date make recent durations look short: a tender advertised last month appears only if it was already signed. Cohorts by **signing** date avoid that censoring.
-# MAGIC - **Decision:** windows by signing date (current = the latest 12 months, reference = the 24 months before).
-# MAGIC
-# MAGIC **Step 5 — Is the incremental path faster?**
-# MAGIC - **Question:** what does incremental buy on this cluster?
-# MAGIC - **What we found:** not in wall time at this size. Over two runs on the shared cluster the incremental update took 65-70 s and the full rebuild of the 1.36 million-edge neighbourhood 30-76 s: the incremental path still scans the whole link and bidder tables to find the rows of the changed notices, and the `MERGE` reads the whole target. What it does save is writes: 3,290 inserts and 50 deletes instead of rewriting 1.36 million rows, so downstream readers of the change feed see 3,340 changes instead of a full replacement.
-# MAGIC - **Decision:** keep the incremental path for correctness of the change feed and for scale (the daily batch stays a few hundred notices while the tables grow), and before relying on it for speed, cluster the link, bidder and edge tables by `notice_id` / `src_id` (liquid clustering) so that finding the changed rows stops being a full scan.
-# MAGIC
-# MAGIC **Step 6 — Freshness must ignore metadata commits**
-# MAGIC - **Question:** how old is each table?
-# MAGIC - **What we found:** the first version took the newest commit and reported every table as 0.5 hours old: the newest commit was this notebook's own `SET TBLPROPERTIES`.
-# MAGIC - **Decision:** freshness = the newest *data* commit (write, merge, update, delete, create-as-select).
+# MAGIC Full reasoning: docs/decision_log.md
 
 # COMMAND ----------
 
@@ -145,6 +103,7 @@ from proc_intel.freshness import (champion_challenger_gate, drift_level, freshne
 from proc_intel.http import get_json
 from proc_intel.ingest import parse_wb_date
 
+# "monitor" is what the daily job passes; it skips the sandbox replay and the example-only policy demos
 dbutils.widgets.dropdown("mode", "demo", ["demo", "monitor"])
 MODE = dbutils.widgets.get("mode")
 RUN_ID = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -190,6 +149,7 @@ def cdf_enabled_since(table: str):
 cdf_rows = []
 for t in CDF_TABLES:
     before = cdf_enabled(t)
+    # only set the property when it is missing, so a re-run adds no extra commit to the table history
     if not before:
         spark.sql(f"ALTER TABLE {t} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)")
     since_v, since_ts = cdf_enabled_since(t)
@@ -223,13 +183,16 @@ for table in BRONZE_TABLES:
     if start is None:
         change_rows.append({"table": table, "from_version": None, "to_version": now_v, "note": "baseline set (first run)"})
     elif now_v > start:
+        # start + 1: the checkpoint version itself was processed by the previous run
         ch = spark.sql(f"SELECT * FROM table_changes('{table}', {start + 1}, {now_v})")
         counts = {r._change_type: r["count"] for r in ch.groupBy("_change_type").count().collect()}
+        # an update appears twice in the feed (pre- and post-image); counting the post-image only avoids double counting
         projects = ch.filter("_change_type <> 'update_preimage'").select("project_id").distinct().count()
         change_rows.append({"table": table, "from_version": start + 1, "to_version": now_v, **counts,
                             "projects_touched": projects, "note": "changes read"})
     else:
         change_rows.append({"table": table, "from_version": start, "to_version": now_v, "note": "no new commits"})
+    # advance the checkpoint even on the first run, so the next run starts from here rather than from version 0
     spark.createDataFrame([(table, now_v)], "table_name string, last_version long").createOrReplaceTempView("_cp")
     spark.sql(f"""MERGE INTO {CHECKPOINTS} t USING _cp s ON t.table_name = s.table_name
                   WHEN MATCHED THEN UPDATE SET last_version = s.last_version, processed_at = current_timestamp()
@@ -241,6 +204,7 @@ display(pd.DataFrame(change_rows))
 
 today = datetime.now(timezone.utc).date()
 recent, pages = [], 0
+# at most 20 pages (10,000 notices) as a safety stop; a normal day ends after the first page or two
 while pages < 20:
     body = get_json(NOTICES_URL, {"format": "json", "srt": "id", "order": "desc", "rows": 500, "os": pages * 500,
                                   "fl": "id,noticedate,notice_type"})
@@ -248,6 +212,7 @@ while pages < 20:
     recent.extend(batch)
     pages += 1
     dates = [d for d in (parse_wb_date(v.get("noticedate")) for v in batch) if d]
+    # stop once a whole page is older than 3 days: newest-first order, so nothing newer can follow
     if not batch or (dates and max(dates) < today - timedelta(days=3)):
         break
 api = spark.createDataFrame([(v["id"], v.get("noticedate"), v.get("notice_type")) for v in recent],
@@ -287,6 +252,7 @@ def props(*cols: str):
 
 def canonical(df: DataFrame) -> DataFrame:
     """Adds properties_json: the property map as sorted JSON, comparable in EXCEPT and MERGE conditions."""
+    # maps cannot be compared or used in EXCEPT; sorted entries as JSON give a stable, comparable text form
     return df.withColumn("properties_json", F.to_json(F.array_sort(F.map_entries("properties"))))
 
 
@@ -294,6 +260,7 @@ def notice_subgraph(notices: DataFrame) -> tuple[DataFrame, DataFrame]:
     """Notice nodes and the edges that touch a notice, by p06's rules, for the given notices only."""
     ids = notices.select("notice_id")
     links = spark.table(f"{SILVER}.notice_contract_links").join(ids, "notice_id", "left_semi")
+    # same rule as p06: one BID_ON edge per entity and notice, keeping the strongest role
     bid_on = (spark.table(f"{SILVER}.notice_bidders").join(ids, "notice_id", "left_semi")
               .join(spark.table(f"{SILVER}.supplier_entity_map"), "supplier_id")
               .withColumn("_rank", F.when(F.col("role") == "awarded", 0).when(F.col("role") == "evaluated", 1).otherwise(2))
@@ -325,6 +292,7 @@ EDGE_KEY, NODE_KEY = ["src_id", "edge_type", "dst_id"], ["node_id"]
 def diff_count(a: DataFrame, b: DataFrame, cols: list[str]) -> int:
     """Rows in a but not b plus rows in b but not a (on the given columns)."""
     a, b = a.select(*cols), b.select(*cols)
+    # exceptAll keeps duplicates, so a row present twice on one side also counts as a difference
     return a.exceptAll(b).count() + b.exceptAll(a).count()
 
 # COMMAND ----------
@@ -342,6 +310,7 @@ if MODE == "demo":
     REPLAY_NODES, REPLAY_EDGES = f"{SANDBOX}.kg_notice_nodes_replay", f"{SANDBOX}.kg_notice_edges_replay"
     silver_notices = spark.table(f"{SILVER}.notices")
     business_cols = silver_notices.columns
+    # relative to the newest notice in silver, not today, so the replay works on any snapshot
     hold_from = silver_notices.agg(F.max("notice_date")).first()[0] - timedelta(days=HOLD_DAYS - 1)
     corrected_ids = (silver_notices.filter((F.col("notice_date") < F.lit(hold_from)) & F.col("project_id").isNotNull())
                      .orderBy(F.sha2("notice_id", 256)).limit(N_CORRECTIONS).select("notice_id")
@@ -350,11 +319,14 @@ if MODE == "demo":
     wrong_project = spark.table(f"{SILVER}.dim_project").agg(F.min("project_id")).first()[0]     # any real project
     yesterday = (silver_notices.filter((F.col("notice_date") < F.lit(hold_from)) | F.col("notice_date").isNull())
                  .join(corrected_ids, "notice_id", "left")
+                 # draft versions: even rows lose their project id, odd rows get a wrong one; both kinds must be
+                 # repaired by the merge
                  .withColumn("project_id", F.when(F.col("_corr") & (F.col("_corr_n") % 2 == 0), F.lit(None).cast("string"))
                              .when(F.col("_corr"), F.lit(wrong_project)).otherwise(F.col("project_id")))
                  .withColumn("bid_description", F.when(F.col("_corr"), F.concat(F.lit("[draft] "), "bid_description"))
                              .otherwise(F.col("bid_description")))
                  .select(*business_cols).withColumn("_row_hash", row_hash(business_cols)))
+    # the replay table is rebuilt from scratch on every demo run so its version history starts clean
     spark.sql(f"DROP TABLE IF EXISTS {REPLAY_NOTICES}")
     yesterday.write.saveAsTable(REPLAY_NOTICES)
     spark.sql(f"ALTER TABLE {REPLAY_NOTICES} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)")
@@ -391,6 +363,7 @@ if MODE == "demo":
     changed_nodes = changed.select(F.concat(F.lit("notice:"), "notice_id").alias("node_id"))
     new_nodes, new_edges = notice_subgraph(spark.table(REPLAY_NOTICES).join(changed, "notice_id", "left_semi"))
     old_edges = spark.table(REPLAY_EDGES)
+    # old edges at either end of a changed notice: candidates for deletion if the recompute no longer produces them
     touching_old = (old_edges.join(changed_nodes.withColumnRenamed("node_id", "src_id"), "src_id", "left_semi")
                     .unionByName(old_edges.join(changed_nodes.withColumnRenamed("node_id", "dst_id"), "dst_id", "left_semi")))
     touched = new_edges.unionByName(touching_old)
@@ -414,10 +387,13 @@ if MODE == "demo":
 
 def incremental_merge(target: str, recomputed: DataFrame, touching: DataFrame, key: list[str]) -> dict:
     """MERGE recomputed rows into target; rows of `touching` that are not recomputed are deleted."""
+    # tombstones: rows that touch a changed key but are no longer produced; deleting them in the same MERGE keeps it
+    # atomic
     tomb = touching.join(recomputed.select(*key), key, "left_anti").withColumn("_delete", F.lit(True))
     source = recomputed.withColumn("_delete", F.lit(False)).unionByName(tomb)
     cond = " AND ".join(f"t.{k} = s.{k}" for k in key)
     cols = recomputed.columns
+    # <=> is null-safe equality, so a name changing to or from null still counts as a change
     changed_row = "t.properties_json <> s.properties_json" + (" OR NOT (t.name <=> s.name)" if "name" in cols else "")
     (DeltaTable.forName(spark, target).alias("t").merge(source.alias("s"), cond)
      .whenMatchedDelete(condition="s._delete")
@@ -436,6 +412,7 @@ if MODE == "demo":
     incremental_s = time.time() - t0
     t0 = time.time()
     full_nodes, full_edges = notice_subgraph(spark.table(REPLAY_NOTICES))
+    # written to a table so the timing includes the write, as the incremental MERGE's does
     full_edges.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{SANDBOX}._kg_notice_edges_rebuild")
     full_s = time.time() - t0
     rewritten = spark.table(f"{SANDBOX}._kg_notice_edges_rebuild").count()
@@ -486,10 +463,12 @@ pop = (spark.table(f"{GOLD}.tender_timelines").filter("is_timed AND competition 
        .select("signing_date", "contract_amount_usd", "procurement_category_code", "procurement_method_name", "region",
                "wgi_gov_effectiveness", "days_notice_to_signing"))
 last_signing = pop.agg(F.max("signing_date")).first()[0]
+# windows by signing date: notice-date cohorts look faster recently only because slow tenders are not signed yet
 cur_from, ref_from = last_signing - timedelta(days=365), last_signing - timedelta(days=3 * 365)
 windowed = (pop.withColumn("window", F.when(F.col("signing_date") > F.lit(cur_from), "current")
                            .when(F.col("signing_date") > F.lit(ref_from), "reference"))
             .filter("window IS NOT NULL")
+            # amounts span several orders of magnitude; log scale, with a floor of 1 so zero amounts do not give -inf
             .withColumn("log10_amount", F.log10(F.greatest(F.col("contract_amount_usd"), F.lit(1.0)))))
 wp = windowed.drop("signing_date", "contract_amount_usd").toPandas()          # about 20k rows, 7 columns
 ref, cur = wp[wp.window == "reference"], wp[wp.window == "current"]
@@ -498,6 +477,7 @@ for feat in ["log10_amount", "wgi_gov_effectiveness"]:
     drift.append({"feature": feat, "kind": "numeric", "metric": "psi", "value": psi_numeric(ref[feat].tolist(), cur[feat].tolist())})
 for feat in ["procurement_category_code", "procurement_method_name", "region"]:
     drift.append({"feature": feat, "kind": "categorical", "metric": "psi",
+                  # missing becomes its own category, so a change in how often a value is missing also shows as drift
                   "value": psi_categorical(ref[feat].fillna("(none)").value_counts().to_dict(),
                                            cur[feat].fillna("(none)").value_counts().to_dict())})
 target_ks = ks_statistic(ref["days_notice_to_signing"].tolist(), cur["days_notice_to_signing"].tolist())
@@ -516,6 +496,7 @@ DRIFT_COMMENTS = {"run_id": "PK. Run timestamp (UTC)", "feature": "PK. <feature>
                   "metric": "psi or ks", "value": "Measured value", "level": "stable / moderate / significant (PSI); stable / shift (KS >= 0.10)",
                   "reference_window": "Signing dates of the reference window", "current_window": "Signing dates of the current window",
                   "n_reference": "Contracts in the reference window", "n_current": "Contracts in the current window", "measured_at": "Timestamp"}
+# append, never overwrite: the drift history across runs is the point of this table
 if spark.catalog.tableExists(DRIFT_TABLE):
     drift_df.write.mode("append").saveAsTable(DRIFT_TABLE)
 else:
@@ -542,9 +523,11 @@ print(f"median days notice->signing: reference {ref['days_notice_to_signing'].me
 # COMMAND ----------
 
 feature_psi = {d["feature"]: d["value"] for d in drift if d["metric"] == "psi" and d["kind"] != "target"}
+# treated as if the champion had been trained up to the start of the current window
 decision = retrain_decision(feature_psi, target_ks, days_since_training=(today - cur_from).days, new_labels=len(cur))
 print(json.dumps(decision, indent=1))
 if MODE == "demo":
+    # illustrative metric sets, not measured: the real champion and challenger metrics come from p07
     champion = {"window": "latest-12m", "n": 4000, "mae": 62.0, "segments": {"CS": {"n": 900, "mae": 95.0}, "CW": {"n": 1500, "mae": 58.0}}}
     examples = {"better overall and in every segment": {"window": "latest-12m", "n": 4000, "mae": 58.5,
                                                         "segments": {"CS": {"n": 900, "mae": 93.0}, "CW": {"n": 1500, "mae": 55.0}},
@@ -575,6 +558,7 @@ if MODE == "demo":
     doc_of = {r.chunk_id: r.doc_id for r in chunk_rows}
     docs = sorted(set(doc_of.values()))[:4]                                    # first 4 documents by id
     rechunked, withdrawn = set(docs[:3]), docs[3]
+    # simulated day: three documents re-chunked (new hashes), one withdrawn, a few new documents below
     current = {cid: (h + "-v2" if doc_of[cid] in rechunked else h) for cid, h in indexed.items() if doc_of[cid] != withdrawn}
     if spark.catalog.tableExists(f"{BRONZE}.rating_documents"):
         first_projects = (spark.table(f"{BRONZE}.rating_documents").select("project_id").distinct()
@@ -614,6 +598,8 @@ ifb = (spark.table(f"{SILVER}.notice_contract_links").filter("link_role = 'tende
        .join(spark.table(f"{SILVER}.notices").filter("notice_type = 'Invitation for Bids'").select("notice_id", "notice_date"), "notice_id")
        .groupBy("contract_id").agg(F.count("*").alias("k"), F.datediff(F.max("notice_date"), F.min("notice_date")).alias("span")))
 n_ifb = ifb.count()
+# two IFBs at least 30 days apart on one contract count as a re-advertisement; a shorter gap is treated as the same
+# round
 retender = ifb.filter("k > 1 AND span >= 30").count() / n_ifb
 conflict_rate = None
 if spark.catalog.tableExists(f"{GOLD}.project_evidence_resolution"):
@@ -626,6 +612,7 @@ for t in [f"{BRONZE}.contract_awards", f"{BRONZE}.procurement_notices", f"{GOLD}
     # Last DATA commit: property changes, constraints and comments are commits too but bring no new data.
     ts = (DeltaTable.forName(spark, t).history().filter(F.col("operation").isin(DATA_OPERATIONS))
           .agg(F.max("timestamp")).first()[0])
+    # both timestamps naive UTC, so the age is not off by the cluster's time zone
     fresh.append({"table": t, **freshness_status(ts.replace(tzinfo=None), datetime.now(timezone.utc).replace(tzinfo=None),
                                                  24 if "bronze" in t else 30)})
 display(pd.DataFrame(fresh))

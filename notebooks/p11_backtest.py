@@ -36,26 +36,6 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC <details><summary>Text version of the diagram</summary>
-# MAGIC
-# MAGIC ```
-# MAGIC  p07 test period (notices 2023-07-01 .. 2024-10-13, 6,624 openly competed contracts with a known duration)
-# MAGIC        |
-# MAGIC        |  stratified sample: region x category, fixed seed, one lot per notice, one tender per project
-# MAGIC        v
-# MAGIC  300 "new packages" --- on each notice date, hide the package's own project and everything dated later --+
-# MAGIC        |                                                                                                  |
-# MAGIC        +--> timeline:   model (champion recipe, refit at the cutoff) and peer benchmarks  vs actual days  |
-# MAGIC        +--> precedents: similar_past_contracts  -> relevance by rule (proxy) and by LLM judge             |
-# MAGIC        |                                                                                                  |
-# MAGIC  100 packages from projects with a completion report (ICR):                                              |
-# MAGIC        +--> lessons:    lessons_learned (own project hidden) vs random passages  -> LLM judge against     |
-# MAGIC        |                what the project's own ICR says actually went wrong                               |
-# MAGIC  30 packages: the full agent  -> review pack (briefs, cited records, actual outcome; labelled in p15)     <-+
-# MAGIC ```
-# MAGIC
-# MAGIC </details>
-# MAGIC
 # MAGIC | Output | Grain | Key |
 # MAGIC |---|---|---|
 # MAGIC | `proc_gold.backtest_results` | one metric for one backtest, forecast or retrieval variant and slice (overall, region, category, method) | `backtest, variant, metric, slice_type, slice_value, population` |
@@ -66,32 +46,17 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## How it was built and tested
+# MAGIC ## Key design decisions
 # MAGIC
-# MAGIC **Step 1 — Which model is being backtested?**
-# MAGIC - **Question:** can the registered `@champion` simply be scored on the test-period tenders?
-# MAGIC - **What we found:** no. p07 refits the champion on the whole cohort, test period included, before registering it. Scored on the test notices it reaches a P50 error of 50 days and 95% interval coverage, against 75 days and 81% for the same recipe fitted without them: the leak a naive backtest would have reported as a result.
-# MAGIC - **Decision:** the backtest refits the champion's recipe (features, hyper-parameters and rounds from its MLflow run) at the cutoff (model A), checks that it reproduces p07's logged test metrics (MAE within 1 day, coverage within 0.001), and adds a stricter model B trained only on tenders whose outcome was fully known on the cutoff date. The champion and the deployed benchmark table appear only as labelled in-sample contrasts. During the agent replays, the agent's own forecast tool is pointed at model A.
+# MAGIC | Decision | Rationale | Evidence |
+# MAGIC |---|---|---|
+# MAGIC | The champion's recipe (features, hyper-parameters and rounds from its MLflow run) refit at the cutoff (model A) and verified against p07's logged test metrics (MAE within 1 day, coverage within 0.001); a stricter model B trained only on tenders whose outcome was fully known at the cutoff; champion and deployed benchmark table shown only as labelled in-sample contrasts; the agent's forecast tool pointed at model A during replays | The registered `@champion` was refit on the whole cohort, test period included, so scoring it would leak | Champion on the test notices: P50 error 50 days and 95% interval coverage, vs 75 days and 81% for the same recipe fitted without them |
+# MAGIC | An `as_of` context manager swaps the tools' cached data; `leak_violations` re-checks every returned record's date and project (the run stops on any hit); `assert_core_intact()` fails if this notebook rebinds any name the agent's code defined | The tools have no date parameter and their code is owned by another component | Blanking the category of later contracts makes the search's own filter skip them; the passage matrix can be swapped for a filtered copy; an earlier helper with a clashing name replaced the agent's helper via the shared `%run` namespace and crashed the benchmark tool |
+# MAGIC | The LLM judge is the relevance measure; the metadata proxy is reported with its failure and with each condition switched off | The proxy does not agree with the reference labels or the judge | Proxy vs p08's 30 reference labels (made by an AI agent): 16 of 30 (kappa 0.21); vs the judge: kappa about 0.1 (28% relevant vs 63%); the judge agrees with agent reference labels on 20 of 23 pairs of this backtest's notice texts |
+# MAGIC | Lessons replay each project's last tender before its completion report; the rubric counts generic warnings as "partial" only; a random-passage control from the same visible pool is judged blind | A random tender per project would mostly predate any completion report; generic warnings match almost anything | Only 20 projects with test-period tenders have a completion report; 15 judge verdicts checked blind by an AI agent: 13 agree, the two disagreements concern whether a project had any problem at all |
+# MAGIC | Judge verdicts cached in the volume under a hash of the prompt; autologging switched off | The judge is the slowest step, and runs on a shared cluster are fragile | About 2,400 distinct pairs at about 4 s each at three threads; a dropped connection killed a prototype's local poller while the cluster kept working; autologging logged each LightGBM refit as a run in the agent's experiment |
 # MAGIC
-# MAGIC **Step 2 — Hiding the future from tools that have no date parameter**
-# MAGIC - **Question:** how can the agent's tools be replayed "as of" a date without changing their code (another component owns it and was changing it at the same time)?
-# MAGIC - **What we found:** every tool reads cached arrays: blanking the category of later contracts makes the search's own category filter skip them, and the passage matrix can be swapped for a filtered copy. A first version imported a helper with the same name as one in the agent's code; because `%run` shares one namespace, it silently replaced the agent's helper and the benchmark tool crashed.
-# MAGIC - **Decision:** the swap lives in one context manager (`as_of`), every returned record is re-checked for its date and project after the call (`leak_violations`, the run stops on any hit), and `assert_core_intact()` fails if this notebook rebinds any name the agent's code defined.
-# MAGIC
-# MAGIC **Step 3 — Does a metadata rule measure precedent relevance?**
-# MAGIC - **Question:** can "same category, same method family, shared sector" stand in for a relevance judgement, so precedents can be scored without a model?
-# MAGIC - **What we found:** no. It agrees with p08's 30 reference labels (made by an AI agent during the build) on 16 of 30 pairs (kappa 0.21) and with the LLM judge barely above chance (kappa about 0.1): it calls 28% of precedents relevant where the judge calls 63%. Both conditions are too strict: classroom blocks are built by social-protection and community-driven projects too, and a request for quotations for pickups is a fine precedent for a bid for pickups. The judge, checked again against agent reference labels on 23 pairs of this backtest's real notice texts, agrees on 20.
-# MAGIC - **Decision:** the proxy is reported with its failure (and with each condition switched off), and the LLM judge is the relevance measure.
-# MAGIC
-# MAGIC **Step 4 — A fair test for lessons**
-# MAGIC - **Question:** how to tell whether retrieved lessons "would have warned" about what then went wrong, when nearly every project has some procurement trouble?
-# MAGIC - **What we found:** only 20 projects with test-period tenders have a completion report yet. Taking a random tender per project put most replays in 2019-2020, when almost no completion report existed, so the test would only have exercised appraisal passages. Generic warnings ("procurement may be delayed") match almost anything.
-# MAGIC - **Decision:** each project's last tender before its report is replayed, the judge's rubric counts generic warnings as "partial" only, and a random-passage control from the same visible pool is judged blind. Fifteen judge verdicts were checked by an AI agent without seeing the judge (agent reference labels): 13 agree, the two disagreements are about whether a project had any problem at all.
-# MAGIC
-# MAGIC **Step 5 — Running on a shared cluster and a mobile connection**
-# MAGIC - **Question:** what made the runs slow or fragile?
-# MAGIC - **What we found:** the relevance judge is the slowest step (about 2,400 distinct pairs, about 4 s each at three threads); a dropped connection killed the local poller of a prototype run while the cluster kept working; Databricks autologging logged each LightGBM refit as a run in the agent's experiment.
-# MAGIC - **Decision:** every judge verdict is cached in the volume under a hash of its prompt, so a re-run (for example after the agent changed) pays only for new pairs; autologging is switched off in this notebook.
+# MAGIC Full reasoning: docs/decision_log.md
 
 # COMMAND ----------
 
@@ -115,6 +80,7 @@
 
 # COMMAND ----------
 
+# %run shares one namespace: snapshot proc_rag_core's names now, so a later accidental rebind here can be caught
 _CORE_NAMES = {k: id(v) for k, v in list(globals().items()) if not k.startswith("_")}   # what proc_rag_core defined
 
 
@@ -173,6 +139,7 @@ JUDGE_CACHE = f"{BT_ROOT}/judge_cache.json"
 REVIEW_DIR = f"{BT_ROOT}/human_review"
 DATA_DIR = os.path.abspath(os.path.join(os.getcwd(), "..", "data"))
 os.makedirs(REVIEW_DIR, exist_ok=True)
+# run_agent exists from phase 3 on; fall back to the older entry point so the notebook runs against either version
 AGENT = globals().get("run_agent") or procurement_brief          # the agent's entry point in proc_rag_core
 print(f"snapshot {SNAPSHOT} | cohort {WINDOW_START}..{WINDOW_END} | test from {TEST_START} | strict as-of training "
       f"notices up to {STRICT_END} | agent entry point: {AGENT.__name__} | rerank={RERANK}")
@@ -299,6 +266,7 @@ assert data["row_id"].is_unique
 data["y"], _ = cap_at_horizon(data["days_notice_to_signing"])
 is_test = data["notice_date"] >= pd.Timestamp(TEST_START)
 train, test = data[~is_test].copy(), data[is_test].copy()
+# model B's rows: notices whose full 730-day outcome was already known on the cutoff date
 strict = data[data["notice_date"] <= pd.Timestamp(STRICT_END)].copy()
 print(f"cohort {len(data):,} | train (notices before {TEST_START}) {len(train):,} | test {len(test):,} | "
       f"strict as-of training rows (notices up to {STRICT_END}) {len(strict):,}")
@@ -311,7 +279,7 @@ assert_core_intact()
 # MAGIC
 # MAGIC **What:** the p07 slow label (duration above the training-years P75 of the method x category; category P75 for small groups), and for every test contract the text a planner would have had on the notice date: the tender notice's own description (`bid_description`), falling back to the contract description only when the notice has none.
 # MAGIC
-# MAGIC **Why:** the contract description is written at award and can mention the winner or the final scope; the notice description is the honest planning-time query. The slow threshold is a definition fixed on training data, so all forecasts are scored against the same labels.
+# MAGIC **Why:** the contract description is written at award and can mention the winner or the final scope; the notice description is the appropriate planning-time query. The slow threshold is a definition fixed on training data, so all forecasts are scored against the same labels.
 
 # COMMAND ----------
 
@@ -342,6 +310,9 @@ texts = (spark.table(f"{SILVER}.contracts").select(F.col("contract_id").alias("r
          .join(notices.select("notice_id", "bid_description"), "notice_id", "left")
          .toPandas().drop(columns=["notice_id", "signing_date"]))
 test = test.merge(texts, on="row_id", how="left").set_index(test.index)
+# the notice text is what a planner had on the day; the contract description is written at award and can name the
+# winner,
+# so it is used only when the notice has no usable description (under 10 characters)
 test["query"] = test["bid_description"].where(test["bid_description"].fillna("").str.len() >= 10,
                                               test["contract_description"])
 test["query_source"] = np.where(test["bid_description"].fillna("").str.len() >= 10, "notice", "contract")
@@ -364,6 +335,7 @@ print(f"slow base rate: train {train['slow'].mean():.3f} | test {test['slow'].me
 
 test["stratum"] = test["region"] + " | " + test["procurement_category_code"]
 pop_sizes = test["stratum"].value_counts().to_dict()
+# at least 5 per stratum so small strata can be reported; design weights below undo the over-sampling in overall figures
 alloc = allocate_sample(pop_sizes, N_SAMPLE, floor=STRATUM_FLOOR)
 picked = stratified_pick(test[["row_id", "notice_id", "project_id", "stratum"]].to_dict("records"),
                          lambda r: r["stratum"], alloc, seed=SEED)
@@ -400,9 +372,11 @@ champ_version = client.get_model_version_by_alias(MODEL_NAME, "champion")
 champ_run = client.get_run(champ_version.run_id)
 P, M = champ_run.data.params, champ_run.data.metrics
 champion = mlflow.pyfunc.load_model(f"models:/{MODEL_NAME}@champion")
+# same category levels as the champion, so the refit models encode categoricals identically
 CATEGORIES = champion.unwrap_python_model().categories                 # the category levels the champion was built with
 BASE_PARAMS = {"learning_rate": 0.05, "feature_fraction": 0.8, "bagging_fraction": 0.8, "bagging_freq": 1,
                "lambda_l2": 1.0, "cat_smooth": 20, "verbose": -1, "num_threads": THREADS, "seed": 7}   # p07 section 5
+# tree size and rounds read from the champion's MLflow run, so the refit is the registered recipe, not a re-tuned one
 BEST_PARAMS = {"num_leaves": int(P["num_leaves"]), "min_data_in_leaf": int(P["min_data_in_leaf"])}
 ROUNDS, CLF_ROUNDS = int(P["rounds"]), int(P["classifier_rounds"])
 print(f"champion v{champ_version.version} (run {champ_version.run_id[:8]}): {BEST_PARAMS}, rounds {ROUNDS}, "
@@ -458,6 +432,7 @@ print(f"refits done in {time.time() - t0:.0f} s | A: {model_a['n_train']:,} rows
       f"{model_a['hi']:+.3f} | B: {model_b['n_train']:,} rows, shifts {model_b['lo']:+.3f} / {model_b['hi']:+.3f}")
 
 pred_a, pred_b = predict_recipe(model_a, test), predict_recipe(model_b, test)
+# in-sample contrast only: the registered champion was refit with the test period included
 pred_champ = champion.predict(model_input(test)).set_axis(test.index)
 repro = interval_metrics(test["y"], pred_a["p10"], pred_a["p50"], pred_a["p90"])
 repro_check = pd.DataFrame([
@@ -507,6 +482,7 @@ cutoff_bench = (benchmark_table(train), f"backtest: training contracts with noti
 
 def tool_benchmark(frame, bench=None):
     """The agent's tender_benchmark tool for each row; `bench` temporarily replaces its cached table."""
+    # swap the tool's cached table for the duration of the call and always restore it, even if the tool raises
     saved = _cache.get("bench")
     if bench is not None:
         _cache["bench"] = bench
@@ -572,6 +548,7 @@ def add_result(backtest, variant, metric, value, population, slice_type="overall
 
 
 TL_METRICS = ["mae_days", "median_ae_days", "mean_pinball", "coverage_p10_p90", "below_p10", "above_p90", "mean_width_days"]
+# positions of the sampled packages in `test`, so every forecast can be sliced to the sample without re-scoring
 sample_idx = test.reset_index().set_index("row_id").loc[sample["row_id"], "index"].to_numpy()
 w = sample["design_weight"].to_numpy()
 rows = []
@@ -675,10 +652,12 @@ display(pd.concat([cal_full, cal_sample]).round(3))
 # COMMAND ----------
 
 _C = _contracts()
+# signing dates aligned with the tool's cached index, so "signed before the cutoff" is one vectorised comparison
 _SIGNED = pd.to_datetime(_C["df"]["signing_date"], errors="coerce").to_numpy()
 _ldf, _ = _lessons()
 _lesson_doc_date = {r.doc_id: r.doc_date for r in spark.table(LESSON_DOCS_TABLE).select("doc_id", "doc_date").collect()}
 _approval = {r.project_id: r.approval_date for r in spark.table(f"{SILVER}.dim_project").select("project_id", "approval_date").collect()}
+# appraisal passages carry no date of their own; they are written before approval, so the approval date stands in
 _LESSON_DATE = pd.to_datetime(pd.Series([_lesson_doc_date.get(d) if s == "completion" else _approval.get(p)
                                          for s, d, p in zip(_ldf.source, _ldf.doc_id, _ldf.project_id)]), errors="coerce").to_numpy()
 LESSON_DATE_OF = dict(zip(_ldf.record_id, pd.Series(_LESSON_DATE).dt.date.astype(str)))
@@ -691,8 +670,10 @@ def as_of(cutoff, project_id=None, bench=None, forecast_model=None):
     cut = np.datetime64(pd.Timestamp(cutoff))
     C = _contracts()
     saved_cat, saved_lessons, saved_bench = C["category"], _cache["lessons"], _cache.get("bench")
+    # blanking the category of later contracts makes the tool's own category filter skip them; its code stays untouched
     C["category"] = np.where(_SIGNED < cut, saved_cat, "")
     pdf, E = saved_lessons
+    # undated passages compare as NaT (False), so they are always hidden
     keep = (_LESSON_DATE < cut) & (pdf.project_id.to_numpy() != (project_id or ""))
     _cache["lessons"] = (pdf[keep].reset_index(drop=True), E[keep])
     if bench is not None:
@@ -729,6 +710,7 @@ class CutoffModel:
 def check_no_leak(records, cutoff, project_id):
     dated = [{**r, "date": r.get("signing_date") if r["type"] == "contract" else LESSON_DATE_OF.get(r["record_id"])}
              for r in records if r["type"] in ("contract", "lesson", "appraisal_passage")]
+    # belt and braces: re-check every returned record, so a leak through a path the swap missed stops the run
     bad = leak_violations(dated, str(pd.Timestamp(cutoff).date()), [project_id], date_key="date")
     assert not bad, f"time leak: {bad[:5]} returned for a package dated {cutoff}"
 
@@ -743,6 +725,7 @@ def check_no_leak(records, cutoff, project_id):
 
 # COMMAND ----------
 
+# the agent component was being upgraded in parallel; detect whether its tool already has the precedent threshold
 THRESHOLD_PARAM = "min_cosine" in inspect.signature(similar_past_contracts).parameters
 VARIANTS = {"tfidf": {"rerank": False},                                              # p08's baseline
             "tfidf_gte_rerank": {"rerank": True, **({"min_cosine": None} if THRESHOLD_PARAM else {})}}   # ranking only
@@ -769,6 +752,7 @@ for pkg in sample.itertuples():
                          "similarity": rec["similarity"], "rerank_cosine": rec.get("rerank_cosine"),
                          "same_country": rec["same_country"], "rec": rec})
         if not res["records"]:
+            # rank 0 marks "nothing returned", so the package still counts (as a miss) in precision@5
             prec.append({"row_id": pkg.row_id, "variant": variant, "rank": 0, "contract_id": None, "rec": None})
 prec = pd.DataFrame(prec)
 print(f"retrieval for {len(sample)} packages x {len(VARIANTS)} variants in {time.time() - t0:.0f} s; "
@@ -807,6 +791,7 @@ def save_judge_cache():
 
 def judge_json(system, user, schema, max_tokens=900):
     """One cached gpt-oss judgement: (parsed JSON or None, from_cache)."""
+    # cache key covers model, prompt and message: any change to them gets a fresh verdict instead of a stale one
     key = hashlib.sha1(json.dumps([JUDGE_MODEL, system, user]).encode()).hexdigest()
     with _JUDGE_LOCK:
         if key in JCACHE:
@@ -820,6 +805,7 @@ def judge_json(system, user, schema, max_tokens=900):
             break
         except Exception:
             v = None
+    # failed calls are not cached, so a re-run retries them
     if v is not None:
         with _JUDGE_LOCK:
             JCACHE[key] = v
@@ -861,6 +847,7 @@ def rec_side(rec):
 
 for name, opts in PROXY_VARIANTS.items():
     got[name] = [proxy_relevant(pkg_side(r.row_id), rec_side(r.rec), **opts) for r in got.itertuples()]
+# the same precedent can come back in several variants; judge each (package, contract) pair once
 pairs = got.drop_duplicates(["row_id", "contract_id"]).reset_index(drop=True)
 t0 = time.time()
 with ThreadPoolExecutor(max_workers=3) as pool:
@@ -901,6 +888,8 @@ def contract_side(cid):
 
 for name, opts in PROXY_VARIANTS.items():
     labels[name] = [proxy_relevant(contract_side(s), contract_side(c), **opts)
+                    # the proxy compares the contract a p08 package was written from with the candidate, the same pair
+                    # the hand label judged
                     for s, c in zip(labels["source_contract_id"], labels["contract_id"], strict=True)]
 
 
@@ -963,6 +952,7 @@ for (row_id, variant), g in prec.groupby(["row_id", "variant"]):
     rec = {"row_id": row_id, "variant": variant, "n_returned": len(g), "no_precedent": float(len(g) == 0)}
     for m in ("proxy", "judge"):
         vals = g[m].tolist()
+        # an empty slot counts as a miss, as in p08
         rec[f"p_at_5_{m}"] = precision_at_k(vals, 5) if len(vals) else 0.0
         rec[f"precision_returned_{m}"] = precision_of_returned(vals)
         rec[f"any_relevant_{m}"] = float(any(bool(v) for v in vals if v is not None))
@@ -1008,6 +998,8 @@ cand = (spark.table(f"{GOLD}.tender_timelines").filter("competition = 'open' AND
                 F.col("procurement_method_name"), F.col("procurement_category_code"), "days_notice_to_signing",
                 "signing_date")
         .join(lesson_docs, "project_id")
+        # only tenders launched before the completion report was written, so the report describes what happened
+        # afterwards
         .filter(F.col("notice_date") < F.col("doc_date"))
         .join(notices.select("notice_id", "bid_description"), "notice_id", "left")
         .join(contracts.select(F.col("contract_id").alias("row_id"), "contract_description"), "row_id", "left")
@@ -1026,6 +1018,7 @@ icr = (spark.table(LESSON_TABLE).join(spark.createDataFrame(lcases[["doc_id"]]),
        .select("doc_id", "chunk_id", "section", "relevance_score", "chunk_index", "chunk_text").toPandas())
 
 
+# the most procurement-relevant passages first, cut to a fixed budget so every judge prompt has the same size
 def icr_excerpt(doc_id, budget=3300):
     parts, used = [], 0
     for r in icr[icr["doc_id"] == doc_id].sort_values(["relevance_score", "chunk_index"], ascending=[False, True]).itertuples():
@@ -1085,6 +1078,7 @@ def lesson_message(case, passages):
 
 def control_passages(case, k=6):
     pdf, _ = _cache["lessons"]                 # inside as_of: only the visible pool
+    # seeded per case, so the control passages are the same on every run (and the cached verdicts stay valid)
     rng = np.random.default_rng(int(stable_hash(SEED, case.row_id)[:8], 16))
     idx = rng.choice(len(pdf), size=min(k, len(pdf)), replace=False)
     return [{"record_id": pdf.record_id.iat[i], "type": "lesson" if pdf.source.iat[i] == "completion" else "appraisal_passage",
@@ -1096,6 +1090,7 @@ lesson_sets = []
 for case in lcases.itertuples():
     with as_of(case.notice_date, case.project_id):
         got_l = lessons_learned(f"procurement risks and delays: {case.query}", case.country_code, k=6)["records"]
+        # drawn inside as_of: the control comes from the same visible pool as the retrieved passages, a fair comparison
         ctrl = control_passages(case)
     check_no_leak(got_l + ctrl, case.notice_date, case.project_id)
     lesson_sets.append({"row_id": case.row_id, "retrieved": got_l, "control": ctrl})
@@ -1125,6 +1120,7 @@ for cond, g in lj.groupby("condition"):
         add_result("lessons", cond, k, v, "lesson_cases", n=len(scorable) if k != "share_none_occurred" else len(g), ci=ci)
     lesson_summary.append({"condition": cond, "scorable": len(scorable), **vals})
 display(pd.DataFrame(lesson_summary).round(3))
+# paired comparison on the same cases removes the variation between projects
 paired = lj.pivot(index="row_id", columns="condition", values="score").dropna()
 print(f"paired cases (both scorable) {len(paired)}: retrieved better {int((paired['retrieved'] > paired['control']).sum())}, "
       f"equal {int((paired['retrieved'] == paired['control']).sum())}, control better {int((paired['retrieved'] < paired['control']).sum())}")
@@ -1179,6 +1175,7 @@ else:
 # COMMAND ----------
 
 order = sample.assign(h=[stable_hash(SEED, f"review|{r}") for r in sample["row_id"]]).sort_values("h")
+# one brief per stratum first, then extra ones by region, so every region and category appears in the 30
 first = order.drop_duplicates("stratum")
 review = pd.concat([first, order[~order["row_id"].isin(first["row_id"])].drop_duplicates("region")]).head(N_REVIEW)
 GROUND_SCHEMA = {"type": "json_schema", "json_schema": {"name": "groundedness", "strict": True, "schema": {
@@ -1206,6 +1203,8 @@ for pkg in review.itertuples():
     recs_ = out.get("cited_records") if "cited_records" in out else out.get("records") or {}
     retrieved = [r for r in recs_.values() if r["type"] != "contract" or r.get("close_precedent", True)]
     check_no_leak(retrieved, pkg.notice_date, pkg.project_id)          # precedents and lessons: strict
+    # graph contracts (supplier history) are not replayed as of the date; counted and reported instead of failing the
+    # run
     out["_kg_future"] = leak_violations([r for r in recs_.values() if r["type"] == "contract" and not r.get("close_precedent", True)],
                                         str(pkg.notice_date.date()), [])   # a supplier's later wins (graph is not as-of)
     briefs.append((pkg, out))
@@ -1305,6 +1304,7 @@ else:
 # COMMAND ----------
 
 res_df = pd.DataFrame(results)
+# a metric can be added twice when a cell is re-run in the same session; the last value wins
 res_df = res_df.drop_duplicates(["backtest", "variant", "metric", "slice_type", "slice_value", "population"], keep="last")
 n_results = publish_table(
     spark.createDataFrame(res_df.astype(object).where(res_df.notna(), None),
@@ -1437,6 +1437,7 @@ checks = [
     ("backtest_packages", "main-sample notices before the test start", int((sample["notice_date"] < pd.Timestamp(TEST_START)).sum()), "== 0"),
     ("backtest_results", "duplicate keys", int(res_df.duplicated(["backtest", "variant", "metric", "slice_type", "slice_value", "population"]).sum()), "== 0"),
     ("timeline", "refit MAE minus p07 logged MAE (days)", round(repro["mae_days"] - M["test_mae_days"], 2), "info"),
+    # a few failed judge calls are tolerated; more would bias precision and should stop the publication
     ("precedents", "relevance judge failures", int(pairs["judge"].isna().sum()), "<= 15"),
     ("lessons", "lesson judge failures", int(lj["verdict"].isna().sum()), "<= 10"),
     ("review", "briefs produced", len(review_df), f"== {N_REVIEW}"),

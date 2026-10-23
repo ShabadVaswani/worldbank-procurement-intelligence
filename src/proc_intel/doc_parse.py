@@ -35,6 +35,7 @@ def running_lines(pages: list[list[str]], min_share: float = 0.3, min_pages: int
     counts = Counter()
     for lines in pages:
         counts.update({_digitless(line) for line in lines if 0 < len(line.strip()) <= 120})
+    # at least 4 pages and 30% of them, so a short document's real lines are not taken for headers
     threshold = max(min_pages, min_share * len(pages))
     return {key for key, n in counts.items() if n >= threshold and key}
 
@@ -59,6 +60,7 @@ def body_font_size(spans: list[tuple[float, int]]) -> float:
     """The font size that carries the most characters: (size, n_chars) pairs -> size (rounded to 0.5 pt)."""
     weight = Counter()
     for size, n_chars in spans:
+        # rounded to half points: the same body font is reported as 10.0, 10.02, 9.98 ... on different lines
         weight[round(size * 2) / 2] += n_chars
     return weight.most_common(1)[0][0] if weight else 10.0
 
@@ -80,6 +82,7 @@ def heading_level(text: str, size: float, bold: bool, body_size: float) -> int |
         return None
     if ANNEX_RE.match(text):
         return 1
+    # a year or several commas suggest a citation or a sentence fragment, not a heading
     if re.search(r"\b(19|20)\d\d\b", text) and not NUMBERED_RE.match(text) or text.count(",") >= 2:
         return None
     if text[-1].isdigit() and not NUMBERED_RE.match(text):        # table-of-contents entry "Risks ...... 12"
@@ -91,6 +94,7 @@ def heading_level(text: str, size: float, bold: bool, body_size: float) -> int |
         return None
     if m:
         num = m.group("num")
+        # a bare number in bold is a list or paragraph number, not a heading
         if num.isdigit() and len(words) == 1:
             return None
         return 1 if re.fullmatch(ROMAN, num) else 2
@@ -120,6 +124,7 @@ def assign_sections(elements: list[dict]) -> list[dict]:
     for el in elements:
         if el["kind"] == "heading":
             level = el.get("level", 1)
+            # a level-1 heading starts a new path; a level-2 heading replaces only the second part
             path = [el["text"]] if level == 1 or not path else [path[0], el["text"]]
         sp = list(path) or ["Front matter"]
         out.append({**el, "section_path": sp, "section_id": short_hash(" > ".join(sp)), "is_annex": is_annex(sp)})
@@ -162,6 +167,7 @@ def is_data_table(q: dict, min_rows: int = 2, min_cols: int = 2, min_fill: float
     """A real table: at least 2 x 2, at least 40% of cells filled, and not one big text box drawn as a frame
     (a 'table' whose cells hold whole paragraphs is prose in a box)."""
     filled = max(1, round(q["fill"] * q["n_rows"] * q["n_cols"]))
+    # over 40 words per filled cell in a one- or two-column frame is a paragraph drawn in a box
     prose_box = q["n_cols"] <= 2 and q["n_words"] / filled > 40
     return (q["n_rows"] >= min_rows and q["n_cols"] >= min_cols and q["fill"] >= min_fill
             and q["longest_cell_words"] <= 120 and not prose_box)
@@ -199,6 +205,7 @@ def table_chunks(rows: list[list[str]], max_words: int = 300) -> list[dict]:
     head_words = sum(len(c.split()) for r in header for c in r)
     groups, cur, cur_words = [], [], head_words
     for i, r in enumerate(body):
+        # + len(r): each cell also costs a separator, so wide rows of short numbers are not undercounted
         w = sum(len(c.split()) for c in r) + len(r)
         if cur and cur_words + w > max_words:
             groups.append(cur)
@@ -215,6 +222,7 @@ def split_sentences(par: str) -> list[str]:
     parts, start = [], 0
     for m in SENT_END.finditer(par):
         prev = par[start:m.start()].rsplit(" ", 1)[-1].rstrip(".!?\"')]").lower()
+        # no split after "e.g.", "para." or an initial ("J. Smith"): those full stops do not end a sentence
         if prev in ABBREV or (len(prev) == 1 and prev.isalpha()):
             continue
         parts.append(par[start:m.start()].strip())
@@ -244,6 +252,7 @@ def pack_sentences(sentences: list[str], target_words: int = 260, max_words: int
         if n_new and sum(len(x.split()) for x in cur) + uw > max_words:
             chunks.append(" ".join(cur))
             keep, kw = [], 0
+            # overlap: carry the last whole sentences (about overlap_words, at most twice that) into the next chunk
             for x in reversed(cur):
                 if kw + len(x.split()) > 2 * overlap_words:
                     break
@@ -286,6 +295,7 @@ def build_chunks(elements: list[dict], doc_title: str, target_words: int = 260, 
         text = re.sub(r"(\w)- (\w)", r"\1\2", text)
         first = buf[0]
         for piece in pack_sentences(split_sentences(text), target_words, max_words):
+            # fragments under 8 words (stray labels, page furniture) carry nothing worth retrieving
             if len(piece.split()) < 8:
                 continue
             chunks.append(_chunk("narrative", piece, first, doc_title, None, [e["page"] for e in buf]))
@@ -310,6 +320,8 @@ def build_chunks(elements: list[dict], doc_title: str, target_words: int = 260, 
 
 def _chunk(kind: str, text: str, el: dict, doc_title: str, caption: str | None, pages: list[int]) -> dict:
     header = context_header(doc_title, el["section_path"], caption)
+    # the header is embedded with the text (the p12 ablation shows retrieval depends on it) but kept separate for
+    # display
     return {"chunk_type": kind, "text": text, "context_header": header, "embed_text": f"{header}\n{text}",
             "section_path": " > ".join(el["section_path"]), "section_id": el["section_id"], "is_annex": el["is_annex"],
             "page_start": min(pages), "page_end": max(pages), "n_words": len(text.split()),

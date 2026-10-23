@@ -46,6 +46,7 @@ def allocate_sample(sizes: Mapping[Any, int], n_total: int, floor: int = 5) -> d
     sizes = {k: int(v) for k, v in sizes.items() if v > 0}
     alloc = {k: min(v, floor) for k, v in sizes.items()}
     remaining = n_total - sum(alloc.values())
+    # loop because a stratum can hit its size cap; the places it cannot take are shared out again in the next round
     while remaining > 0:
         room = {k: sizes[k] - alloc[k] for k in sizes if sizes[k] > alloc[k]}
         if not room:
@@ -61,6 +62,7 @@ def allocate_sample(sizes: Mapping[Any, int], n_total: int, floor: int = 5) -> d
             if add[k] < room[k]:
                 add[k] += 1
                 left -= 1
+        # no stratum can grow any more: stop instead of looping forever
         if sum(add.values()) == 0:
             break
         for k, a in add.items():
@@ -84,6 +86,8 @@ def stratified_pick(rows: Sequence[Mapping], stratum: Callable[[Mapping], Any], 
         by_stratum.setdefault(stratum(r), []).append(r)
     used = {k: set() for k in unique_keys}
     picked: dict[Any, list[dict]] = {s: [] for s in alloc}
+    # pass 1 enforces every unique key, pass 2 only the first (the notice); `used` is shared, so pass 2 never repeats a
+    # pass-1 pick
     for keys in (tuple(unique_keys), tuple(unique_keys[:1])):
         for s in sorted(alloc, key=str):
             for r in by_stratum.get(s, []):
@@ -120,6 +124,7 @@ def bootstrap_ci(values, stat: Callable[[np.ndarray], float] = np.mean, n_boot: 
     if len(v) == 0:
         return float("nan"), float("nan")
     rng = np.random.default_rng(seed)
+    # resample rows with replacement; a fixed seed makes the interval identical on every run
     stats = np.array([stat(v[rng.integers(0, len(v), len(v))]) for _ in range(n_boot)])
     return float(np.quantile(stats, alpha / 2)), float(np.quantile(stats, 1 - alpha / 2))
 
@@ -154,6 +159,7 @@ def roc_auc(y, score) -> float:
     n_pos, n_neg = int(y.sum()), int(len(y) - y.sum())
     if n_pos == 0 or n_neg == 0:
         return float("nan")
+    # stable sort, so tied scores stay contiguous and get the same average rank below
     order = np.argsort(s, kind="mergesort")
     ranks = np.empty(len(s), dtype=float)
     sorted_s = s[order]
@@ -164,6 +170,7 @@ def roc_auc(y, score) -> float:
             j += 1
         ranks[order[i:j + 1]] = (i + j) / 2 + 1
         i = j + 1
+    # Mann-Whitney U of the positives divided by the number of positive-negative pairs equals the ROC-AUC
     return float((ranks[y == 1].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
 
 
@@ -194,6 +201,7 @@ def leak_violations(records: Iterable[Mapping], cutoff, excluded_projects: Itera
     bad = []
     for r in records:
         d = _as_date(r.get(date_key))
+        # undated records count as leaks: without a date the backtest cannot prove the record existed at the cutoff
         if r.get("project_id") in excluded or d is None or d >= cut:
             bad.append(r.get("record_id"))
     return bad
@@ -285,6 +293,7 @@ def agreement(a: Sequence, b: Sequence) -> dict:
         return {"n": 0, "agreement": None, "kappa": None}
     po = sum(x == y for x, y in pairs) / n
     labels = sorted({x for x, _ in pairs} | {y for _, y in pairs}, key=str)
+    # chance agreement: product of the two labelings' marginal shares, summed over labels
     pe = sum((sum(x == lab for x, _ in pairs) / n) * (sum(y == lab for _, y in pairs) / n) for lab in labels)
     kappa = None if pe == 1 else (po - pe) / (1 - pe)
     return {"n": n, "agreement": po, "kappa": kappa}
@@ -322,6 +331,7 @@ def parse_lesson_verdict(text: str) -> dict | None:
 
 def lesson_score(verdict: str | None) -> float | None:
     """yes = 1, partial = 0.5, no = 0; None for none_occurred or a failed judgement (not scorable)."""
+    # "partial" (a generic warning) earns half: it would have pointed a team at the area, not at the mechanism
     return {"yes": 1.0, "partial": 0.5, "no": 0.0}.get(verdict or "")
 
 
@@ -386,6 +396,7 @@ def review_agreement(rows: Sequence[Mapping]) -> dict:
 def render_review_html(rows: Sequence[Mapping], title: str = "Procurement agent: human review pack") -> str:
     """A self-contained, readable HTML page: one section per package with the brief, cited records, the actual
     outcome and empty label fields to fill in the CSV. All text is escaped."""
+    # all text comes from model output and source documents; escape it so nothing in it can act as HTML
     def e(s) -> str:
         return html.escape("" if s is None else str(s))
 

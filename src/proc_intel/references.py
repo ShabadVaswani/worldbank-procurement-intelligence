@@ -21,6 +21,8 @@ import re
 
 from unidecode import unidecode
 
+# the activity id is the 5-7 digit block right before the category code; the lookarounds stop it matching inside longer
+# numbers or words
 _STEP_ID = re.compile(r"(?<![0-9])([0-9]{5,7})\s*-\s*(?:GO|CW|CS|NC)(?![A-Z])")
 _NON_ALNUM = re.compile(r"[^A-Z0-9]+")
 
@@ -56,6 +58,7 @@ def is_reference_variant(a: str, b: str) -> bool:
     extra = len(long_) - len(short)
     if not 1 <= extra <= MAX_VARIANT_INSERT or len(short) < MIN_VARIANT_LENGTH:
         return False
+    # try every insertion point: the extra letters can be a prefix, an infix ('17B/W/...') or a suffix ('...06A')
     for start in range(len(short) + 1):
         inserted = long_[start:start + extra]
         if inserted.isalpha() and long_[:start] + long_[start + extra:] == short:
@@ -71,6 +74,7 @@ def variant_keys(normalised: str) -> list[str]:
     """
     keys: set[str] = set()
     for size in range(1, MAX_VARIANT_INSERT + 1):
+        # deleting more would leave a key too short to be specific, and keys only get shorter as size grows
         if len(normalised) - size < MIN_VARIANT_LENGTH:
             break
         for start in range(len(normalised) - size + 1):

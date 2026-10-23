@@ -49,24 +49,6 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC <details><summary>Text version of the diagram</summary>
-# MAGIC
-# MAGIC ```
-# MAGIC  new package --> input guard --> planner LLM --tool calls (max 6)--> similar_past_contracts  (TF-IDF + GTE, 282,890 contracts,
-# MAGIC  {country,        (Llama 3.3)     (Qwen 3.5)                          |                       only re-rank cosine >= threshold)
-# MAGIC   category,                          |                              tender_benchmark        (proc_gold.tender_benchmarks)
-# MAGIC   method,                            |                              forecast_timeline       (ml.proc_tender_duration@champion)
-# MAGIC   description}                       |                              lessons_learned         (appraisal + completion passages)
-# MAGIC                                      v                              supplier_profile        (proc_gold.kg_nodes / kg_edges)
-# MAGIC                               writer LLM (JSON brief) <---- records with ids --+
-# MAGIC                                      |
-# MAGIC                                      v
-# MAGIC                      validation in code: unknown ids dropped, uncited risks removed, timeline numbers
-# MAGIC                      equal to the cited forecast and benchmark, precedents only close ones  -->  cited brief
-# MAGIC ```
-# MAGIC
-# MAGIC </details>
-# MAGIC
 # MAGIC | Output | Grain | Key |
 # MAGIC |---|---|---|
 # MAGIC | `proc_silver.lesson_documents` | one completion report (ICR) selected for the lessons corpus | `doc_id` |
@@ -98,52 +80,21 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## How it was built and tested
+# MAGIC ## Key design decisions
 # MAGIC
-# MAGIC **Step 1 — Contract search: embeddings for everything, or keywords?**
-# MAGIC - **Question:** what is a cost-sane way to find similar past contracts among 282,890?
-# MAGIC - **What we found:** embedding every description would take about five hours at the workspace's embedding rate limit (about 15 texts per second, shared with every other job). TF-IDF over all of them builds in about a minute. A first TF-IDF version with a stored unigram + bigram vocabulary made the driver process balloon while counting the vocabulary, on a 16 GB driver shared with other jobs; hashing the terms (no stored vocabulary) kept the whole index at about 70 MB.
-# MAGIC - **Decision:** hashed TF-IDF over all contracts, then GTE re-ranking of only the best 30 per query. Measured on the 20 evaluation packages (section 5b): precision@5 rose from about 0.6 with TF-IDF alone to about 0.75 with re-ranking (exact values in section 5b).
+# MAGIC | Decision | Rationale | Evidence |
+# MAGIC |---|---|---|
+# MAGIC | Hashed TF-IDF over all 282,890 contracts, then GTE re-ranking of only the best 30 per query | Embedding every description is too slow under the shared rate limit; a stored vocabulary inflated driver memory | Embedding all would take about five hours (about 15 texts per second); TF-IDF builds in about a minute; a stored unigram + bigram vocabulary inflated the driver process on a shared 16 GB driver; hashing keeps the index at about 70 MB; precision@5 about 0.6 with TF-IDF alone vs about 0.75 re-ranked on the 20 evaluation packages (section 5b) |
+# MAGIC | Passage rules: numbered digit headings must be capitalised and comma-free (all-capitals Roman or letter headings may contain commas); cp1252 fallback; M&E sections excluded; unit tests per case | Heading and encoding errors assigned passages to the wrong sections | Initial rules kept only 3,768 passages and read numbered paragraphs ("86. The concerned government agencies were ...") as headings; a later rule rejected "IV. BANK PERFORMANCE, COMPLIANCE ISSUES, AND RISK ..."; some reports are Windows-1252; result: 4,495 passages from 300 reports |
+# MAGIC | The 970,000 bid and award edges loaded once into integer-coded arrays for supplier profiles | Spark joins were too slow for an interactive loop, and caching held driver memory | Joins over the 2.3 million edges took 26 to 74 seconds per profile; with arrays (a few MB) a profile takes about 4.5 seconds; the co-bidder answer is identical to the join version |
+# MAGIC | Tolerant tool interfaces: numeric strings converted for integer parameters; country names and method codes resolved by every tool; embeddings in batches of 8 paced at 10 texts per second across threads, with longer backoff; the benchmark tool reads only documented columns, casts decimals and falls back to `tender_timelines` peer groups | Model quirks, the shared rate limit and another component's table must not break tool calls | Qwen 3.5 sent numbers as strings (`"k": "5"`), rejected ten times in one run with two core tools forced (after the fix: 4 own calls, no forced tool); both models pass country names ("Kenya"); a 31-text request was refused with HTTP 429 eight times in a row; `proc_gold.tender_benchmarks` has a decimal `slow_rate` |
+# MAGIC | The trace's evidence span includes the package text as a non-citable "user input" document | The groundedness judge must see everything the agent was given | In a trial the judge marked a brief ungrounded partly because it restated the package ("speedboats ... between islands") |
+# MAGIC | A precedent needs re-rank cosine >= 0.68 and TF-IDF cosine >= 0.08; lower-ranked candidates fill freed places; the writer lists only genuinely similar records and the code accepts only records marked close | Always listing five precedents included irrelevant ones; the cosine level moves with the query | 200 judged pairs (74% relevant): GTE ROC-AUC 0.77, TF-IDF 0.66, same method 0.56; best candidates score 0.70 (relevant) and 0.73 (speedboats, not relevant; 0 of 5 relevant); a 0.74 cosine cut empties four packages; speedboat look-alikes have TF-IDF 0.05 to 0.07; best F0.5 on the grid: precision 0.83 vs 0.76 unfiltered, recall 0.86; leave-one-package-out picked the same pair for 19 of 20 (out-of-fold precision 0.81) |
+# MAGIC | `proc_intel.forecast.planning_features` fills unknown notice facts with documented defaults listed in `assumptions`; unknown project facts stay missing; untrained methods or categories return an unscored record and the brief falls back to the peer group | A planning brief comes before the notice, but the model needs 27 notice-date features | Country, method, category, market history and governance are known at planning time; cohort medians: Request for Bids works 28 days advertising, 7,862-character notices; QCBS 18 days, expressions of interest; direct selection and individual consultants cannot be scored; section 5f measures the cost of the defaults |
 # MAGIC
-# MAGIC **Step 2 — Which completion-report passages are lessons about procurement?**
-# MAGIC - **Question:** can headings and keywords pick the procurement-relevant passages out of 100-page reports?
-# MAGIC - **What we found:** the first rules kept only 3,768 passages and mistook numbered paragraphs ("86. The concerned government agencies were ...") for headings, so passages got nonsense section names. All-capitals headings with commas ("IV. BANK PERFORMANCE, COMPLIANCE ISSUES, AND RISK ...") were then rejected by the fix, which moved the fiduciary passages under the wrong section. Some reports are Windows-1252, not UTF-8, and curly quotes turned into replacement characters. Monitoring-and-evaluation sub-sections sit inside the "compliance" section but say nothing about procurement.
-# MAGIC - **Decision:** numbered digit headings must be capitalised and comma-free (all-capitals Roman or letter headings may contain commas); a cp1252 fallback; M&E sections are excluded. Result: 4,495 passages from 300 reports, mostly key factors during preparation and implementation, lessons, fiduciary compliance and quality of supervision. Unit tests cover each of these cases.
+# MAGIC Limitations: the precedent-threshold gain is modest.
 # MAGIC
-# MAGIC **Step 3 — A supplier profile in seconds**
-# MAGIC - **Question:** can the knowledge graph answer "who is this firm and who does it compete with?" inside an interactive loop?
-# MAGIC - **What we found:** Spark joins over the 2.3 million edges took 26 to 74 seconds per profile on the shared cluster, and caching the edges held driver memory for the whole session.
-# MAGIC - **Decision:** the 970,000 bid and award edges are loaded once into integer-coded arrays (a few MB); a profile then takes about 4.5 seconds, mostly the two node look-ups. The co-bidder answer is identical to the join version.
-# MAGIC
-# MAGIC **Step 4 — Tool-calling quirks of the planner models**
-# MAGIC - **Question:** do the two candidate models call the tools correctly?
-# MAGIC - **What we found:** both return well-formed tool calls and accept the strict JSON schema. Qwen 3.5 sends numbers as quoted strings (`"k": "5"`); the argument check rejected them ten times in one run and the coverage check had to add two core tools. Both models pass countries as names ("Kenya"), not codes.
-# MAGIC - **Decision:** numeric strings are converted for integer parameters, and every tool resolves country names and method codes; after that fix the same run made 4 calls of its own and needed no forced tool. The model comparison (section 3) is run after these fixes.
-# MAGIC
-# MAGIC **Step 5 — The shared embedding rate limit**
-# MAGIC - **Question:** can the agent embed 31 texts per query while other jobs embed too?
-# MAGIC - **What we found:** one request of 31 texts was refused with HTTP 429 eight times in a row: the workspace limit counts every text as a query and is shared by every user.
-# MAGIC - **Decision:** batches of 8 and a pacing clock at 10 texts per second shared by all threads, with longer backoff.
-# MAGIC
-# MAGIC **Step 6 — What the groundedness judge needs to see**
-# MAGIC - **Question:** is "not grounded" from the judge a real hallucination?
-# MAGIC - **What we found:** in a trial, the judge marked a brief ungrounded partly because it restated the package itself ("speedboats ... between islands"), which is in no tool record.
-# MAGIC - **Decision:** the trace's evidence span also carries the package text as a non-citable "user input" document, so the judge checks the brief against everything the agent was given.
-# MAGIC
-# MAGIC **Step 7 — The benchmark table belongs to another component**
-# MAGIC - **Question:** how can the agent use the risk component's benchmarks without depending on its code?
-# MAGIC - **What we found:** `proc_gold.tender_benchmarks` appeared while this notebook was being built, with the same four peer-group levels; its `slow_rate` column is a decimal type.
-# MAGIC - **Decision:** the tool reads only its documented columns (and stops with a clear message if one is missing), casts decimals, and falls back to computing the same peer groups from `tender_timelines` when the table does not exist.
-# MAGIC
-# MAGIC **Step 8 — Fewer precedents when nothing comparable exists**
-# MAGIC - **Question:** the first version always listed five precedents, even for speedboats to carry laboratory samples (0 of 5 relevant). Which score says when a candidate is close enough?
-# MAGIC - **What we found:** on 200 judged pairs (top 10 re-ranked candidates of the 20 evaluation packages; 74% relevant), the GTE re-rank cosine separates relevant from not relevant best (ROC-AUC 0.77; TF-IDF 0.66; same method 0.56), but its level moves with the query: the best candidate for the technical-education study scores 0.70 and is relevant, the best for the speedboats scores 0.73 (sample-shipping kits) and is not. Any cosine-only cut that drops the speedboat candidates also empties briefs that had five relevant precedents (at 0.74, four packages lose all precedents and only one of them had nothing relevant). The speedboat look-alikes share few words with the package: the three closest in meaning have TF-IDF cosines of 0.05 to 0.07.
-# MAGIC - **Decision:** a precedent needs re-rank cosine >= 0.68 **and** TF-IDF cosine >= 0.08, with lower-ranked candidates filling freed places; the pair has the best F0.5 on the grid (precision 0.83 vs 0.76 for an unfiltered top 5, recall 0.86), a leave-one-package-out check picked the same pair for 19 of 20 packages (out-of-fold precision 0.81), and only the speedboat package is left with none. The gain is modest; the writer is also told to list only genuinely similar records, and the code accepts only records the search marked as close.
-# MAGIC
-# MAGIC **Step 9 — A forecast for a tender that has not been advertised yet**
-# MAGIC - **Question:** the risk component's model needs 27 features known on the notice date; a planning brief comes before the notice. What can be filled in honestly?
-# MAGIC - **What we found:** country, method, category, market history and governance are known at planning time; the advertising period, notice type, length and language are not, and project facts only when the user gives a project id. The training cohort's medians are clear by method x category (Request for Bids works: 28 days advertising, 7,862-character notices; QCBS: 18 days, expressions of interest). Methods the model was never trained on (direct selection, individual consultants) cannot be scored at all.
-# MAGIC - **Decision:** `proc_intel.forecast.planning_features` fills each unknown with a documented default and lists it in the record's `assumptions`; unknown project facts stay missing, as LightGBM was trained with missing values. A method or category outside the training data returns an unscored record and the brief falls back to the peer group, saying so. Section 5f measures what the defaults cost against the real notice facts.
+# MAGIC Full reasoning: docs/decision_log.md
 
 # COMMAND ----------
 
@@ -176,9 +127,11 @@ from proc_intel.lessons import decode_report, lesson_chunks
 ICR_ROOT = f"{RAW_VOLUME}/icr_docs"
 WDS_URL = "https://search.worldbank.org/api/v2/wds"
 ICR_TYPE = "Implementation Completion and Results Report"
+# 300 reports keep the embedding run under ~20 minutes at the shared ~15 texts/s limit
 MAX_DOCS = 300
 MAX_PER_DOC = 50                 # 300 x 50 = the 15,000-passage budget
 EMBED_BATCH = 8                  # texts per request; the workspace limit counts every text
+# stored on every passage so a later chunker change can be told apart from this corpus
 CHUNKER_VERSION = "lessons-v1"
 EVAL_FILE = os.path.abspath(os.path.join(os.getcwd(), "..", "data", "agent_eval_packages.json"))
 LABEL_FILE = os.path.abspath(os.path.join(os.getcwd(), "..", "data", "agent_relevance_labels.csv"))
@@ -201,6 +154,7 @@ os.makedirs(f"{ICR_ROOT}/embeddings", exist_ok=True)
 
 def fetch_icr_catalog():
     pages = sorted(glob.glob(f"{ICR_ROOT}/metadata/page_*.json"))
+    # saved catalog pages are reused, so a re-run does not page the Documents API again
     if pages:
         print(f"catalog: reusing {len(pages)} saved pages")
         return pages
@@ -211,6 +165,7 @@ def fetch_icr_catalog():
         r.raise_for_status()
         body = r.json()
         total = int(body["total"])
+        # the API returns documents as a dict keyed by id, with a "facets" entry mixed in
         page = [v for k, v in body["documents"].items() if k != "facets"]
         if not page:
             break
@@ -231,6 +186,9 @@ catalog = spark.createDataFrame(pd.DataFrame(rows))
 catalog.createOrReplaceTempView("icr_catalog")
 print(f"catalog rows: {catalog.count():,}")
 
+# one report per project, then round-robin over sectors within each region so no single sector or country fills the
+# corpus;
+# the 7 regions share the 300 places, hence region_rank <= MAX_DOCS // 7 + 1 inside the query
 selection = spark.sql(f"""
     WITH docs AS (
       SELECT doc_id, trim(pid) AS project_id, try_to_date(nullif(doc_date, '')) AS doc_date, regexp_replace(txt_url, '^http://', 'https://') AS txt_url, title
@@ -279,6 +237,7 @@ session = requests.Session()
 
 def download(row):
     path = f"{ICR_ROOT}/text/{row.project_id}__{row.doc_id}.txt"
+    # resumable: a file already on the volume is not downloaded again (empty files from a failed write are retried)
     if os.path.exists(path) and os.path.getsize(path) > 0:
         return row.doc_id, path, "exists", os.path.getsize(path)
     status = "error"
@@ -316,6 +275,7 @@ print(f"downloads in {time.time() - t0:.0f} s: {docs.download_status.value_count
 
 chunk_rows, stats = [], []
 for d in docs[docs.path.notna()].itertuples():
+    # decode_report falls back to cp1252: some of the Bank's text extractions are not valid UTF-8
     raw = decode_report(open(d.path, "rb").read())
     kept = lesson_chunks(raw, max_per_doc=MAX_PER_DOC)
     stats.append({"doc_id": d.doc_id, "n_words": len(raw.split()), "n_kept": len(kept)})
@@ -346,8 +306,10 @@ for c in ex.head(4).itertuples():
 # COMMAND ----------
 
 proj_names = {p: r.project_name for p, r in refs()["projects"].items()}
+# project name and section go into the embedded text so a query can match a passage that only says "the works"
 chunks["embed_text"] = [f"Completion report | {proj_names.get(p, '')} | {s}\n{t}"
                         for p, s, t in zip(chunks.project_id, chunks.section, chunks.chunk_text)]
+# checkpoint key: a vector is reused only if the exact embedded text is unchanged
 chunks["text_hash"] = [hashlib.sha256(t.encode()).hexdigest()[:32] for t in chunks.embed_text]
 
 done = {}
@@ -361,6 +323,7 @@ for start in range(0, len(todo), 1000):
     part = todo.iloc[start:start + 1000]
     V = embed_texts(part.embed_text.tolist(), batch_size=EMBED_BATCH)
     g = pd.DataFrame({"text_hash": part.text_hash.to_numpy(), "embedding": list(V)})
+    # one file per 1,000 vectors: an interrupted run loses at most the group in progress
     g.to_parquet(f"{ICR_ROOT}/embeddings/group_{n_groups:04d}.parquet")
     n_groups += 1
     done.update(zip(g.text_hash, g.embedding))
@@ -417,6 +380,7 @@ add_foreign_key(LESSON_TABLE, ["doc_id"], LESSON_DOCS_TABLE, ["doc_id"])
 add_foreign_key(LESSON_TABLE, ["project_id"], f"{SILVER}.dim_project", ["project_id"])
 
 L, D = spark.table(LESSON_TABLE), spark.table(LESSON_DOCS_TABLE)
+# squared length of each vector in SQL; retrieval uses dot products, which equal cosines only for unit vectors
 norms = L.select(F.expr("aggregate(embedding, 0D, (a, x) -> a + x * x)").alias("n2"))
 display(dq_report([
     (LESSON_DOCS_TABLE, "rows (reports selected)", n_docs, f"<= {MAX_DOCS}"),
@@ -516,10 +480,12 @@ for model in CANDIDATES:
         choice.append({"model": model.replace("databricks-", ""), "package": i + 1, **run_summary(r)})
 choice = pd.DataFrame(choice)
 display(choice)
+# a fallback brief is the worst outcome, so it weighs three times a single forced tool or bad citation
 score = (choice.assign(bad=lambda x: x.forced_tools + x.n_invalid_citations + (x.json_first_try == False).astype(int)
                        + (x.status == "fallback").astype(int) * 3)
          .groupby("model").agg(bad=("bad", "sum"), median_latency_s=("latency_s", "median"), dbu=("dbu", "sum")))
 display(score.reset_index())
+# ties go to cost before latency: latency on the shared pay-per-token endpoints changed a lot from day to day
 CHOSEN_MODEL = "databricks-" + score.sort_values(["bad", "dbu", "median_latency_s"]).index[0]
 PLANNER_MODEL = CHOSEN_MODEL
 print(f"planner and writer model for the rest of this notebook: {CHOSEN_MODEL}")
@@ -578,6 +544,8 @@ src = (spark.table(f"{SILVER}.contracts").filter(F.col("contract_id").isin([p["s
 packages = []
 for p in ev["packages"]:
     pkg = {k: p[k] for k in ("description", "country", "category", "method")}
+    # hold out the source contract's whole project, or the search would simply find the contract the package was written
+    # from
     pkg["_exclude_projects"] = [src.project_id[p["source_contract_id"]]]
     packages.append({"eval_id": p["id"], "source_contract_id": p["source_contract_id"], "package": pkg})
 guard_cases = [{"eval_id": g["id"], "expected": g["expected"],
@@ -598,6 +566,7 @@ display(pd.DataFrame([{"eval_id": p["eval_id"], **{k: v for k, v in p["package"]
 
 # COMMAND ----------
 
+# strict JSON schema so the judge's verdict parses without free-text handling
 REL_SCHEMA = {"type": "json_schema", "json_schema": {"name": "relevance", "strict": True, "schema": {
     "type": "object", "additionalProperties": False, "required": ["relevant", "reason"],
     "properties": {"relevant": {"type": "boolean"}, "reason": {"type": "string"}}}}}
@@ -628,6 +597,7 @@ retr = []
 for p in packages:
     pkg = p["package"]
     for variant, rr_, k_ in (("tfidf", False, 5), ("tfidf_gte_rerank", True, 10)):
+        # min_cosine=None switches the precedent filter off: this measures the ranking itself
         res = similar_past_contracts(pkg["description"], pkg["country"], pkg["category"], k=k_, rerank=rr_,
                                      exclude_project_ids=pkg["_exclude_projects"], min_cosine=None)
         for rank, rec in enumerate(res["records"], 1):
@@ -635,6 +605,7 @@ for p in packages:
                          "similarity": rec["similarity"], "rerank_cosine": rec["rerank_cosine"],
                          "same_country": rec["same_country"], "rec": rec})
 retr = pd.DataFrame(retr)
+# a contract found by both variants is judged once, so both variants are scored with the same verdict
 pairs = retr.drop_duplicates(["eval_id", "contract_id"]).reset_index(drop=True)
 pkg_of = {p["eval_id"]: p["package"] for p in packages}
 with ThreadPoolExecutor(max_workers=2) as pool:
@@ -642,6 +613,7 @@ with ThreadPoolExecutor(max_workers=2) as pool:
 pairs = pairs.assign(relevant=[v[0] for v in verdicts], judge_reason=[v[1] for v in verdicts])
 retr = retr.merge(pairs[["eval_id", "contract_id", "relevant", "judge_reason"]], on=["eval_id", "contract_id"])
 top5_retr = retr[retr["rank"] <= 5]
+# a failed judge call counts as not relevant, and fewer than 5 results still divide by 5, so the figure errs low
 p_at_5 = (top5_retr.groupby(["variant", "eval_id"]).relevant.apply(lambda s: s.fillna(False).astype(bool).sum() / 5)
           .rename("p_at_5").reset_index())
 summary_retr = p_at_5.groupby("variant").p_at_5.agg(["mean", "min", "max"]).round(3)
@@ -652,6 +624,7 @@ print(f"{len(pairs)} distinct (package, contract) pairs judged ({len(top5_retr.d
 display(summary_retr.reset_index())
 display(p_at_5.pivot(index="eval_id", columns="variant", values="p_at_5").reset_index())
 gain = summary_retr.loc["tfidf_gte_rerank", "mean"] - summary_retr.loc["tfidf", "mean"]
+# re-ranking costs 31 embeddings per query; keep it only if it buys at least 5 points of precision
 RERANK = bool(gain >= 0.05)
 print(f"re-ranking gain in precision@5: {gain:+.3f} -> RERANK = {RERANK} for the agent")
 
@@ -663,6 +636,7 @@ print(f"re-ranking gain in precision@5: {gain:+.3f} -> RERANK = {RERANK} for the
 # COMMAND ----------
 
 top5_pairs = pairs.merge(top5_retr[["eval_id", "contract_id"]].drop_duplicates(), on=["eval_id", "contract_id"])
+# hash order: the same 30 pairs on every run, so the saved reference labels keep matching
 sample = (top5_pairs.assign(h=[hashlib.sha1(f"{a}|{b}".encode()).hexdigest() for a, b in zip(top5_pairs.eval_id, top5_pairs.contract_id)])
           .sort_values("h").head(30))
 for r in sample.itertuples():
@@ -696,10 +670,12 @@ rule_rows = [{"rule": "top 5, no filter", **precedent_rule_metrics(cand, 0.0, 0.
              {"rule": f"agent: cosine >= {MIN_PRECEDENT_COSINE} and tfidf >= {MIN_PRECEDENT_TFIDF}",
               **precedent_rule_metrics(cand, MIN_PRECEDENT_COSINE, MIN_PRECEDENT_TFIDF)},
              {"rule": f"cosine only >= {MIN_PRECEDENT_COSINE}", **precedent_rule_metrics(cand, MIN_PRECEDENT_COSINE, 0.0)}]
+# beta 0.5 weights precision over recall: a listed but unrelated precedent misleads more than a missing one
 best_run = choose_precedent_rule(cand, COS_GRID, TFIDF_GRID, beta=0.5)
 rule_rows.append({"rule": f"best F0.5 on this run: cosine >= {best_run['min_cosine']} and tfidf >= {best_run['min_tfidf']}", **best_run})
 loo_taken = loo_tp = loo_cap = 0
 loo_pairs = []
+# leave one package out: choose the rule on 19 packages, apply it to the 20th, to see how much the choice overfits
 for e in sorted({c["group"] for c in cand}):
     b_ = choose_precedent_rule([c for c in cand if c["group"] != e], COS_GRID, TFIDF_GRID, beta=0.5)
     m_ = precedent_rule_metrics([c for c in cand if c["group"] == e], b_["min_cosine"], b_["min_tfidf"])
@@ -762,6 +738,7 @@ print(f"MIN_LESSON_COSINE = {MIN_LESSON_COSINE}: packages below it "
 
 from mlflow.genai.scorers import RetrievalGroundedness
 
+# two agents at a time keep the chat and embedding endpoints under their shared rate limits
 os.environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] = "2"
 JUDGE_URI = f"databricks:/{JUDGE_MODEL}"
 store = {}
@@ -771,6 +748,7 @@ HELD_OUT = {p["package"]["description"]: p["package"]["_exclude_projects"] for p
 def predict_fn(package):
     # the held-out project travels outside the judged inputs (in phase 2 the judge read it as part of the claim)
     r = procurement_brief({**package, "_exclude_projects": HELD_OUT[package["description"]]})
+    # keep the full result: the judge only sees the text, the code checks below need the brief and the records
     store[package["description"]] = r
     return r["text"]
 
@@ -797,6 +775,7 @@ def _as_score(v):
         vals = [x for x in (_as_score(y) for y in v) if x is not None]
         return sum(vals) / len(vals) if vals else None
     if isinstance(v, str):
+        # the judge's value arrives as "yes"/"no", a number, a list, or NaN depending on the MLflow version
         return {"yes": 1.0, "no": 0.0}.get(v.strip().lower())
     if v is None or (isinstance(v, float) and v != v):
         return None
@@ -826,6 +805,7 @@ for p in packages:
     rel = []
     for cid in cited_prec:
         if (p["eval_id"], cid) not in judged:
+            # a precedent the agent cited that was not in the 5b pool gets judged now, with the same judge and prompt
             judged[(p["eval_id"], cid)] = judge_relevance(p["package"], r["records"][f"contract:{cid}"])[0]
         rel.append(judged[(p["eval_id"], cid)])
     g, rat = ground.get(p["package"]["description"], (None, ""))
@@ -833,6 +813,7 @@ for p in packages:
                  "n_precedents_cited": len(cited_prec),
                  "precedent_precision": (sum(bool(x) for x in rel) / len(rel)) if rel else None,
                  "relevant_in_pool": pool_relevant.get(p["eval_id"], 0),
+                 # an empty precedent list is right only when nothing in the re-ranked top 10 was judged relevant
                  "zero_precedents_right": (pool_relevant.get(p["eval_id"], 0) == 0) if not cited_prec else None,
                  "invalid_citations": ",".join((r.get("validation") or {}).get("invalid_citations", [])),
                  "forced_tool_names": ",".join(r.get("forced_tools", [])), "brief_text": r["text"],
@@ -934,10 +915,13 @@ for p in ev["packages"]:
         continue
     s_ = src_tl.loc[cid]
     base = {k: p[k] for k in ("country", "category", "method")} | {"planned_notice_date": s_.notice_date}
+    # A = what the agent knows at planning time, B adds the project, C adds the real notice facts; the gaps show what
+    # each input is worth
     variants = {"A": base, "B": base | {"project_id": s_.project_id},
                 "C": base | {"project_id": s_.project_id, "notice_type": s_.notice_type, "notice_language": s_.notice_language,
                              **({"advertising_days": float(s_.advertising_days)} if pd.notna(s_.advertising_days) else {})}}
     row = {"eval_id": p["id"], "timed": True, "notice_date": s_.notice_date, "in_model_cohort": w0 <= s_.notice_date <= w1,
+           # capped at 730 days, like the model's training target
            "actual_days": min(float(s_.actual_days), 730.0)}
     for name, pkg in variants.items():
         rec = forecast_timeline(pkg)["records"][0]
@@ -983,6 +967,7 @@ keep_cols = ["eval_id", "kind", "description", "source_contract_id", "status", "
              "groundedness_rationale", "flags", "latency_s", "dbu", "brief_text", "brief_json", "relevant_in_pool",
              "zero_precedents_right", "forecast_p50_days", "peer_p50_days", *tl_cols.values()]
 save = pd.concat([e2e, guard_df], ignore_index=True).reindex(columns=keep_cols)
+# pandas NaN would not fit the typed schema below; turn every missing value into None first
 save = save.astype(object).where(save.notna(), None)
 save_schema = ("eval_id string, kind string, description string, source_contract_id string, status string, expected string, "
                "got string, correct boolean, guard_reason string, model_tool_calls double, forced_tool_names string, "
@@ -1040,6 +1025,8 @@ print(f"saved {n_saved} rows to {GOLD}.agent_eval_results")
 # COMMAND ----------
 
 led = ledger_frame()
+# the judge runs inside MLflow, so its tokens are not metered here; estimate ~4 characters per token and 400 output
+# tokens per call
 judge_in = int(sum(len(_evidence_block(x)) for r in store.values() for x in (r.get("records") or {}).values()) / 4)
 led = pd.concat([led, pd.DataFrame([{"model": "gpt-oss-120b groundedness judge (estimated)", "calls": len(store),
                                      "prompt_tokens": judge_in, "completion_tokens": 400 * len(store),
@@ -1078,7 +1065,7 @@ print(f"total {led.dbu.sum():.2f} DBU in this run")
 # MAGIC
 # MAGIC **Reading the timeline result:** with only country, method and category the model is no better than the peer group (91 vs 85 days on 20 tenders); its edge comes from facts the planner does not have yet. Giving the project id (always known to a task team) brings it level or slightly ahead (80); the real advertising period, notice type and language bring it to 60. So the brief shows both numbers, the forecast with its assumptions, and the package's optional fields (`project_id`, `advertising_days`, `planned_notice_date`) are worth filling in. With 20 tenders (17 of them inside the training cohort of both the model and the benchmark table) these differences are indicative only; `p07`'s held-out test (MAE 76 vs 88 days) is the out-of-sample evidence.
 # MAGIC
-# MAGIC **What changed between runs while building this version:** in a first run the model-choice rule broke a tie on latency and picked Llama 3.3 (faster on that day, twice the cost); the rule now breaks ties on cost first. In the next run, three briefs failed groundedness because the writer had been asked to say whether the forecast was above or below the peer group and got the direction wrong ("129 days, faster than the peer median of 100"); the difference is now computed in code and a summary that compares the medians in words is rewritten (`timeline_text_replaced`, 1 brief here). The judge also could not check "no close precedent found" because an empty search leaves no record; empty searches are now logged as *tool outcome* documents in the evidence span.
+# MAGIC **Revisions made during development:** in an earlier run the model-choice rule broke a tie on latency and picked Llama 3.3 (faster on that day, twice the cost); the rule now breaks ties on cost first. In the next run, three briefs failed groundedness because the writer had been asked to say whether the forecast was above or below the peer group and got the direction wrong ("129 days, faster than the peer median of 100"); the difference is now computed in code and a summary that compares the medians in words is rewritten (`timeline_text_replaced`, 1 brief here). The judge also could not check "no close precedent found" because an empty search leaves no record; empty searches are now logged as *tool outcome* documents in the evidence span.
 # MAGIC
 # MAGIC **The one "not grounded" brief (e11)** is a harness artefact: the judge read the held-out project id and the model argument from the agent span's inputs as part of the claim. The id is no longer in the judged inputs, but it still reaches the traced `procurement_brief` call; passing it through a context variable instead would remove it.
 # MAGIC

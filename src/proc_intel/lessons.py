@@ -19,6 +19,7 @@ from collections import Counter
 TARGET_WORDS = 220
 MAX_WORDS = 320
 MIN_WORDS = 40
+# a chunk where fewer than 45% of the words start lower-case is a table, list or contents page, not prose
 PROSE_MIN = 0.45
 
 _ROMAN = r"(?:X{0,3})(?:IX|IV|V?I{0,3})"
@@ -26,6 +27,7 @@ _NUMBERED = re.compile(rf"^(?:(?P<num>{_ROMAN}|[A-H]|\d{{1,2}})[.)]|(?P<dotted>\
                        rf"(?P<title>[A-Za-z].*)$")
 _PAGE = re.compile(r"^(page\s*)?\d{1,3}(\s*(of|/)\s*\d{1,3})?$", re.I)
 _WS = re.compile(r"[ \t ]+")
+# split after . ! ? only when followed by a capital, so "US$ 2.5 million" and "e.g. the" stay in one sentence
 _SENT_END = re.compile(r"(?<=[a-z0-9)%][.!?])\s+(?=[A-Z(])")
 _DOTS = re.compile(r"\.{4,}\s*\d*")
 
@@ -51,6 +53,7 @@ def heading(line: str) -> tuple[int, str] | None:
     title-case line of 1-6 words without a final full stop ('Procurement', 'Financial Management').
     """
     s = line.strip()
+    # dot leaders ("Procurement ........ 12") are contents-page entries, not headings
     if len(s) < 4 or len(s) > 110 or s.endswith((",", ";", ":")) or _DOTS.search(s):
         return None
     words = s.split()
@@ -110,6 +113,7 @@ def paragraphs_with_sections(raw: str) -> list[tuple[str, str]]:
 
     def flush():
         if buf:
+            # re-join words hyphenated at a line break ("procure- ment" -> "procurement")
             par = re.sub(r"(\w)- (\w)", r"\1\2", " ".join(buf))
             out.append((section(), par))
             buf.clear()
@@ -121,6 +125,7 @@ def paragraphs_with_sections(raw: str) -> list[tuple[str, str]]:
         if _PAGE.match(l) or l in repeated:
             continue
         h = heading(l)
+        # a heading counts only at the start of a paragraph; a heading-like line inside a paragraph is wrapped text
         if h and not buf:
             flush()
             if h[0] == 1:
@@ -163,6 +168,7 @@ def chunk_report(raw: str, target: int = TARGET_WORDS, max_words: int = MAX_WORD
                 pieces_w = [piece]
             for p in pieces_w:
                 n_cur = sum(len(c.split()) for c in cur)
+                # close the current chunk before it would exceed max_words, so pieces are never cut mid-sentence
                 if cur and n_cur + len(p.split()) > max_words:
                     emit()
                 cur.append(p)
@@ -197,5 +203,6 @@ def lesson_chunks(raw: str, max_per_doc: int = 60) -> list[dict]:
         keep, score = relevance(c["section"], c["text"])
         if keep:
             scored.append({**c, "chunk_index": i, "score": score})
+    # keep the best-scoring chunks within the per-report budget, then restore reading order
     scored.sort(key=lambda c: (-c["score"], c["chunk_index"]))
     return sorted(scored[:max_per_doc], key=lambda c: c["chunk_index"])

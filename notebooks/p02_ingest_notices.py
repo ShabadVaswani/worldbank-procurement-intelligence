@@ -16,35 +16,17 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## How it was built and tested
+# MAGIC ## Key design decisions
 # MAGIC
-# MAGIC **Step 1 — Plain offset paging cannot reach most of the data**
-# MAGIC - **Question:** can we page through all 423k notices with `rows` and `os` (offset)?
-# MAGIC - **What we found:** no. The API sits on Azure Cognitive Search, and an offset above 100,000 fails with "Value must be between 0 and 100000 ($skip)". A simple loop would silently stop at about a quarter of the notices. Pages are also capped at 1,000 rows.
-# MAGIC - **Decision:** split the work into partitions that each hold fewer than 100,000 notices.
+# MAGIC | Decision | Rationale | Evidence |
+# MAGIC |---|---|---|
+# MAGIC | Split the download into partitions of fewer than 100,000 notices each | Plain offset paging cannot reach most of the data | The API (Azure Cognitive Search) fails above offset 100,000 with "Value must be between 0 and 100000 ($skip)"; a simple loop would stop at about a quarter of the 423k notices; pages are capped at 1,000 rows |
+# MAGIC | One partition per project country (`project_ctry_name_exact`); completeness checked against the total | The only filter the API honours; date windows (adaptive halving) and id ranges or `id % n` were considered, but the API offers no such filters | Date parameters (`strdate`/`enddate`, `fq=noticedate:[...]`, `noticedate_exact`) are ignored or rejected; 184 country values add up exactly to the total, the largest being India with 47,452 |
+# MAGIC | Sort by `id` newest first; stop a country when a whole page is older than 2018-01-01 | `id` is a unique, time-ordered sort key; newest-first repeats a row (removed by the `MERGE` key) but never skips one when notices are published during the run | The default order by notice date has many ties, so one offset can return different rows; `OP00000005` is from September 2005; about 50k ids predate mid-2018 |
+# MAGIC | 500 rows per page, 4 countries in parallel, retries with exponential backoff; one file per page, so a restart skips finished pages and countries | Consistent latency per call | 1,000 rows with `notice_text` took 17 s once and 3 s another time; 500 rows consistently took about 2 s (about 2 MB) |
+# MAGIC | Measure the gap (total minus facet counts) and read the unfiltered feed newest-first until that many country-less notices are saved | Recent notices without a project country fall outside every partition | Facet counts matched the total exactly on the initial run; on a re-run about 20 hours later 200 notices were missing from every facet (184 of the newest 1,000 had no country; the last of the 200 was about 37,500 notices deep); the completeness assert detected it |
 # MAGIC
-# MAGIC **Step 2 — How to partition**
-# MAGIC - **Question:** which filter splits the data reliably? We wanted a date filter (only notices from 2018 are needed).
-# MAGIC - **What we found:** the date parameters (`strdate`/`enddate`, `fq=noticedate:[...]`, `noticedate_exact`) are ignored or rejected. The facet filter `project_ctry_name_exact` works: 184 values whose counts add up **exactly** to the total, the largest being India with 47,452.
-# MAGIC - **Alternatives considered:**
-# MAGIC   - *Date windows* (the preferred design): split adaptively, halving any window that returns more than 100,000, and reconcile the windows' sum with the total. Not possible here, because the API ignores date filters.
-# MAGIC   - *Id ranges or `id % n`*: also even and complete, but the API offers no range or modulo filter on `id`; splitting after download does not help, because the full set cannot be downloaded in the first place.
-# MAGIC - **Decision:** one partition per project country, the only filter the API honours. The 2018 cutoff is applied by ordering instead (Step 3), and a completeness check against the total guards the gaps a facet split can leave (Step 5).
-# MAGIC
-# MAGIC **Step 3 — A stable order, and the 2018 cutoff**
-# MAGIC - **Question:** how do we page without skipping or repeating notices, and stop at 2018?
-# MAGIC - **What we found:** the default order is by notice date, which has many ties, so the same offset can return different rows on two calls. Sorting by `id` is unique, and ids are issued in time order (`OP00000005` is from September 2005; about 50k ids predate mid-2018).
-# MAGIC - **Decision:** sort by `id` newest first and stop a country when a whole page is older than 2018-01-01. Newest-first also tolerates notices published *during* the run: a new notice pushes everything down by one, which repeats a row (removed by the `MERGE` key) but never skips one.
-# MAGIC
-# MAGIC **Step 4 — Page size and politeness**
-# MAGIC - **Question:** how big should a page be?
-# MAGIC - **What we found:** 1,000 rows with `notice_text` took 17 s once and 3 s another time; 500 rows consistently took about 2 s (about 2 MB).
-# MAGIC - **Decision:** 500 rows per page, 4 countries in parallel, retries with exponential backoff. Every page is saved as a file, so a restart skips finished pages and finished countries.
-# MAGIC
-# MAGIC **Step 5 — Notices without a country**
-# MAGIC - **Question:** do the country partitions still cover everything on a later run?
-# MAGIC - **What we found:** no. On the first run the facet counts added up exactly to the total; on a re-run about 20 hours later 200 notices were missing from every facet. They were recent notices published without a project country (184 of the newest 1,000 had none; the last of the 200 was found about 37,500 notices deep). The completeness assert caught it.
-# MAGIC - **Decision:** measure the gap (total minus facet counts) and read the unfiltered feed newest-first until that many country-less notices are saved, instead of asserting that the gap is zero.
+# MAGIC Full reasoning: docs/decision_log.md
 
 # COMMAND ----------
 
@@ -57,7 +39,7 @@
 # MAGIC
 # MAGIC **What:** the field list, page size, parallelism and snapshot folder.
 # MAGIC
-# MAGIC **Why:** `fl` asks only for the fields we use and leaves out personal contact data. The snapshot folder is named by the UTC date, so a same-day restart resumes.
+# MAGIC **Why:** `fl` asks only for the fields the pipeline uses and leaves out personal contact data. The snapshot folder is named by the UTC date, so a same-day restart resumes.
 
 # COMMAND ----------
 
@@ -68,6 +50,7 @@ from datetime import datetime, timezone
 from proc_intel.http import get_json
 from proc_intel.ingest import page_file_name, page_is_older_than, partition_folder, slugify
 
+# contact person name, e-mail, phone and address fields are left out on purpose (data minimisation)
 NOTICE_FIELDS = [
     "id", "notice_type", "noticedate", "notice_lang_name", "notice_status",
     "submission_date", "submission_deadline_date", "submission_deadline_time",
@@ -75,12 +58,14 @@ NOTICE_FIELDS = [
     "procurement_group", "procurement_method_code", "procurement_method_name",
     "contact_organization", "contact_ctry_name", "notice_text",
 ]
+# 500 rows took a steady ~2 s; 1,000 rows with notice_text varied between 3 s and 17 s
 PAGE_SIZE = 500
 MAX_OFFSET = 100_000          # API limit on `os`
 PARALLEL_COUNTRIES = 4
 SNAPSHOT = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 SNAPSHOT_DIR = f"{RAW_VOLUME}/notices/{SNAPSHOT}"
 TARGET = f"{BRONZE}.procurement_notices"
+# sort by id, not noticedate: dates tie, so an offset over a date sort can return different rows on two calls
 BASE_PARAMS = {"format": "json", "srt": "id", "order": "desc", "fl": ",".join(NOTICE_FIELDS)}
 
 # COMMAND ----------
@@ -95,6 +80,7 @@ BASE_PARAMS = {"format": "json", "srt": "id", "order": "desc", "fl": ",".join(NO
 # COMMAND ----------
 
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+# country is the only filter this API honours (date filters are ignored), so it is the partition key
 facet_body = get_json(NOTICES_URL, {"format": "json", "rows": 1, "fl": "id", "fct": "project_ctry_name_exact"})
 partitions = {v["name"]: int(v["count"]) for v in facet_body["facets"]["project_ctry_name_exact"].values()}
 with open(f"{SNAPSHOT_DIR}/_partitions.json", "w") as f:
@@ -103,9 +89,11 @@ with open(f"{SNAPSHOT_DIR}/_partitions.json", "w") as f:
 API_TOTAL = int(facet_body["total"])
 NO_COUNTRY_GAP = API_TOTAL - sum(partitions.values())   # notices the country facet cannot reach
 print(f"API total {API_TOTAL:,} | covered by country facets {sum(partitions.values()):,} | without a country: {NO_COUNTRY_GAP:,}")
+# a country above 100k could not be fully paged with offsets, so stop before any data silently goes missing
 assert max(partitions.values()) < MAX_OFFSET, "a country is too large for offset paging"
 print(f"{len(partitions)} countries, {sum(partitions.values()):,} notices, largest {max(partitions.values()):,}")
 names = pd.Series(sorted(partitions))
+# this is why partition_folder adds a hash: some facet names collapse to the same slug
 by_slug = names.groupby(names.map(slugify)).agg(list)
 print("names that share a slug:", by_slug[by_slug.map(len) > 1].tolist())
 
@@ -123,6 +111,7 @@ print("names that share a slug:", by_slug[by_slug.map(len) > 1].tolist())
 def fetch_country(country: str) -> dict:
     folder = f"{SNAPSHOT_DIR}/{partition_folder(country)}"
     marker = f"{folder}/_COMPLETE"
+    # a finished country is not refetched on restart; its saved status is reused for the checks
     if os.path.exists(marker):
         with open(marker) as f:
             return json.load(f)
@@ -136,6 +125,7 @@ def fetch_country(country: str) -> dict:
         else:
             body = get_json(NOTICES_URL, {**BASE_PARAMS, "project_ctry_name_exact": country,
                                           "rows": PAGE_SIZE, "os": offset})
+            # keep the API's per-country total in each page file: it must equal the facet count (checked in section 4)
             page = {"country": country, "offset": offset, "total": int(body.get("total", 0)),
                     "procnotices": body.get("procnotices", [])}
             with open(path, "w") as f:
@@ -143,9 +133,12 @@ def fetch_country(country: str) -> dict:
         api_total = page["total"]
         notices = page["procnotices"]
         rows += len(notices)
+        # a short page means the country has no more notices
         if len(notices) < PAGE_SIZE:
             reason = "exhausted"
             break
+        # ids are issued in time order and we read newest first, so once a whole page predates the cutoff nothing newer
+        # can follow
         if page_is_older_than(notices, NOTICE_CUTOFF):
             reason = "reached cutoff"
             break
@@ -182,6 +175,7 @@ def fetch_without_country(expected: int) -> dict:
                 json.dump(page, f)
         notices = page["procnotices"]
         rows += len(notices)
+        # the unfiltered feed also returns notices that do have a country; only the country-less ones fill the gap
         found += sum(1 for n in notices if not n.get("project_ctry_name"))
         offset += PAGE_SIZE
         if found >= expected:
@@ -192,6 +186,7 @@ def fetch_without_country(expected: int) -> dict:
             "facet_count": expected, "found_without_country": found, "stop": reason}
 
 
+# largest first, so the long countries start early and the pool does not end waiting on one big tail
 countries = sorted(partitions, key=partitions.get, reverse=True)
 with ThreadPoolExecutor(max_workers=PARALLEL_COUNTRIES) as pool:
     fetch_status = pd.DataFrame(list(pool.map(fetch_country, countries)))
@@ -218,6 +213,7 @@ page_schema = StructType([
     StructField("country", StringType()), StructField("offset", LongType()), StructField("total", LongType()),
     StructField("procnotices", ArrayType(StructType([StructField(c, StringType()) for c in NOTICE_FIELDS]))),
 ])
+# a notice published during the run shifts later pages by one and is saved twice; keep one copy per id
 newest_first = Window.partitionBy("id").orderBy(F.col("_source_file").desc())
 
 notices = (spark.read.schema(page_schema).option("multiLine", True).json(f"{SNAPSHOT_DIR}/*/page_*.json")
@@ -230,6 +226,7 @@ notices = (spark.read.schema(page_schema).option("multiLine", True).json(f"{SNAP
            .withColumn("as_of_date", F.lit(SNAPSHOT).cast("date"))
            .withColumn("_ingested_at", F.current_timestamp()))
 
+# no mark_removed: the fetch stops at 2018, so a notice missing from it has not necessarily been withdrawn
 first = merge_upsert(notices, TARGET, key="id")
 spark.sql(f"COMMENT ON TABLE {TARGET} IS 'World Bank procurement notices as delivered (search API v2 procnotices), "
           "one row per notice id, fetched per project country newest-first back to 2018-01-01. "
@@ -257,6 +254,7 @@ checks = [
     (TARGET, "notices without a country: expected", NO_COUNTRY_GAP, "info"),
     (TARGET, "notices without a country: saved", no_country_status.get("found_without_country", 0), f">= {NO_COUNTRY_GAP}"),
     (TARGET, "countries where API total != facet count", int((fetch_status["api_total"] != fetch_status["facet_count"]).sum()), "== 0"),
+    # countries stopped at the cutoff are left out: the API cannot count "since 2018", so there is no figure to compare
     (TARGET, "fully read countries with rows != facet count", int((exhausted["rows"] != exhausted["facet_count"]).sum()), "== 0"),
     (TARGET, "countries stopped at the 2018 cutoff", int((fetch_status["stop"] == "reached cutoff").sum()), "info"),
     (TARGET, "rows", bronze.count(), "info"),

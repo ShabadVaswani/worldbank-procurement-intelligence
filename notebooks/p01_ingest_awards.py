@@ -16,22 +16,15 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## How it was built and tested
+# MAGIC ## Key design decisions
 # MAGIC
-# MAGIC **Step 1 — Is there a bulk file?**
-# MAGIC - **Question:** is there a CSV/JSON bulk download that is faster than about 300 paged calls of 1,000 rows?
-# MAGIC - **What we found:** the old Socrata CSV link for this dataset now redirects to FinancesOne and returns 404. But the API itself accepts big pages: `top=50000` returned 50,000 rows (52 MB) in about 6 seconds.
-# MAGIC - **Decision:** page with 10,000 rows (30 calls of about 10 MB): close to bulk speed, small enough to retry cheaply. The API answered HTTP 429 "Try again in 24 seconds" once during probing, so the retry helper reads that hint.
+# MAGIC | Decision | Rationale | Evidence |
+# MAGIC |---|---|---|
+# MAGIC | Page the API at 10,000 rows per call (30 calls of about 10 MB); the retry helper reads the HTTP 429 retry hint | No bulk file is available; large pages are close to bulk speed and still cheap to retry | The old Socrata CSV link redirects to FinancesOne and returns 404; `top=50000` returned 50,000 rows (52 MB) in about 6 seconds; the API answered HTTP 429 "Try again in 24 seconds" once during probing |
+# MAGIC | Bronze key = SHA-256 of `wb_contract_number`, `supplier_id` and `supplier` | Bronze grain is one row per (contract, supplier); the key must stay unique even for the row without a `supplier_id` | 295,058 rows, 282,890 distinct `wb_contract_number`s; 8,864 joint-venture contracts have 2 to 10+ rows; `(wb_contract_number, supplier_id)` is unique; one row has no `supplier_id` (its supplier text is a broken fragment, "EMPHNET)") |
+# MAGIC | `_row_hash` covers the business columns only; changed rows are updated, unchanged rows left alone, rows missing from a full snapshot get `_removed_at_source` (soft delete) | Re-runs must not rewrite the table daily | `as_of_date` changes every day on every row; the notebook runs the same `MERGE` twice and the second run changes nothing |
 # MAGIC
-# MAGIC **Step 2 — What is one row?**
-# MAGIC - **Question:** what makes a row unique, so that `MERGE` has a key?
-# MAGIC - **What we found:** 295,058 rows, 282,890 distinct `wb_contract_number`s. A contract with a joint venture has one row per member (8,864 contracts have 2 to 10+ rows). `(wb_contract_number, supplier_id)` is unique; one row has no `supplier_id` (its supplier text is a broken fragment, "EMPHNET)").
-# MAGIC - **Decision:** key = SHA-256 of `wb_contract_number | supplier_id | supplier`, which stays unique even for that row.
-# MAGIC
-# MAGIC **Step 3 — Re-runs and withdrawn records**
-# MAGIC - **Question:** what happens on the next run, when most rows are unchanged and a few were corrected or withdrawn?
-# MAGIC - **What we found:** `as_of_date` changes every day on every row, so hashing the whole row would rewrite the table daily.
-# MAGIC - **Decision:** `_row_hash` covers the business columns only. Changed rows are updated, unchanged rows are left alone, and rows missing from a full snapshot get `_removed_at_source` (a soft delete). The notebook runs the same `MERGE` twice to prove the second run changes nothing.
+# MAGIC Full reasoning: docs/decision_log.md
 
 # COMMAND ----------
 
@@ -55,7 +48,9 @@ from datetime import datetime, timezone
 from proc_intel.http import get_json
 from proc_intel.ingest import page_file_name, page_offsets
 
+# 10k rows is about 10 MB per call: near bulk speed, cheap to retry (top=50000 also works but one failure costs more)
 PAGE_SIZE = 10_000
+# UTC date, so a restart later the same day lands in the same folder and reuses the saved pages
 SNAPSHOT = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 SNAPSHOT_DIR = f"{RAW_VOLUME}/awards/{SNAPSHOT}"
 TARGET = f"{BRONZE}.contract_awards"
@@ -72,17 +67,20 @@ TARGET = f"{BRONZE}.contract_awards"
 # COMMAND ----------
 
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+# a one-row call is the cheapest way to learn the total row count
 total = get_json(AWARDS_URL, {**AWARDS_PARAMS, "top": 1, "skip": 0})["count"]
 
 fetched = 0
 for skip in page_offsets(total, PAGE_SIZE):
     path = f"{SNAPSHOT_DIR}/{page_file_name(skip)}"
+    # resume: pages saved by an earlier, interrupted run are not downloaded again
     if os.path.exists(path):
         continue
     body = get_json(AWARDS_URL, {**AWARDS_PARAMS, "top": PAGE_SIZE, "skip": skip})
     with open(path, "w") as f:
         json.dump(body, f)
     fetched += 1
+    # public API that has already answered 429 once; one second between pages keeps us polite
     time.sleep(1)
 
 saved_rows = 0
@@ -90,6 +88,7 @@ for name in sorted(os.listdir(SNAPSHOT_DIR)):
     with open(f"{SNAPSHOT_DIR}/{name}") as f:
         saved_rows += len(json.load(f)["data"])
 print(f"API count {total:,} | pages fetched now {fetched} | rows in snapshot {saved_rows:,}")
+# fail here rather than load a partial snapshot, which would then soft-delete the rows we did not fetch
 assert saved_rows == total, "snapshot is incomplete"
 
 # COMMAND ----------
@@ -108,6 +107,7 @@ assert saved_rows == total, "snapshot is incomplete"
 
 from pyspark.sql.types import DoubleType, LongType, StringType, StructField, StructType, ArrayType
 
+# explicit types: schema inference could read supplier_id as a number on some snapshot and null the hashed ids
 AWARD_FIELDS = {
     "as_of_date": StringType(), "borrower_contract_reference_number": StringType(),
     "borrower_country": StringType(), "borrower_country_code": StringType(),
@@ -125,11 +125,16 @@ page_schema = StructType([
 ])
 
 raw = (spark.read.schema(page_schema).option("multiLine", True).json(f"{SNAPSHOT_DIR}/*.json")
+       # one input row per page file; explode turns its data array into one row per award, keeping the page path as
+       # lineage
        .select(F.explode("data").alias("r"), F.col("_metadata.file_path").alias("_source_file"))
        .select("r.*", "_source_file")
        .withColumnRenamed("contract_signed___calendar_year", "contract_signed_calendar_year"))
+# compare business columns only: as_of_date changes daily, so hashing it would rewrite every row on every run
 business_cols = [c for c in raw.columns if c not in ("as_of_date", "_source_file")]
 awards = (raw
+          # grain is contract x supplier (joint ventures have one row per member); supplier text is included because one
+          # row has no supplier_id
           .withColumn("award_row_key", F.sha2(F.concat_ws("|", "wb_contract_number",
                                                             F.coalesce("supplier_id", F.lit("")), "supplier"), 256))
           .withColumn("_row_hash", row_hash(business_cols))
@@ -150,6 +155,7 @@ print("rows read:", awards.count())
 
 # COMMAND ----------
 
+# mark_removed is safe only because this is a full snapshot (checked by the assert above)
 first = merge_upsert(awards, TARGET, key="award_row_key", mark_removed=True)
 spark.sql(f"COMMENT ON TABLE {TARGET} IS 'Contract awards (FinancesOne DS00005) as delivered: one row per contract x supplier. "
           "supplier_contract_amount_usd repeats the contract amount on each joint-venture member row. "
@@ -167,6 +173,7 @@ print("first MERGE :", first)
 
 # COMMAND ----------
 
+# same input again: an idempotent MERGE must insert 0 and update 0 rows
 second = merge_upsert(awards, TARGET, key="award_row_key", mark_removed=True)
 print("second MERGE:", second)
 
@@ -176,6 +183,7 @@ checks = [
     (TARGET, "rows (current)", current.count(), f"== {total}"),
     (TARGET, "rows withdrawn at source", bronze.count() - current.count(), "info"),
     (TARGET, "duplicate award_row_key", duplicate_keys(bronze, ["award_row_key"]), "== 0"),
+    # rows without supplier_id are excluded: the one such row is unique only through its supplier text
     (TARGET, "duplicate (wb_contract_number, supplier_id)", duplicate_keys(current.filter("supplier_id IS NOT NULL"),
                                                                           ["wb_contract_number", "supplier_id"]), "== 0"),
     (TARGET, "distinct wb_contract_number", current.select("wb_contract_number").distinct().count(), "info"),

@@ -34,11 +34,13 @@ def page_is_older_than(notices: Iterable[Mapping], cutoff: date) -> bool:
     the cutoff. A page with no readable dates counts as old, so paging always terminates.
     """
     dates = [d for d in (parse_wb_date(n.get("noticedate")) for n in notices) if d is not None]
+    # all() of an empty list is True: a page without readable dates ends the paging instead of looping forever
     return all(d < cutoff for d in dates)
 
 
 def slugify(text: str) -> str:
     """File-system-safe ASCII name, e.g. "Cote d'Ivoire" -> 'cote_d_ivoire'."""
+    # NFKD splits accented letters into letter + accent mark, and the ASCII encode then drops the mark
     ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
     slug = re.sub(r"[^a-z0-9]+", "_", ascii_text.lower()).strip("_")
     return slug or "unknown"

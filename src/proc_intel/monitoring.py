@@ -38,9 +38,11 @@ def parse_sort_ratings(text: str | None) -> dict:
     if not text:
         return out
     start = re.search(r"RISK-RATING TOOL|Risk Category|SYSTEMATIC OPERATIONS", text, re.I)
+    # read only a window after the table title, so risk words elsewhere in the ISR are not taken as ratings
     body = text[start.start(): start.start() + 6000] if start else text
     lines = [re.sub(r"[-]", " ", ln) for ln in body.splitlines()]
     for cat in SORT_CATEGORIES:
+        # match on the first four words: long category names wrap onto a second line
         head = " ".join(cat.split()[:4])
         for i, ln in enumerate(lines):
             if not re.match(rf"\s*{re.escape(head)}\b", ln):
@@ -61,6 +63,7 @@ def parse_sort_ratings(text: str | None) -> dict:
                     elif ratings or len(s.split()) > 3:
                         break
             if ratings:
+                # first printed rating = at approval, last = current; with a single rating the approval value is unknown
                 out[cat] = {"approval": ratings[0] if len(ratings) >= 2 else None, "current": ratings[-1], "ratings": ratings}
                 break
     return out
@@ -89,6 +92,8 @@ def parse_isr_cells(text: str | None) -> dict:
     for key, label in (("pdo", r"Progress towards achievement of PDO"), ("ip", r"Overall Implementation Progress \(IP\)")):
         for i, ln in enumerate(lines):
             if re.fullmatch(label, ln, re.I):
+                # the two lines after the label are previous then current; fullmatch so a sentence that merely contains
+                # a rating word is ignored
                 vals = [canon[" ".join(x.split()).lower()] for x in lines[i + 1: i + 3] if _RATING.fullmatch(x)]
                 if len(vals) == 2:
                     out[f"{key}_previous"], out[f"{key}_current"] = vals
@@ -105,6 +110,7 @@ def disbursement_position(loans: list[dict], as_of: date) -> dict | None:
     elapsed = (as_of - first approval) / (latest closing - first approval), capped to [0, 1].
     """
     net = sum((x.get("original_amount") or 0) - (x.get("cancelled_amount") or 0) for x in loans)
+    # fully cancelled (or zero) commitments have no meaningful disbursed share
     if net <= 0:
         return None
     disbursed = sum(x.get("disbursed_amount") or 0 for x in loans)
@@ -125,6 +131,7 @@ def expected_share(curve: dict[int, float], elapsed: float) -> float | None:
 def months_between(a: date | None, b: date | None) -> float | None:
     if not a or not b:
         return None
+    # average month length (365.25 / 12)
     return (b - a).days / 30.44
 
 
@@ -132,6 +139,7 @@ def isr_signal(pdo_prev: str | None, pdo_cur: str | None, ip_prev: str | None, i
     """Whether the latest ISR rates PDO or implementation progress below satisfactory, or downgraded either."""
     s = {k: SCALE.get(v) if v else None for k, v in
          {"pdo_prev": pdo_prev, "pdo_cur": pdo_cur, "ip_prev": ip_prev, "ip_cur": ip_cur}.items()}
+    # 3 = Moderately Unsatisfactory on the six-point scale: below the satisfactory line
     unsat = [name for name, cur in (("PDO", s["pdo_cur"]), ("IP", s["ip_cur"])) if cur is not None and cur <= 3]
     down = [name for name, prev, cur in (("PDO", s["pdo_prev"], s["pdo_cur"]), ("IP", s["ip_prev"], s["ip_cur"]))
             if prev is not None and cur is not None and cur < prev]
@@ -177,6 +185,7 @@ def indicators(p: dict) -> list[dict]:
                     "reason": "no loan or credit statement", "citations": []})
     else:
         gap = ds - ex
+        # early in a project every loan disburses slowly, so the first quarter of the period is never flagged
         trig = el >= MIN_ELAPSED and gap <= DISBURSEMENT_GAP
         out.append({"indicator": "disbursement_lag", "status": "triggered" if trig else "ok", "value": round(gap, 2),
                     "reason": f"{ds:.0%} disbursed at {el:.0%} of the implementation period; peers at that point: {ex:.0%}",
@@ -226,6 +235,8 @@ def alert(inds: list[dict]) -> dict:
     """
     trig = [i for i in inds if i["status"] == "triggered"]
     names = {i["indicator"] for i in trig}
+    # weak ratings together with money not flowing is the combination treated as most serious, even with only two
+    # indicators
     if len(trig) >= 3 or {"isr_ratings", "disbursement_lag"} <= names:
         level = "red"
     else:
@@ -233,4 +244,5 @@ def alert(inds: list[dict]) -> dict:
     return {"level": level, "n_triggered": len(trig), "triggered": sorted(names),
             "n_no_data": sum(i["status"] == "no_data" for i in inds),
             "reasons": [f"{i['indicator']}: {i['reason']}" for i in trig],
+            # dict.fromkeys removes duplicate citations but keeps their order
             "citations": list(dict.fromkeys(c for i in trig for c in i["citations"]))}

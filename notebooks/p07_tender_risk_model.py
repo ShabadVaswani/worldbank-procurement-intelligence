@@ -48,26 +48,6 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC <details><summary>Text version of the diagram</summary>
-# MAGIC
-# MAGIC ```
-# MAGIC  proc_gold.tender_timelines (open, timed)       notice-time features
-# MAGIC  notice date -> signing date                     notice: method, category, type, advertising days, language, length
-# MAGIC        |                                         project: region, sector, age, size, earlier tenders
-# MAGIC        |                                         country: governance (WGI) and income, year before the notice
-# MAGIC        |                                         market: past contracts, winners, bidders, durations (3 years before)
-# MAGIC        v                                                 |
-# MAGIC  cohort with full follow-up (notices 2019-07 .. 2024-10, durations capped at 730 days)
-# MAGIC        |
-# MAGIC        +--> peer-group baseline (quantiles of country x method x category, with fallbacks)
-# MAGIC        +--> LightGBM quantile models P10 / P50 / P90 + slow-tender classifier   (time split, rolling-origin CV)
-# MAGIC        +--> survival view: Kaplan-Meier per notice (unsigned = censored), Weibull AFT
-# MAGIC        v
-# MAGIC  proc_gold.tender_benchmarks (peer groups)    proc_gold.open_tender_scores (open notices)    UC model ml.proc_tender_duration
-# MAGIC ```
-# MAGIC
-# MAGIC </details>
-# MAGIC
 # MAGIC ### Output tables (the interface for the agent's tools)
 # MAGIC
 # MAGIC `proc_gold.tender_benchmarks` — one row per peer group. Read it with `proc_intel.risk.benchmark_lookup(rows, country, method, category)`, which returns the finest group with at least 30 contracts and says which level it used.
@@ -105,37 +85,20 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## How it was built and tested
+# MAGIC ## Key design decisions
 # MAGIC
-# MAGIC **Step 1 — Which tenders can be used at all?**
-# MAGIC - **Question:** is the duration of every timed contract a fair training example?
-# MAGIC - **What we found:** no. The awards feed holds contracts signed from 2019-07-01 to the snapshot, so the median notice -> signing time by notice year is 465 days for 2018 (only slow tenders reached the feed), 154-189 days for 2019-2024, 135 for 2025 and 95 for 2026 (only fast tenders are signed yet). A plain "test on the newest year" split would report that tenders became twice as fast.
-# MAGIC - **Decision:** model notices from 2019-07-01 to 730 days before the snapshot, with the duration capped at 730 days (1.5% took longer). Within that window every duration up to the cap is observable. Newer notices are scored, not trained on, and the survival view in section 9 handles them as censored.
+# MAGIC | Decision | Rationale | Evidence |
+# MAGIC |---|---|---|
+# MAGIC | Model notices from 2019-07-01 to 730 days before the snapshot, duration capped at 730 days; newer notices are scored, not trained on, and handled as censored in the survival view (section 9) | The awards feed holds contracts signed from 2019-07-01 to the snapshot, so edge cohorts are biased; within the window every duration up to the cap is observable | Median notice -> signing time by notice year: 465 days (2018), 154-189 (2019-2024), 135 (2025), 95 (2026); 1.5% took longer than 730 days |
+# MAGIC | Risk target = slow: duration above the P75 of the same method x category in the training years; re-advertisement rates reported, not modelled | Re-advertisement is rare and mostly invisible in the data | 1.3% of training contracts (1.5% of test) have more than one tender notice linked; only 135 of 81,600 (project, reference) pairs repeat exactly; only 10 IFB notices carry a "Revised" status; base rate 25.0% in training, 22.4% in the test notices |
+# MAGIC | Contract amount, review type and the outcome-model risk score excluded; governance indicators for the year before the notice; market history for the 36 months before the notice month | Features must be known on the notice date | The amount is known only at award (no pre-award estimate); review type is not on the notice; the outcome-model score exists only for projects still active in 2026 |
+# MAGIC | Interval calibrated with conformalised quantile regression on the last training half-year; model registered as `@champion` | The model beats the peer-group lookup, but its raw interval under-covers | Pinball loss of the median 38.1-42.1 vs 44.5-49.2 on all four rolling-origin folds; test MAE 76 vs 88 days, mean pinball 24.6 vs 29.1; raw P10-P90 coverage 68% (16% below, 15% above); after calibration (lower bound -0.136, upper +0.112 log-days, about 13% and 12% in days) 80.7% (9.8% below, 9.5% above), interval still 12% narrower than the peer table's |
+# MAGIC | Publish the slow-tender probability with the threshold it refers to | The classifier ranks tenders better than the peer group's historical slow rate | ROC-AUC 0.747 vs 0.584, PR-AUC 0.494 vs 0.295 (base rate 0.224) |
+# MAGIC | Kaplan-Meier used to compare timing across groups and cohorts, not to estimate how many tenders fail; Weibull AFT for readable time ratios | Censoring is valid for young notices; for old notices, cancellations and link failures look the same | KM share signed within 180 days 0.30-0.38 for every notice year 2019-2025, while naive medians fall to 144 days (2025) and 91 (2026); curves flatten at 0.56-0.67 (the share p05 links); KM medians among linked notices: consulting 319 days, works 132, goods 127, non-consulting 125; AFT: Request for Bids 0.42x the other open methods, Latin America 1.28x vs Europe and Central Asia, +1.2% per advertising day; test concordance 0.694 vs LightGBM's 0.721 |
 # MAGIC
-# MAGIC **Step 2 — What does "re-bidding risk" mean in this data?**
-# MAGIC - **Question:** can re-advertisement be the risk target?
-# MAGIC - **What we found:** 1.3% of training contracts (1.5% of test) have more than one tender notice linked, and only 135 of 81,600 (project, reference) pairs of tender notices repeat exactly; a re-tender under a new reference is invisible, and only 10 IFB notices carry a "Revised" status.
-# MAGIC - **Decision:** the risk target is **slow**: duration above the P75 of the same method x category in the training years. Base rate 25.0% in training, 22.4% in the test notices (newer tenders are faster). Re-advertisement rates are reported, not modelled.
+# MAGIC Limitations: predicted slow probabilities run slightly high in the lower deciles (consistent with the lower test base rate); recalibrating on recent data is the first maintenance task.
 # MAGIC
-# MAGIC **Step 3 — Which inputs are known on the notice date?**
-# MAGIC - **Question:** which candidate features would leak the outcome?
-# MAGIC - **What we found:** the contract amount is only known at award and no pre-award estimate exists; review type is not on the notice, so open notices could not be scored with it; the outcome-model risk score exists only for projects still active in 2026, so its presence reveals the project's future.
-# MAGIC - **Decision:** all three are left out. Governance indicators are taken for the year before the notice, and market history for the 36 months before the notice month.
-# MAGIC
-# MAGIC **Step 4 — Does the model beat the lookup table?**
-# MAGIC - **Question:** is a model better than the peer-group quantiles an analyst would look up?
-# MAGIC - **What we found:** on all four rolling-origin folds (pinball loss of the median 38.1-42.1 vs 44.5-49.2 for the peer table) and on the test notices: MAE 76 vs 88 days, mean pinball 24.6 vs 29.1. But the raw P10-P90 interval covered only 68% of test outcomes (target 80%): 16% fell below P10 and 15% above P90.
-# MAGIC - **Decision:** calibrate the interval with conformalised quantile regression on the last training half-year (the lower bound moves down by 0.136 and the upper bound up by 0.112 log-days, about 13% and 12% in days). Test coverage is then 80.7% (9.8% below, 9.5% above), with the interval still 12% narrower than the peer table's. The model is registered as `@champion`.
-# MAGIC
-# MAGIC **Step 5 — Is the slow-tender score useful, and is it calibrated?**
-# MAGIC - **Question:** does the classifier rank tenders better than the peer group's historical slow rate?
-# MAGIC - **What we found:** ROC-AUC 0.747 vs 0.584, PR-AUC 0.494 vs 0.295 (base rate 0.224). The predicted probabilities run slightly high in the lower deciles, consistent with the lower base rate of the test notices.
-# MAGIC - **Decision:** publish the probability with the threshold it refers to; recalibrating on recent data is the first maintenance task.
-# MAGIC
-# MAGIC **Step 6 — Can "not signed yet" be told apart from "never signed"?**
-# MAGIC - **Question:** can unsigned notices be treated as censored in a survival model?
-# MAGIC - **What we found:** for young notices, yes: the Kaplan-Meier share signed within 180 days is 0.30-0.38 for every notice year 2019-2025, while the naive median of the observed durations falls to 144 days (2025) and 91 (2026). For old notices, no: the curves flatten at 0.56-0.67, the share of notices p05 manages to link, so cancellations and link failures look the same.
-# MAGIC - **Decision:** use KM to compare timing across groups and cohorts (median among linked notices: consulting 319 days, works 132, goods 127, non-consulting 125), not to estimate how many tenders fail. The Weibull AFT gives readable time ratios (Request for Bids 0.42x the time of the other open methods, which are mostly consultant selections; Latin America 1.28x vs Europe and Central Asia; +1.2% per advertising day); its test concordance (0.694) is below LightGBM's (0.721).
+# MAGIC Full reasoning: docs/decision_log.md
 
 # COMMAND ----------
 
@@ -175,10 +138,12 @@ from proc_intel.risk import (ALL, HORIZON_DAYS, LEVELS, MIN_PEER_N, QUANTILES, b
                              calibration_table, cap_at_horizon, conformal_shift, interval_coverage, peer_aggregate, peer_baseline,
                              pinball_loss, rolling_origin_folds, slow_label, sort_quantiles)
 
+# the data's own last date, not today's date, so a re-run on an old snapshot gives the same windows
 SNAPSHOT = spark.table(f"{SILVER}.contracts").agg(F.max("signing_date")).first()[0]   # last signing in the feed
 WINDOW_START = date(2019, 7, 1)                                # first signing date in the awards feed
 WINDOW_END = SNAPSHOT - timedelta(days=HORIZON_DAYS)           # notices after this are not yet fully observable
 TEST_START = date(2023, 7, 1)                                  # train on older notices, test on the newest
+# all four origins fall before TEST_START, so tuning never looks at the test notices
 CV_ORIGINS = ["2021-07-01", "2022-01-01", "2022-07-01", "2023-01-01"]   # rolling origin, 6-month validation
 CAL_START = date(2023, 1, 1)                                   # last training half-year calibrates the interval
 TENDER_TYPES = ["Invitation for Bids", "Request for Expression of Interest", "Invitation for Prequalification"]
@@ -227,6 +192,7 @@ notice_cols = ["notice_id", "notice_date", "notice_type", "submission_deadline",
                "project_id"]
 
 train_rows = (open_timed
+    # the cohort: older notices are biased slow, newer ones biased fast (section 1), so both ends are cut off
     .filter(F.col("tender_notice_date").between(WINDOW_START, WINDOW_END))
     .select(F.col("contract_id").alias("row_id"), F.col("tender_notice_id").alias("notice_id"),
             F.col("borrower_country_code").alias("c_country"), F.col("procurement_method_name").alias("c_method"),
@@ -235,6 +201,7 @@ train_rows = (open_timed
     .join(notices.select(*notice_cols, F.col("country_code").alias("n_country"),
                          F.col("procurement_method_name").alias("n_method"),
                          F.col("procurement_category_code").alias("n_category")), "notice_id")
+    # contract values first: the procurement plan fixes method, category and country before the notice goes out
     .withColumn("country_code", F.coalesce("c_country", "n_country"))
     .withColumn("procurement_method_name", F.coalesce("c_method", "n_method"))
     .withColumn("procurement_category_code", F.coalesce("c_category", "n_category"))
@@ -245,6 +212,7 @@ score_rows = (notices
     .filter(F.col("notice_type").isin(TENDER_TYPES))
     .filter(F.col("notice_date").between(SNAPSHOT - timedelta(days=HORIZON_DAYS), SNAPSHOT))
     .join(methods.filter("competition = 'open'"), "procurement_method_name")
+    # only notices still waiting for a contract are scored
     .join(linked_notices, "notice_id", "left_anti")
     .select(F.col("notice_id").alias("row_id"), *notice_cols, "country_code", "procurement_method_name",
             "procurement_category_code"))
@@ -270,11 +238,13 @@ def month_index(col):
 
 
 all_tenders = notices.filter(F.col("notice_type").isin(TENDER_TYPES) & F.col("notice_date").isNotNull())
+# rank, not row_number: notices published the same day do not count each other as "earlier"
 prior_tenders = all_tenders.select("notice_id", (F.rank().over(Window.partitionBy("project_id").orderBy("notice_date")) - 1)
                                    .alias("project_prior_tenders"))
 projects = spark.table(f"{SILVER}.dim_project").select("project_id", "region", "major_sector", "env_category",
                                                        "approval_date", "commitment_musd")
 governance = spark.table(COUNTRY_YEAR).select(
+    # leakage guard: a notice in year Y gets the indicators of Y-1, which were already published
     F.col("country_iso2").alias("country_code"), (F.col("year") + 1).alias("notice_year"),
     "wgi_gov_effectiveness", "wgi_control_corruption", "wgi_rule_of_law", "wgi_regulatory_quality",
     "wgi_political_stability", "wgi_voice_accountability", "log_gdp_pc")
@@ -290,6 +260,8 @@ hist_winners = (spark.table(f"{SILVER}.contract_suppliers").join(spark.table(f"{
                       "contract_id")
                 .select(F.col("borrower_country_code").alias("country_code"), "procurement_category_code",
                         month_index("signing_date").alias("h_month"), "supplier_entity_id",
+                        # null when either country is missing; count() and sum() below skip nulls, so the share uses
+                        # known rows only
                         (F.col("supplier_country_code") != F.col("borrower_country_code")).cast("int").alias("is_foreign"))
                 .groupBy(*cc, "h_month", "supplier_entity_id")
                 .agg(F.count("is_foreign").alias("rows"), F.sum("is_foreign").alias("foreign_rows")).cache())
@@ -304,6 +276,7 @@ past_durations = (tl.filter("is_timed")
 
 def as_of_history(need, history, keys, aggs):
     """Aggregate `history` rows of the same keys in the 36 months before each needed month."""
+    # ends the month before the notice month: nothing signed in the notice's own month (possibly after it) can leak in
     window = (F.col("h_month") >= F.col("n_month") - 36) & (F.col("h_month") <= F.col("n_month") - 1)
     return need.join(history, keys).filter(window).groupBy(*keys, "n_month").agg(*aggs)
 
@@ -311,6 +284,7 @@ def as_of_history(need, history, keys, aggs):
 def add_features(rows):
     base = (rows.withColumn("n_month", month_index("notice_date"))
             .withColumn("notice_year", F.year("notice_date")))
+    # aggregate once per distinct (key, month) rather than per row, then join back
     need_cc = base.select("country_code", "procurement_category_code", "n_month").distinct()
     need_cm = base.select("country_code", "procurement_method_name", "n_month").distinct()
     volume = as_of_history(need_cc, hist_contracts, cc, [F.sum("n_contracts").alias("mkt_contracts_3y")])
@@ -330,12 +304,14 @@ def add_features(rows):
             .join(bidders, [*cc, "n_month"], "left")
             .join(durations, ["country_code", "procurement_method_name", "n_month"], "left")
             .withColumn("region", F.coalesce("region", F.lit("Other")))
+            # a deadline before the notice date is a data error; leave it missing instead of feeding a negative period
             .withColumn("advertising_days", F.when(F.datediff("submission_deadline", "notice_date") >= 0,
                                                    F.datediff("submission_deadline", "notice_date")))
             .withColumn("log_notice_chars", F.log1p("notice_text_chars"))
             .withColumn("notice_month", F.month("notice_date"))
             .withColumn("project_age_years", F.datediff("notice_date", "approval_date") / 365.25)
             .withColumn("log_commitment", F.log1p("commitment_musd"))
+            # no history in the window really means zero contracts; ratios and medians stay missing instead
             .fillna(0, subset=["mkt_contracts_3y", "mkt_winners_3y", "hist_n_cm"]))
 
 
@@ -348,6 +324,7 @@ NUMERIC = ["advertising_days", "log_notice_chars", "notice_month", "project_age_
            "hist_median_days_cm", "hist_n_cm"]
 FEATURES = CATEGORICAL + NUMERIC
 keep = ["row_id", "notice_id", "notice_date", "project_id", "submission_deadline"] + FEATURES
+# tens of thousands of rows x ~30 columns: small enough for LightGBM on the driver
 data = add_features(train_rows).select(*keep, "days_notice_to_signing", "n_tender_notices").toPandas()
 scoring = add_features(score_rows).select(*keep).toPandas()
 for frame in (data, scoring):
@@ -369,11 +346,12 @@ display(data[NUMERIC].describe().T.round(2).reset_index())
 # MAGIC - **slow** = `y` above the P75 of its method x category in the training years (category P75 when the group has fewer than 30 contracts). The threshold is fixed on training data, so the test base rate can drift;
 # MAGIC - baselines: the global training quantiles, and the **peer-group** quantiles (country x method x category, falling back to region, method x category, category; at least 30 contracts) — the benchmark a procurement analyst would look up today.
 # MAGIC
-# MAGIC **Why:** a planner's question is relative ("slow for an RFB works contract?"), so slowness is defined against the peer group, not in absolute days. The peer-group table is the honest bar a model has to beat.
+# MAGIC **Why:** a planner's question is relative ("slow for an RFB works contract?"), so slowness is defined against the peer group, not in absolute days. The peer-group table is the baseline a model has to beat.
 
 # COMMAND ----------
 
 data["y"], _ = cap_at_horizon(data["days_notice_to_signing"])
+# the whole cohort, used for the final refit and the benchmark table after testing
 train_all = data.copy()
 is_test = data["notice_date"] >= pd.Timestamp(TEST_START)
 train, test = data[~is_test].copy(), data[is_test].copy()
@@ -387,6 +365,7 @@ def slow_thresholds(frame: pd.DataFrame) -> pd.DataFrame:
     return mc[mc["n"] >= MIN_PEER_N][["thr_mc"]].reset_index(), cat.reset_index()
 
 
+# thresholds from the training years only; they are then applied unchanged to test and scoring rows
 thr_mc, thr_cat = slow_thresholds(train)
 
 
@@ -409,6 +388,7 @@ print(f"re-advertised (more than one tender notice linked): train {(train['n_ten
 global_q = {q: train["y"].quantile(q) for q in QUANTILES}
 peer_test = peer_baseline(train, test, "y")
 for q in QUANTILES:
+    # a test row whose peer group never appears in training falls back to the global quantiles
     peer_test[f"q{q}"] = peer_test[f"q{q}"].fillna(global_q[q])
 display(peer_test["level"].value_counts().rename_axis("baseline_level").reset_index())
 
@@ -423,6 +403,7 @@ display(peer_test["level"].value_counts().rename_axis("baseline_level").reset_in
 
 # COMMAND ----------
 
+# a fixed category list keeps LightGBM's category codes identical between training, test and the registered model
 CATEGORIES = {c: sorted(train_all[c].dropna().unique()) for c in CATEGORICAL}
 
 
@@ -450,6 +431,7 @@ GRID = [{"num_leaves": nl, "min_data_in_leaf": md} for nl in (15, 31, 63) for md
 
 def fit_quantile(X, y, alpha, params, rounds, X_val=None, y_val=None):
     p = {**BASE_PARAMS, **params, "objective": "quantile", "alpha": alpha, "metric": "quantile"}
+    # quantiles survive a monotone transform, so fitting on log(1 + days) and converting back keeps them valid
     dtrain = lgb.Dataset(X, np.log1p(y))
     if X_val is None:
         return lgb.train(p, dtrain, num_boost_round=rounds)
@@ -481,6 +463,7 @@ cv_summary = (cv_all.groupby(["num_leaves", "min_data_in_leaf"], dropna=False)
 display(cv_summary)
 best = cv.groupby(["num_leaves", "min_data_in_leaf"])["pinball50"].mean().idxmin()
 BEST_PARAMS = {"num_leaves": int(best[0]), "min_data_in_leaf": int(best[1])}
+# the final fit has no validation set to stop on; use the folds' median best iteration, +10% for the larger training set
 ROUNDS = int(cv[(cv["num_leaves"] == best[0]) & (cv["min_data_in_leaf"] == best[1])]["best_iter"].median() * 1.1)
 print("chosen:", BEST_PARAMS, "rounds:", ROUNDS)
 
@@ -500,12 +483,15 @@ print("chosen:", BEST_PARAMS, "rounds:", ROUNDS)
 
 X_train, X_test = make_X(train), make_X(test)
 q_models = {q: fit_quantile(X_train, train["y"], q, BEST_PARAMS, ROUNDS) for q in QUANTILES}
+# three separate models can cross on some rows; sorting restores P10 <= P50 <= P90
 p10_raw, p50, p90_raw = sort_quantiles(*(predict_days(q_models[q], X_test) for q in QUANTILES))
 
+# calibration models are fitted without the last half-year so their misses on it are honest, out-of-sample
 pre, cal = train["notice_date"] < pd.Timestamp(CAL_START), train["notice_date"] >= pd.Timestamp(CAL_START)
 X_pre, X_cal, ly_cal = make_X(train[pre]), make_X(train[cal]), np.log1p(train["y"][cal].to_numpy())
 lo_cal = fit_quantile(X_pre, train["y"][pre], 0.1, BEST_PARAMS, ROUNDS).predict(X_cal)
 hi_cal = fit_quantile(X_pre, train["y"][pre], 0.9, BEST_PARAMS, ROUNDS).predict(X_cal)
+# one shift per side, since the raw model missed both tails by different amounts
 LO_SHIFT, HI_SHIFT = conformal_shift(lo_cal - ly_cal, 0.1), conformal_shift(ly_cal - hi_cal, 0.1)
 print(f"calibration rows {int(cal.sum()):,} | raw miss on calibration: below P10 {np.mean(ly_cal < lo_cal):.3f}, "
       f"above P90 {np.mean(ly_cal > hi_cal):.3f} | shifts (log-days): lower {LO_SHIFT:+.3f}, upper {HI_SHIFT:+.3f}")
@@ -544,6 +530,7 @@ display(by_cat.groupby("procurement_category_code").agg(
     mae_peer=("err_peer", "mean"), coverage_model=("inside", "mean")).round(2).reset_index())
 
 model_row, peer_row = results.iloc[3], results.iloc[1]
+# the registration gate in section 10: no champion unless the model beats the lookup table on both measures
 BEATS_BASELINE = bool(model_row["mean_pinball"] < peer_row["mean_pinball"] and model_row["mae_days"] < peer_row["mae_days"])
 print("model beats the peer-group baseline on mean pinball and MAE:", BEATS_BASELINE)
 
@@ -558,6 +545,7 @@ print("model beats the peer-group baseline on mean pinball and MAE:", BEATS_BASE
 
 # COMMAND ----------
 
+# the last column of pred_contrib is the bias term, not a feature
 contrib = q_models[0.5].predict(X_test, pred_contrib=True)[:, :-1]
 shap_table = pd.DataFrame({"feature": FEATURES, "mean_abs_shap_log_days": np.abs(contrib).mean(axis=0)})
 direction = {}
@@ -602,6 +590,7 @@ peer_rate = peer_aggregate(train, test, "slow", {"rate": "mean"})["rate"].fillna
 p50_ratio = p50 / test["slow_threshold_days"].to_numpy()
 risk_results = pd.DataFrame([
     {"score": name, "roc_auc": roc_auc_score(yt_slow, s), "pr_auc": average_precision_score(yt_slow, s),
+     # a ratio is a ranking score, not a probability, so a Brier score would be meaningless for it
      "brier": brier_score_loss(yt_slow, s) if name != "quantile model P50 / threshold" else np.nan}
     for name, s in [("peer-group slow rate", peer_rate), ("quantile model P50 / threshold", p50_ratio),
                     ("LightGBM classifier", p_slow)]])
@@ -634,6 +623,7 @@ km_rows = (notices.filter(F.col("notice_type").isin(TENDER_TYPES) & (F.col("noti
            .join(methods.filter("competition = 'open'"), "procurement_method_name")
            .join(first_signing, "notice_id", "left")
            .withColumn("t_event", F.datediff("first_signing", "notice_date"))
+           # follow-up capped at 3 years for every notice, so old and young cohorts are compared on the same horizon
            .withColumn("event", (F.col("t_event").isNotNull() & (F.col("t_event") <= 1095)).cast("int"))
            .withColumn("duration", F.when(F.col("event") == 1, F.col("t_event"))
                        .otherwise(F.least(F.datediff(F.lit(SNAPSHOT), "notice_date"), F.lit(1095))))
@@ -648,6 +638,7 @@ for cat, grp in km_rows.dropna(subset=["procurement_category_code"]).groupby("pr
     kmf = KaplanMeierFitter().fit(grp["duration"], grp["event"], label=cat)
     (1 - kmf.survival_function_).plot(ax=ax)
     signed = {t: 1 - float(kmf.survival_function_at_times(t).iloc[0]) for t in (180, 365, 730, 1095)}
+    # the curve never reaches 1 (unlinked notices), so the median is taken among notices signed within 3 years
     half = 0.5 * signed[1095]
     cdf = 1 - kmf.survival_function_[cat]
     km_cat.append({"category": cat, "notices": len(grp), **{f"signed_by_{t}d": round(v, 3) for t, v in signed.items()},
@@ -687,6 +678,7 @@ def aft_frame(frame: pd.DataFrame, medians: dict) -> pd.DataFrame:
 aft_medians = train[["wgi_gov_effectiveness", "log_commitment", "project_age_years", "advertising_days",
                      "hist_median_days_cm"]].median().to_dict()
 duration_tr, event_tr = cap_at_horizon(train["days_notice_to_signing"])
+# Weibull needs strictly positive durations; same-day signings become 1 day
 aft_train = aft_frame(train, aft_medians).assign(duration=np.maximum(duration_tr, 1), event=event_tr.astype(int))
 aft = WeibullAFTFitter(penalizer=0.01).fit(aft_train, duration_col="duration", event_col="event")
 aft_test = aft_frame(test, aft_medians)
@@ -719,6 +711,8 @@ class TenderDurationModel(mlflow.pyfunc.PythonModel):
 
     def _load(self):
         if self._boosters is None:
+            # boosters are rebuilt from the stored model strings on first use, so only plain text is pickled with the
+            # pyfunc
             self._boosters = {q: lgb.Booster(model_str=s) for q, s in self.quantile_models.items()}
             self._boosters["slow"] = lgb.Booster(model_str=self.classifier)
         return self._boosters
@@ -750,6 +744,7 @@ for _, r in results.iloc[:2].iterrows():
         mlflow.log_params(window_tags)
         mlflow.log_metrics({f"test_{c}": float(r[c]) for c in metric_cols})
 
+# test metrics above come from the train-only fit; this refit only adds the newest notices for scoring
 # refit on the whole cohort for scoring
 X_all = make_X(train_all)
 final_q = {q: fit_quantile(X_all, train_all["y"], q, BEST_PARAMS, ROUNDS) for q in QUANTILES}
@@ -805,8 +800,11 @@ for level, cols in LEVELS:
         values = {c: keys.get(c, ALL) for c in ("country_code", "region", "procurement_method_name",
                                                  "procurement_category_code")}
         if level == "country_method_category":
+            # the country level keeps its region in the key so benchmark_lookup can fall back to region without another
+            # lookup
             values["region"] = grp["region"].mode().iloc[0]
         thr = grp["slow_threshold_days"].iloc[0]
+        # at category level the group mixes methods, each with its own threshold, so there is no single value to show
         thr = None if level == "category" or pd.isna(thr) else float(thr)
         bench_rows.append({"benchmark_key": benchmark_key(level, *values.values()), "benchmark_level": level, **values,
                            "n_contracts": float(len(grp)), "p10_days": round(grp["y"].quantile(0.1)),
@@ -844,6 +842,7 @@ if BEATS_BASELINE:
 else:
     scored = pd.DataFrame({"p10_days": np.nan, "p50_days": np.nan, "p90_days": np.nan, "slow_probability": np.nan},
                           index=scoring.index)
+# same lookup the agent tool uses, so the table and the tool agree on the peer group
 peer = [benchmark_lookup(bench_rows, r.country_code, r.procurement_method_name, r.procurement_category_code, r.region)
         for r in scoring.itertuples()]
 scores = scoring[["row_id", "project_id", "country_code", "region", "procurement_method_name",
@@ -917,6 +916,7 @@ checks = [
     ("open_tender_scores", "rows with p10 > p50 or p50 > p90", S.filter("p10_days > p50_days OR p50_days > p90_days").count(), "== 0"),
     ("open_tender_scores", "rows without a range", S.filter("p50_days IS NULL").count(), "info"),
     ("open_tender_scores", "orphan notice_id", orphan_count(S, "notice_id", notices, "notice_id"), "== 0"),
+    # leakage guard: none of these is known on the notice date
     ("model", "award-time columns among features (amount, review type, signing)",
      len({"contract_amount_usd", "review_type", "signing_date", "n_tender_notices"} & set(FEATURES)), "== 0"),
     ("model", "test rows: notices on or after test start", int((test["notice_date"] < pd.Timestamp(TEST_START)).sum()), "== 0"),

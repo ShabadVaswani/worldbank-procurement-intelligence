@@ -76,11 +76,15 @@ def _column_phrases(lines: list[str], bounds: dict[str, tuple[int, float]]) -> d
     for line in lines:
         for word in _WORD.finditer(line):
             for name, (start, end) in bounds.items():
+                # a word belongs to the column its first character falls in; wrapped cells keep their words in the right
+                # column
                 if start <= word.start() < end:
                     text[name].append(word.group())
                     break
     out = {}
     for name, words in text.items():
+        # joining the column's words top to bottom reunites "Moderately" (above the row label) with "Satisfactory"
+        # (below it)
         out[name] = [(normalise_rating(m.group()) or (None,))[0] for m in _PHRASE.finditer(" ".join(words))]
     return out
 
@@ -140,6 +144,7 @@ def parse_isr_ratings(text: str | None) -> dict:
            "ip_current": None, "ip_previous": None}
     if not text:
         return out
+    # a space, not an empty string, so every later character keeps its column offset
     text = _PRIVATE_USE.sub(" ", text.replace("\r", ""))
     seq = _SEQ.search(text)
     out["seq_no"] = int(seq.group(1)) if seq else None
@@ -156,6 +161,7 @@ def parse_isr_ratings(text: str | None) -> dict:
     # Only lines between the PDO row and the stop line: the row labels themselves contain no rating words.
     phrases = _column_phrases(block, _bounds(header.group(), ["Previous", "Current"], None))
     prev, cur = phrases["Previous"], phrases["Current"]
+    # the block lists PDO first, then IP; padding with None covers a block with fewer ratings
     out["pdo_current"], out["ip_current"] = (cur + [None, None])[:2]
     # The first ISR prints '--' as the previous rating, which is a placeholder (None) and keeps the order.
     out["pdo_previous"], out["ip_previous"] = (prev + [None, None])[:2]
@@ -186,6 +192,8 @@ def parse_icrr_ratings(text: str | None) -> dict:
         return out
     before = text[:header.start()].rstrip("\n").split("\n")[-1]
     after = text[header.end():].lstrip("\n").split("\n")
+    # the free-text column title wraps: "Reason for" sits on the line above the header, "Disagreements" on the line
+    # below
     reason = next((ln.find(word) for ln, word in [(before, "Reason"), (after[0] if after else "", "Disagreements")]
                    if word in ln), None)
     block = []
@@ -301,6 +309,7 @@ def resolve_evidence(records: list[dict], question_type: str, reference_date=Non
 
     for rank, spec, rec in usable[1:]:
         c = _citation(rec, rank, spec)
+        # a status question compares only ratings of the same ISR; an older ISR that differs is history, not a conflict
         if question_type == "current_status" and not same_doc(rec):
             result["superseded"].append(c)
             continue

@@ -30,18 +30,6 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC <details><summary>Text version of the diagram</summary>
-# MAGIC
-# MAGIC ```
-# MAGIC  approval        mid-term                 last ISR        closing    ICR (self)       IEG ICR Review
-# MAGIC     |    ISR ... ISR (isr_earlier) ... ISR (isr_last)        |       outcome rating    outcome rating
-# MAGIC     |    task team: "progress towards the PDO",               |       Bank team         independent
-# MAGIC     |    "implementation progress" (forward-looking)          |       (backward-looking, self-reported)
-# MAGIC     +---------------------------- time ---------------------------------------------------------->
-# MAGIC ```
-# MAGIC
-# MAGIC </details>
-# MAGIC
 # MAGIC | Output | Grain | Key |
 # MAGIC |---|---|---|
 # MAGIC | `proc_bronze.rating_documents` | one document read per project and role (last ISR, earlier ISR, ICR Review), with the raw parsed ratings | `project_id, role` |
@@ -83,32 +71,17 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## How it was built and tested
+# MAGIC ## Key design decisions
 # MAGIC
-# MAGIC **Step 1 — Where do the ratings live?**
-# MAGIC - **Question:** which source gives the last ISR rating, the ICR self-rating and IEG's rating most cheaply and reliably?
-# MAGIC - **What we found:** the outcome project's `bronze.ieg_ratings` has IEG's outcome for 6,906 ICR Reviews but **no ICR self-rating**, and its document chunks are only appraisal documents (no ISRs, no ICRs). The Projects API carries no ratings. The Documents API filters by document type (`docty_exact`), and every ISR and ICR Review has a plain-text rendering.
-# MAGIC - **Decision:** list each project's ISRs, ICRs and ICR Reviews from the Documents API and read the ratings from the text. The ICR Review prints the ICR's rating and IEG's rating side by side, so one document gives both, and IEG's rating read from the text can be **checked against** `bronze.ieg_ratings` (a free accuracy test of the parser).
+# MAGIC | Decision | Rationale | Evidence |
+# MAGIC |---|---|---|
+# MAGIC | Ratings read from the Documents API text of each project's ISRs, ICRs and ICR Reviews; parsed IEG ratings checked against `bronze.ieg_ratings` | No existing source holds the ICR self-rating; one ICR Review gives both the ICR and IEG ratings | `bronze.ieg_ratings` has IEG's outcome for 6,906 ICR Reviews but no ICR self-rating; existing chunks are appraisal documents only; the Projects API carries no ratings; the Documents API filters by `docty_exact` and every ISR and ICR Review has a plain-text rendering |
+# MAGIC | One column-position parser for both tables: columns from the header line, words assigned to the column under which they start, placeholders (`---`, `Not Rated`) matched, the "Reason for disagreement" column cut off | A line regex reads the wrong column when cells wrap | In ICR Reviews a cell such as "Moderately Satisfactory" is often split over two lines, above and below the row label |
+# MAGIC | A column starts 8 characters before its title (never before the second word of the previous column's rating); the header regex accepts both ISR templates; private-use characters replaced by a space; both layouts unit-tested | Two layout variants broke the parser; falling back to an older ISR would have silently replaced the last ISR for a quarter of the sample | Run 1 read IEG's outcome correctly for 364 of 376 ICR Reviews (all 12 mismatches: IEG cells up to 5 characters left of the title); for 91 of 400 projects the newest ISR had "no ratings" (2024 template: "Previous / Current" header, private-use icon prefixes); section 4 re-checks IEG |
+# MAGIC | 400 of the eligible projects in hash order of `project_id`; per project the last ISR, the ISR nearest the middle of supervision and the ICR Review, with counted fallbacks | Reproducible and unrelated to the ratings, so disagreement rates are not biased by the selection | 1,368 closed projects in the procurement data have an IEG outcome rating (evaluated FY2019-2027) |
+# MAGIC | A documented source hierarchy per question type; every other record returned as supporting or conflicting with its date and citation, plus a flag and a confidence label | The question decides the authoritative source: IEG for "how did the project do", the latest ISR for "how is it going now" | Tested on hand-made cases in `tests/test_evidence.py` |
 # MAGIC
-# MAGIC **Step 2 — The rating tables are fixed-width columns with wrapped cells**
-# MAGIC - **Question:** can a line regex read the ratings?
-# MAGIC - **What we found:** for ISRs mostly yes (`Progress towards achievement of PDO   <previous>   <current>`), but in ICR Reviews a cell such as "Moderately Satisfactory" is often split over two lines, *above and below* the row label, while the neighbouring cell sits on the label line. A line regex reads the wrong column.
-# MAGIC - **Decision:** one parser for both tables: take the column positions from the header line, assign every word to the column under which it starts, and read each column's text top to bottom for rating phrases. Placeholders (`---`, `Not Rated`) are matched too, so an empty cell cannot shift the next row's rating up. The "Reason for disagreement" column is cut off, because its free text contains rating words.
-# MAGIC
-# MAGIC **Step 3 — The first full run found two layout variants**
-# MAGIC - **Question:** does the parser read the real documents, not just the probes?
-# MAGIC - **What we found:** run 1 read IEG's outcome correctly for only 364 of 376 ICR Reviews, and for 91 of 400 projects the newest ISR had "no ratings". Two causes: (1) in some ICR Reviews the IEG cells start up to 5 characters **left** of the "IEG" title, so "Moderately" fell into the ICR column and IEG kept only "Satisfactory" (all 12 mismatches had that pattern); (2) ISRs from 2024 use a new template: the header says "Previous / Current" instead of "Previous Rating / Current Rating", and each rating is prefixed by an icon character from the Unicode private-use area. Falling back to an older ISR would have silently replaced the *last* ISR with an earlier one for a quarter of the sample.
-# MAGIC - **Decision:** a column starts 8 characters before its title (but never before the second word of the previous column's rating), the header regex accepts both templates, and private-use characters are replaced by a space (which keeps the column offsets). Both layouts are now unit tests; section 4 re-checks IEG against the dataset.
-# MAGIC
-# MAGIC **Step 4 — A bounded, unbiased sample**
-# MAGIC - **Question:** which projects?
-# MAGIC - **What we found:** 1,368 closed projects in the procurement data have an IEG outcome rating (evaluated FY2019-2027).
-# MAGIC - **Decision:** 400 of them in hash order of `project_id` (reproducible and unrelated to the ratings, so the disagreement rates are not biased by the selection). For each: the last ISR, the ISR nearest the middle of the supervision period, and the ICR Review. If a document has no readable ratings block, the next candidate of the same role is tried and counted.
-# MAGIC
-# MAGIC **Step 5 — Resolution as a policy, not a pick**
-# MAGIC - **Question:** what should the agent say when sources disagree?
-# MAGIC - **What we found:** the question decides which source is authoritative. For "how did the project do", IEG's independent ex-post rating is the Bank's official verdict; for "how is it going now", only the latest ISR speaks to the present.
-# MAGIC - **Decision:** a documented hierarchy per question type, every other record returned as supporting or conflicting with its date and citation, a flag and a confidence label. Tested on hand-made cases in `tests/test_evidence.py`.
+# MAGIC Full reasoning: docs/decision_log.md
 
 # COMMAND ----------
 
@@ -151,6 +124,7 @@ DOCS_URL = "https://search.worldbank.org/api/v3/wds"
 DOC_TYPES = {"isr": "Implementation Status and Results Report",
              "icr": "Implementation Completion and Results Report",
              "icrr": "Implementation Completion Report Review"}
+# some ISRs and ICR Reviews have no readable ratings block; try up to three documents before giving up on a role
 MAX_TRIES_PER_ROLE = 3
 EVIDENCE_DIR = f"{RAW_VOLUME}/evidence"
 DOCS_TABLE = f"{BRONZE}.rating_documents"
@@ -171,6 +145,7 @@ for sub in ["lists", "docs"]:
 
 # COMMAND ----------
 
+# newest ICR Review per project; a project can have been re-evaluated
 ieg = (spark.table(IEG_RATINGS).filter("evaluation_type = 'ICRR' AND outcome <> 'Not Rated'")
        .withColumn("_rn", F.row_number().over(Window.partitionBy("project_id").orderBy(F.desc("evaluation_fy"))))
        .filter("_rn = 1").select("project_id", F.col("outcome").alias("ieg_outcome_dataset"),
@@ -178,6 +153,8 @@ ieg = (spark.table(IEG_RATINGS).filter("evaluation_type = 'ICRR' AND outcome <> 
 eligible = (spark.table(f"{SILVER}.dim_project").filter("status = 'Closed'")
             .join(ieg, "project_id").select("project_id", "project_name", "region", "major_sector", "country_code",
                                             "approval_fy", "ieg_outcome_dataset", "evaluation_fy"))
+# hash order is reproducible and unrelated to the ratings, so the disagreement rates below are not biased by the
+# selection
 sample = eligible.orderBy(F.sha2("project_id", 256)).limit(SAMPLE_SIZE).cache()
 print(f"eligible closed projects with an IEG outcome: {eligible.count():,}; sampled: {sample.count()}")
 display(sample.groupBy("region").count().orderBy(F.desc("count")))
@@ -208,6 +185,7 @@ def get_text(url: str, max_retries: int = 5) -> str | None:
     for attempt in range(max_retries + 1):
         try:
             resp = HTTP.get(url, timeout=120)
+            # some listed documents simply have no text rendering; that is an answer, not an error to retry
             if resp.status_code in (403, 404, 410):
                 return None
             if resp.status_code not in RETRYABLE_STATUS:
@@ -216,6 +194,7 @@ def get_text(url: str, max_retries: int = 5) -> str | None:
             delay = retry_delay(attempt, resp.text, resp.headers.get("Retry-After"))
         except (requests.ConnectionError, requests.Timeout):
             delay = retry_delay(attempt)
+        # jitter so the four worker threads do not retry in lockstep
         time.sleep(delay + random.uniform(0, 1))
     raise RuntimeError(f"giving up on {url}")
 
@@ -229,6 +208,7 @@ def list_documents(project_id: str) -> dict:
     for role, docty in DOC_TYPES.items():
         body = get_json(DOCS_URL, {"format": "json", "proid": project_id, "docty_exact": docty, "rows": 100,
                                    "fl": "id,docdt,docty,txturl,url"}, session=HTTP)
+        # documents without a text URL cannot be parsed, so they are not candidates
         docs = [d for k, d in body.get("documents", {}).items() if k != "facets" and d.get("txturl")]
         listing[role] = sorted(docs, key=lambda d: d.get("docdt") or "", reverse=True)     # newest first
     with open(path, "w") as f:
@@ -243,6 +223,7 @@ def read_document(doc: dict) -> tuple[str | None, str | None]:
         return None, None
     if not os.path.exists(path):
         text = get_text(doc["txturl"])
+        # remember "no text" on disk so a re-run does not ask the server again
         if text is None:
             open(missing, "w").close()
             return None, None
@@ -257,6 +238,7 @@ def first_readable(candidates: list[dict], parse, has_rating) -> tuple[dict | No
     for tried, doc in enumerate(candidates[:MAX_TRIES_PER_ROLE], start=1):
         text, path = read_document(doc)
         parsed = parse(text)
+        # a document counts only if its ratings parse; otherwise fall through to the next older one
         if text and has_rating(parsed):
             return doc, parsed, path, tried, len(text)
     return None, {}, None, min(len(candidates), MAX_TRIES_PER_ROLE), 0
@@ -281,15 +263,18 @@ def collect_project(project_id: str) -> list[dict]:
     last, parsed, path, tried, n = first_readable(isrs, parse_isr_ratings, isr_ok)
     add("isr_last", last, parsed, path, tried, n, len(isrs))
     if last:
+        # ISO date strings compare correctly as text
         older = [d for d in isrs if (d.get("docdt") or "") < last["docdt"]]
         if older:
             first_d, last_d = _date(older[-1]), _date(last)
+            # the mid-period ISR: closest to halfway between the first ISR and the last readable one
             middle = first_d + (last_d - first_d) / 2
             by_distance = sorted(older, key=lambda d: abs((_date(d) - middle).days))
             mid, parsed, path, tried, n = first_readable(by_distance, parse_isr_ratings, isr_ok)
             add("isr_earlier", mid, parsed, path, tried, n, len(older))
     icrr, parsed, path, tried, n = first_readable(icrrs, parse_icrr_ratings,
                                                   lambda p: bool(p.get("ieg_outcome") or p.get("icr_outcome")))
+    # the ICR itself is not downloaded: its rating is printed in the ICR Review, only its id and date are needed
     add("icrr", icrr, {**parsed, "icr_doc_id": icrs[0]["id"] if icrs else None,
                        "icr_doc_date": _date(icrs[0]).isoformat() if icrs else None}, path, tried, n, len(icrrs))
     return rows
@@ -355,6 +340,7 @@ display(D.groupBy("role").agg(F.count("*").alias("projects"), F.count("doc_id").
 
 # COMMAND ----------
 
+# IEG's dataset is an independent ground truth for the IEG column; matching it shows the column assignment works
 check = (D.filter("role = 'icrr' AND ieg_outcome IS NOT NULL").join(sample.select("project_id", "ieg_outcome_dataset"), "project_id"))
 n_check, n_match = check.count(), check.filter("ieg_outcome = ieg_outcome_dataset").count()
 low, high = wilson_interval(n_match, n_check)
@@ -386,7 +372,11 @@ icrr = D.filter("role = 'icrr'").alias("r")
 isr = D.filter("role IN ('isr_last', 'isr_earlier') AND doc_id IS NOT NULL")
 ieg_rows = (sample.select("project_id", "ieg_outcome_dataset", "evaluation_fy").join(icrr, "project_id", "left")
             .select("project_id", F.lit("ieg_validation").alias("source_type"), F.lit("outcome").alias("dimension"),
+                    # the rating comes from IEG's dataset, not the text parse: the parse is only used to cross-check it
+                    # above
                     F.col("ieg_outcome_dataset").alias("rating"),
+                    # no ICR Review document found: date it at the end of the evaluation fiscal year (the Bank's FY ends
+                    # 30 June)
                     F.coalesce("doc_date", F.make_date("evaluation_fy", F.lit(6), F.lit(30))).alias("as_of"),
                     F.concat(F.lit("IEG ICR Review, evaluation FY"), F.col("evaluation_fy").cast("string")).alias("source"),
                     F.coalesce("doc_id", F.lit("bronze.ieg_ratings")).alias("doc_id"), doc_url("txt_url").alias("doc_url")))
@@ -399,6 +389,7 @@ icr_rows = (icrr.filter("icr_outcome IS NOT NULL")
 isr_rows = (isr.select("project_id", F.col("role").alias("source_type"),
                        F.explode(F.array(F.struct(F.lit("pdo_progress").alias("dimension"), F.col("pdo_current").alias("rating")),
                                          F.struct(F.lit("implementation_progress").alias("dimension"), F.col("ip_current").alias("rating")))).alias("r"),
+                       # the archive date printed in the ISR is when the rating was given; the catalog date can be later
                        F.coalesce("archived_on", "doc_date").alias("as_of"),
                        F.concat(F.lit("ISR sequence "), F.coalesce(F.col("seq_no").cast("string"), F.lit("?"))).alias("source"),
                        "doc_id", doc_url("txt_url").alias("doc_url"))
@@ -406,6 +397,7 @@ isr_rows = (isr.select("project_id", F.col("role").alias("source_type"),
             .filter("rating IS NOT NULL"))
 evidence = (ieg_rows.unionByName(icr_rows).unionByName(isr_rows)
             .withColumn("score", F.try_element_at(score_map, F.col("rating")).cast("int"))
+            # 4 = Moderately Satisfactory: the satisfactory line used in the Bank's outcome statistics
             .withColumn("is_satisfactory", F.col("score") >= 4)
             .withColumn("independence", F.when(F.col("source_type") == "ieg_validation", "independent").otherwise("self_reported")))
 n_evidence = publish_table(
@@ -445,7 +437,7 @@ display(E.groupBy("source_type", "dimension").agg(F.countDistinct("project_id").
 # MAGIC - the **disconnect**: the last ISR rated progress Moderately Satisfactory or better, IEG rated the outcome Moderately Unsatisfactory or worse, as a share of (a) satisfactory last ISRs and (b) projects IEG rated unsatisfactory,
 # MAGIC - the same for the ICR self-rating and the mid-period ISR, and by region and sector.
 # MAGIC
-# MAGIC **Why:** the Bank's own evaluators have long reported that supervision ratings are more optimistic than final evaluations. Here it is measured on this sample, with confidence intervals, so the resolution policy rests on numbers rather than folklore.
+# MAGIC **Why:** the Bank's own evaluators have long reported that supervision ratings are more optimistic than final evaluations. Here it is measured on this sample, with confidence intervals, so the resolution policy rests on numbers rather than anecdote.
 
 # COMMAND ----------
 
@@ -469,6 +461,8 @@ display(matrix.reset_index())
 def rate_row(df, earlier: str, label: str) -> dict:
     """Disconnect between an earlier self-rating column and IEG, with Wilson intervals."""
     d = df.dropna(subset=[earlier, "ieg"])
+    # two denominators, because they answer different questions: how often a good rating is wrong, and how often a bad
+    # outcome was missed
     sat, ieg_unsat = d[d[earlier] >= 4], d[d["ieg"] < 4]
     n_dis = int(((d[earlier] >= 4) & (d["ieg"] < 4)).sum())
     lo1, hi1 = wilson_interval(n_dis, len(sat))
@@ -498,6 +492,7 @@ def by_group(col: str) -> pd.DataFrame:
     d = pdf.dropna(subset=["isr_pdo", "ieg"])
     rows = []
     for key, g in d.groupby(col):
+        # fewer than 15 projects gives intervals too wide to say anything
         if len(g) < 15:
             continue
         n_dis = int(((g["isr_pdo"] >= 4) & (g["ieg"] < 4)).sum())
@@ -565,8 +560,10 @@ display(by_group("major_sector"))
 
 # COMMAND ----------
 
+# "today" for the staleness rule: a last ISR older than 12 months cannot give high confidence on current status
 REFERENCE_DATE = datetime.now(timezone.utc).date()
 by_project: dict[str, list[dict]] = {}
+# a few thousand rows: resolve in plain Python with the same tested function the agent calls
 for r in E.collect():
     by_project.setdefault(r.project_id, []).append(r.asDict())
 resolved = []

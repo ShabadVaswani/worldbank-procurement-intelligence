@@ -89,6 +89,8 @@ _NON_ALNUM = re.compile(r"[^A-Z0-9]+")
 
 
 def _ascii_upper(text: str) -> str:
+    # private-use (Co), control (Cc) and format (Cf) characters become spaces before transliteration, so they cannot
+    # glue words together
     cleaned = "".join(" " if unicodedata.category(ch) in ("Co", "Cc", "Cf") else ch for ch in text)
     return unidecode(cleaned).upper()
 
@@ -97,6 +99,7 @@ def _join_single_letters(tokens: list[str]) -> list[str]:
     out: list[str] = []
     run = ""
     for tok in tokens:
+        # digits are not joined: "LOT 1 2" must not become "LOT12"
         if len(tok) == 1 and tok.isalpha():
             run += tok
             continue
@@ -113,6 +116,8 @@ def _remove_phrases(tokens: list[str]) -> list[str]:
     out: list[str] = []
     i = 0
     while i < len(tokens):
+        # LEGAL_PHRASES lists longer phrases before their shorter prefixes ("S DE RL DE CV" before "S DE RL"), so the
+        # first match is the longest
         for phrase in LEGAL_PHRASES:
             if tuple(tokens[i:i + len(phrase)]) == phrase:
                 i += len(phrase)
@@ -128,6 +133,7 @@ def base_tokens(name: str | None) -> list[str]:
     if not name:
         return []
     text = _JV_ROLE.sub(" ", _ascii_upper(name)).replace("&", " AND ")
+    # "S.A." -> "SA" before punctuation becomes spaces; otherwise it would split into the single letters "S A"
     text = _ACRONYM_DOT.sub(r"\1", text)
     return _join_single_letters(_NON_ALNUM.sub(" ", text).split())
 
@@ -138,6 +144,7 @@ def normalise_supplier_name(name: str | None) -> str:
     stripped = [t for t in _remove_phrases(tokens) if t not in LEGAL_FORMS]
     while stripped and stripped[0] in LEADING_DESIGNATORS:
         stripped = stripped[1:]
+    # a name that is only a legal form ("THE COMPANY LTD") keeps its tokens rather than becoming empty
     return " ".join(stripped or tokens)
 
 
@@ -193,6 +200,7 @@ def is_ambiguous_person_name(name: str | None, normalised: str, index: Mapping[s
     tokens = normalised.split()
     if not tokens:
         return False
+    # names containing every word of this one (its own spelling variants) are not evidence that the words are common
     sharing_all = set.intersection(*(set(index.get(t, ())) for t in tokens))
     return min(len(index.get(t, ())) - len(sharing_all) for t in tokens) > max_others
 
@@ -203,6 +211,7 @@ def is_acronym_of(short_name: str | None, long_name: str | None) -> bool:
     sides; small connecting words may be skipped or counted."""
     short = [t for t in base_tokens(short_name) if t not in LEGAL_FORMS]
     words = [t for t in base_tokens(long_name) if t not in LEGAL_FORMS]
+    # an acronym is one alphabetic word of 2-8 letters; anything else is not tested
     if len(short) != 1 or not 2 <= len(short[0]) <= 8 or not short[0].isalpha() or len(words) < 2:
         return False
     with_all = "".join(w[0] for w in words)

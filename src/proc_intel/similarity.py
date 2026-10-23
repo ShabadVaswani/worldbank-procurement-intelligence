@@ -23,6 +23,8 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 
 def char_ngram_tfidf(names: Sequence[str], ngram: int = 3) -> sparse.csr_matrix:
     """L2-normalised TF-IDF matrix of character n-grams (word-boundary aware), one row per name."""
+    # char_wb pads each word with spaces, so trigrams do not span two words and word starts/ends carry weight;
+    # float32 halves the memory of the 370k-row matrix
     vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(ngram, ngram), sublinear_tf=True,
                                  dtype=np.float32)
     return vectorizer.fit_transform(names).tocsr()
@@ -46,6 +48,7 @@ def _block_scores(matrix: sparse.csr_matrix, blocks: Sequence[Hashable], min_sco
         for start in range(0, len(ids), chunk_size):
             scores = (sub[start:start + chunk_size] @ sub.T).tocoo()
             rows = scores.row + start
+            # rows < cols keeps each unordered pair once and drops the diagonal (a name with itself)
             keep = (scores.data >= min_score) & (rows < scores.col)
             yield ids[rows[keep]], ids[scores.col[keep]], scores.data[keep]
 
@@ -75,6 +78,7 @@ def score_band_counts(matrix: sparse.csr_matrix, blocks: Sequence[Hashable], gro
     counts: dict[float, int] = defaultdict(int)
     for i, j, score in _block_scores(matrix, blocks, min_score, chunk_size):
         keep = codes[i] != codes[j]
+        # float64 and round(2) so the band keys match the bands computed for the labels in p04
         bands = np.minimum(np.floor(score[keep].astype(np.float64) / band_width) * band_width, 1.0).round(2)
         for band, n in zip(*np.unique(bands, return_counts=True), strict=True):
             counts[float(band)] += int(n)
@@ -119,6 +123,7 @@ class UnionFind:
 
     def find(self, x: int) -> int:
         while self.parent[x] != x:
+            # path halving: point each visited node at its grandparent, which keeps the trees shallow without recursion
             self.parent[x] = self.parent[self.parent[x]]
             x = self.parent[x]
         return x

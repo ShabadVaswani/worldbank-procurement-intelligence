@@ -26,6 +26,7 @@ import pandas as pd
 HORIZON_DAYS = 730
 QUANTILES = (0.1, 0.5, 0.9)
 ALL = "ALL"
+# a P10 or P90 of fewer than 30 contracts moves too much with a single tender; fall back to a coarser group
 MIN_PEER_N = 30
 
 # finest first; each level lists the columns that must match (the others are ALL)
@@ -47,6 +48,7 @@ def cap_at_horizon(days, horizon: int = HORIZON_DAYS) -> tuple[np.ndarray, np.nd
 def pinball_loss(y, pred, alpha: float) -> float:
     """Mean quantile (pinball) loss: under-prediction costs alpha, over-prediction 1 - alpha."""
     diff = np.asarray(y, dtype=float) - np.asarray(pred, dtype=float)
+    # the max picks alpha * diff when y is above the prediction and (alpha - 1) * diff (positive) when below
     return float(np.mean(np.maximum(alpha * diff, (alpha - 1) * diff)))
 
 
@@ -89,6 +91,7 @@ def benchmark_lookup(rows, country: str | None, method: str | None, category: st
     level_cols = dict(LEVELS)
     # a row is found by its level and the columns that level matches on (country rows also carry their region)
     index = {(r["benchmark_level"], tuple(r[c] for c in level_cols[r["benchmark_level"]])): r for r in records}
+    # the region is taken from the country's own row, so callers only need to pass the country
     if region is None and country:
         region = next((r["region"] for (level, _), r in index.items()
                        if level == LEVELS[0][0] and r["country_code"] == country), None)
@@ -96,6 +99,7 @@ def benchmark_lookup(rows, country: str | None, method: str | None, category: st
               "procurement_category_code": category}
     skipped = []
     for level, cols in LEVELS:
+        # a level whose key is unknown (e.g. no country given) is skipped, not matched against blanks
         if any(wanted[c] in (None, "") for c in cols):
             continue
         row = index.get((level, tuple(wanted[c] for c in cols)))
@@ -130,6 +134,7 @@ def peer_aggregate(train: pd.DataFrame, test: pd.DataFrame, target: str, stats: 
         table = pd.concat([grouped.size().rename("n")] + [grouped.agg(fn).rename(name) for name, fn in stats.items()],
                           axis=1)
         table = table[table["n"] >= min_n].reset_index()
+        # merge loses the index; carry it as a column so results land on the right test rows
         hit = test.loc[todo, cols].rename_axis("_row").reset_index().merge(table, on=cols).set_index("_row")
         out.loc[hit.index, [*stats, "n"]] = hit[[*stats, "n"]].to_numpy(dtype=float)
         out.loc[hit.index, "level"] = level
@@ -156,6 +161,7 @@ def rolling_origin_folds(dates, origins, val_months: int) -> list[tuple[np.ndarr
 def calibration_table(y, p, n_bins: int = 10) -> pd.DataFrame:
     """Observed rate vs mean predicted probability per equal-count bin of the predictions."""
     frame = pd.DataFrame({"y": np.asarray(y, dtype=float), "p": np.asarray(p, dtype=float)})
+    # ranking first breaks ties, so qcut can always make equal-count bins even when many predictions are identical
     frame["bin"] = pd.qcut(frame["p"].rank(method="first"), n_bins, labels=False)
     return (frame.groupby("bin").agg(n=("y", "size"), mean_predicted=("p", "mean"), observed_rate=("y", "mean"))
             .reset_index())
@@ -172,4 +178,5 @@ def conformal_shift(scores, miss_rate: float) -> float:
     s = np.sort(np.asarray(scores, dtype=float))
     n = len(s)
     k = int(np.ceil((n + 1) * (1 - miss_rate)))
+    # k can exceed n on a small calibration set; the largest violation is then the most conservative shift available
     return float(s[min(k, n) - 1])

@@ -38,27 +38,6 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC <details><summary>Text version of the diagram</summary>
-# MAGIC
-# MAGIC ```
-# MAGIC  proc_bronze.procurement_notices.notice_text (HTML)        proc_gold.tender_timelines (signed contracts, outcomes)
-# MAGIC        |                                                          |
-# MAGIC  rules (proc_intel.tender_checks.extract_requirements)    bidders named in award notices, days to signing,
-# MAGIC  + Qwen JSON extraction only where the rules found         re-advertised reference, value per lot
-# MAGIC    a mention without a value                                       |
-# MAGIC        v                                                          v
-# MAGIC  proc_silver.tender_requirements (400 notices)   +   advertising period, market approach (all 10,000+ notices)
-# MAGIC                                    \                 /
-# MAGIC                       peer statistics per country / region / category x market approach
-# MAGIC                       (proc_gold.tender_design_peers)  +  policy minimum (Regulations para 5.36)
-# MAGIC                                           v
-# MAGIC              check_tender_design(notice_or_package, peers) -> flags  -->  proc_gold.tender_design_flags
-# MAGIC                                           v
-# MAGIC              flagged vs not flagged: bidders, single-bidder share, days to signing, re-advertisement
-# MAGIC ```
-# MAGIC
-# MAGIC </details>
-# MAGIC
 # MAGIC | Output | Grain | Key |
 # MAGIC |---|---|---|
 # MAGIC | `proc_silver.tender_requirements` | one sampled notice with the requirements read from its text and the source of each value | `notice_id` |
@@ -87,27 +66,18 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## How it was built and tested
+# MAGIC ## Key design decisions
 # MAGIC
-# MAGIC **Step 1 — What do notices actually state?**
-# MAGIC - **Question:** can technical specifications and qualification criteria be read from the notices?
-# MAGIC - **What we found:** IFB notices are short (median about 3,900 characters for English IFBs) and mostly point to the bidding document. In a 400-notice sample, about 75% mention bid security, 74% state national or international competition, but only about 7% print a turnover requirement and 3% a number of years of experience. Specifications and the full qualification criteria are in the bidding documents, which are not published as open data.
-# MAGIC - **Decision:** check what the notices do carry (advertising period, market approach, package value, bid security, bid validity, electronic submission) and treat qualification thresholds as a small-sample check. The data gap is stated in `docs/data_gaps.md`.
+# MAGIC | Decision | Rationale | Evidence |
+# MAGIC |---|---|---|
+# MAGIC | Check what notices carry (advertising period, market approach, package value, bid security, bid validity, electronic submission); qualification thresholds only as a small-sample check; the gap stated in `docs/data_gaps.md` | Specifications and full qualification criteria are in bidding documents, which are not published as open data | English IFBs: median about 3,900 characters; in a 400-notice sample about 75% mention bid security, 74% state national or international competition, about 7% print a turnover requirement and 3% a number of years of experience |
+# MAGIC | Rules for all 400 notices; Qwen 3.5 (thinking off, strict JSON schema) only where rules found a mention without a value, plus a random 40 of the others for rule-model agreement; a model value never overwrites a rule value | The formats repeat, so rules read most fields | "Bid Security of US$ 22,000", "2% of the bid price", "Bid-Securing Declaration", "valid for 90 days"; currency codes are a case-sensitive whitelist (an earlier rule read "FOR 3,000", "LOT 2" as currencies); about 30% of notices name bid security without a readable value |
+# MAGIC | A policy check for international tenders; peer checks everywhere (same country, else region, else all, x category x market approach, at least 20 observations, over the p07 cohort: notices 2019-07-01 to 2024-10-13) | National competition follows national rules, so only peers can judge it | Procurement Regulations (7th edition, September 2025, para 5.36): minimum of 30 Business Days (about 42 calendar days) for open international competitive procurement |
+# MAGIC | Flagged and unflagged notices compared on outcomes with bootstrap intervals, by check | Shows which checks are associated with worse outcomes | Outcomes are observable only for tenders that ended in a signed contract in the awards feed; the bidder count is the number of firms named in the award notice |
 # MAGIC
-# MAGIC **Step 2 — Rules first, a model only for the leftovers**
-# MAGIC - **Question:** rules or an LLM for the extraction?
-# MAGIC - **What we found:** the formats repeat ("Bid Security of US$ 22,000", "2% of the bid price", "Bid-Securing Declaration", "valid for 90 days"), so rules read most fields. The first currency rule read any three capital letters before a number as a currency ("FOR 3,000", "LOT 2"); currency codes are now a whitelist matched case-sensitively. About 30% of notices name bid security without a readable value (tables flattened into text, amounts in words).
-# MAGIC - **Decision:** rules for all 400; Qwen 3.5 (thinking off, strict JSON schema) only for notices where the rules found a mention without a value, plus a random 40 of the others to measure agreement between rules and model. A model value never overwrites a rule value.
+# MAGIC Limitations: results are associations (a large package is also a complex one), not effects; cancelled tenders are invisible.
 # MAGIC
-# MAGIC **Step 3 — Peers and policy**
-# MAGIC - **Question:** what is "short" or "large"?
-# MAGIC - **What we found:** the Procurement Regulations (7th edition, September 2025, para 5.36) set a minimum of 30 Business Days (about 42 calendar days) for open international competitive procurement; national competition follows national rules, so only peers can judge it.
-# MAGIC - **Decision:** a policy check for international tenders, and peer checks everywhere: peers are notices of the same country (else region, else all) x category x market approach with at least 20 observations, over the cohort p07 also used (notices 2019-07-01 to 2024-10-13, fully observable).
-# MAGIC
-# MAGIC **Step 4 — Does a flag matter?**
-# MAGIC - **Question:** which checks are associated with worse outcomes?
-# MAGIC - **What we found:** outcomes are only observable for tenders that ended in a signed contract in the awards feed; cancelled tenders are invisible, and the bidder count is the number of firms named in the award notice.
-# MAGIC - **Decision:** compare flagged and unflagged notices on these outcomes with bootstrap intervals, by check, and read them as associations (a large package is also a complex one), not effects.
+# MAGIC Full reasoning: docs/decision_log.md
 
 # COMMAND ----------
 
@@ -138,9 +108,11 @@ from proc_intel import tender_checks as tc
 
 SAMPLE_SIZE = 400
 LLM_CHECK_SAMPLE = 40
+# p07's fully observable cohort: outcomes inside it are not biased by the awards feed's truncation at either end
 WINDOW = ("2019-07-01", "2024-10-13")
 CATEGORIES = ("CW", "GO", "NC")
 LLM_MODEL = "databricks-qwen35-122b-a10b"
+# the requirements sit near the top of an IFB; 6,000 characters cover most notices and cap the tokens per call
 MAX_TEXT_CHARS = 6000
 REQ_TABLE = f"{SILVER}.tender_requirements"
 PEERS_TABLE = f"{GOLD}.tender_design_peers"
@@ -153,7 +125,7 @@ FLAGS_TABLE = f"{GOLD}.tender_design_flags"
 # MAGIC
 # MAGIC **What:** English Invitations for Bids (works, goods, non-consulting services) published in the window that p05 linked as the tender notice of openly competed, timed contracts. Per notice: number of contracts (lots signed), the earliest days to signing, the mean number of firms named in the award notices, whether all its contracts had one named firm, whether a contract had a second tender notice (re-advertisement), and the value per lot. The advertising period comes from the notice's structured dates; the market approach is read from its text.
 # MAGIC
-# MAGIC **Why:** these are the tenders whose outcome we can observe, so every check can be related to an outcome. All English IFBs of the window (with or without a signed contract) are the peer pool for the advertising period.
+# MAGIC **Why:** these are the tenders whose outcome is observable, so every check can be related to an outcome. All English IFBs of the window (with or without a signed contract) are the peer pool for the advertising period.
 
 # COMMAND ----------
 
@@ -163,6 +135,8 @@ ifb = (spark.table(f"{SILVER}.notices")
        .filter(f"notice_type = 'Invitation for Bids' AND notice_language = 'English' AND notice_date BETWEEN '{WINDOW[0]}' AND '{WINDOW[1]}'")
        .filter(F.col("procurement_category_code").isin(*CATEGORIES))
        .withColumn("advertising_days", F.datediff("submission_deadline", "notice_date"))
+       # a deadline before the notice or more than a year after it is a data error; keep it missing rather than skew the
+       # peers
        .withColumn("advertising_days", F.when(F.col("advertising_days").between(1, 365), F.col("advertising_days")))
        .join(texts, "notice_id")
        .withColumn("market_approach", approach_udf("notice_text", "procurement_method_name"))
@@ -174,6 +148,8 @@ tt = spark.table(f"{GOLD}.tender_timelines").filter("is_timed AND competition = 
 outcomes = (tt.groupBy(F.col("tender_notice_id").alias("notice_id"))
             .agg(F.count("*").alias("n_contracts"), F.min("days_notice_to_signing").alias("days_to_signing"),
                  F.avg("n_named_firms_in_award_notice").alias("bidders"),
+                 # grain: one row per notice (lots summed); a notice is single-bidder only if every lot with a known
+                 # bidder count had one firm
                  F.min(F.when(F.col("n_named_firms_in_award_notice").isNotNull(),
                               (F.col("n_named_firms_in_award_notice") == 1).cast("int"))).alias("single_bidder"),
                  F.max((F.col("n_tender_notices") > 1).cast("int")).alias("readvertised"),
@@ -196,6 +172,7 @@ display(pool.groupBy("category", "market_approach").agg(
 
 # COMMAND ----------
 
+# hash order: reproducible and unrelated to the outcomes
 sample = (pool.orderBy(F.sha2("notice_id", 256)).limit(SAMPLE_SIZE).join(texts, "notice_id")
           .select("notice_id", "category", "country_code", "procurement_method_name", "notice_text").toPandas())
 sample["text"] = sample.notice_text.map(tc.notice_text)
@@ -232,6 +209,7 @@ def _invoke(endpoint: str, body: dict, timeout: int = 180, max_retries: int = 8)
                               headers={"Authorization": f"Bearer {_TOKEN}"}, json=body, timeout=timeout)
             if r.status_code == 200:
                 return r.json()
+            # only rate limits and server errors are retried; a 4xx means a bad request and retrying will not help
             retry, err = r.status_code == 429 or r.status_code >= 500, f"HTTP {r.status_code}: {r.text[:300]}"
         except requests.exceptions.RequestException as e:
             retry, err = True, f"{type(e).__name__}: {str(e)[:200]}"
@@ -242,6 +220,7 @@ def _invoke(endpoint: str, body: dict, timeout: int = 180, max_retries: int = 8)
 
 _num = {"type": ["number", "null"]}
 _str = {"type": ["string", "null"]}
+# strict schema with nullable fields: the model must say "not stated" with null instead of guessing a value
 SCHEMA = {"type": "json_schema", "json_schema": {"name": "tender_requirements", "strict": True, "schema": {
     "type": "object", "additionalProperties": False,
     "properties": {"market_approach": {"type": ["string", "null"], "enum": ["international", "national", None]},
@@ -270,9 +249,11 @@ def llm_extract(text: str) -> dict:
         USAGE["completion_tokens"] += u.get("completion_tokens", 0)
         USAGE["calls"] += 1
     content = resp["choices"][0]["message"]["content"]
+    # some endpoints return content as a list of typed blocks instead of a plain string
     if isinstance(content, list):
         content = "".join(b.get("text", "") for b in content if b.get("type") == "text")
     out = json.loads(content)
+    # renamed to match the rules' field name, so the two sources can be merged column by column
     out["n_lots_stated"] = out.pop("n_lots")
     if out["bid_security_kind"] == "not_stated":
         out["bid_security_kind"] = None
@@ -280,8 +261,10 @@ def llm_extract(text: str) -> dict:
 
 
 mentions_qual = sample.text.str.contains(r"turnover|years of (?:general |specific )?experience", case=False, regex=True)
+# the model only reads notices where the rules saw a mention but could not read the value
 fill_mask = (rules.bid_security_kind == "mentioned") | (mentions_qual & rules.turnover_amount.isna() & rules.experience_years.isna())
 others = rules.index[~fill_mask].tolist()
+# a random check set, so rules-vs-model agreement is measured on notices the rules already handled
 check_idx = sorted(random.Random(13).sample(others, min(LLM_CHECK_SAMPLE, len(others))))
 llm_idx = sorted(set(rules.index[fill_mask]) | set(check_idx))
 t0 = time.time()
@@ -294,6 +277,7 @@ print(f"model calls: {len(llm_idx)} (fill {int(fill_mask.sum())}, check {len(che
 
 def same(a, b) -> bool:
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        # numbers agree within 1% (rounding in the notice text, e.g. 22,000 vs 22000.0)
         return abs(a - b) <= 0.01 * max(abs(a), abs(b), 1)
     return str(a).strip().upper() == str(b).strip().upper()
 
@@ -317,6 +301,7 @@ for i in llm_idx:
         continue                               # the check set measures agreement; its values stay rule values
     for f in FIELDS:
         v = llm_out[i].get(f)
+        # model values only fill gaps; a rule value is never overwritten, except the placeholder "mentioned"
         if pd.isna(merged.at[i, f]) and v is not None or (f == "bid_security_kind" and merged.at[i, f] == "mentioned" and v):
             merged.at[i, f] = v
             source.at[i, f] = "model"
@@ -336,10 +321,12 @@ amounts = (tt.groupBy(F.col("tender_notice_id").alias("notice_id")).agg(F.max("c
            .toPandas().set_index("notice_id").max_contract_usd)
 merged["max_contract_usd"] = merged.notice_id.map(amounts)
 usd = merged.bid_security_currency.eq("USD") & merged.bid_security_amount.notna()
+# only US$ amounts are converted to a share of the award: other currencies would need exchange rates per notice date
 merged["bid_security_pct_of_award"] = np.where(merged.bid_security_kind.eq("percent"), merged.bid_security_percent,
                                                np.where(usd, 100 * merged.bid_security_amount / merged.max_contract_usd, np.nan))
 merged.loc[~merged.bid_security_pct_of_award.between(0.05, 10), "bid_security_pct_of_award"] = np.nan   # parsing errors
 merged["turnover_multiple"] = np.where(merged.turnover_currency.eq("USD"), merged.turnover_amount / merged.max_contract_usd, np.nan)
+# a turnover outside 0.1-20x the award is treated as a parsing error, like the bid-security bounds above
 merged.loc[~merged.turnover_multiple.between(0.1, 20), "turnover_multiple"] = np.nan
 merged["field_sources"] = [json.dumps({f: s for f, s in row.items() if s}) for row in source.to_dict("records")]
 merged["electronic_submission"] = merged.electronic_submission.map(lambda v: None if v is None or pd.isna(v) else bool(v))
@@ -349,6 +336,7 @@ req_schema = ("notice_id string, market_approach string, bid_security_kind strin
               "electronic_submission boolean, pre_bid_meeting string, turnover_amount double, turnover_currency string, "
               "experience_years double, similar_contracts double, max_contract_usd double, bid_security_pct_of_award double, "
               "turnover_multiple double, field_sources string")
+# NaN and pandas NA become None, numpy numbers become float, so createDataFrame accepts the explicit schema
 req_records = [[None if (not isinstance(v, (str, bool, dict, list)) and pd.isna(v)) else
                 (float(v) if isinstance(v, (int, float, np.floating, np.integer)) and not isinstance(v, bool) else v)
                 for v in row] for row in merged[req_cols].itertuples(index=False)]
@@ -396,11 +384,13 @@ def stats_rows(pdf: pd.DataFrame, metric: str, value_col: str, levels: list[list
 
 adv = ifb.select("country_code", "region", "category", "market_approach", "advertising_days").toPandas()
 adv["market_approach"] = adv.market_approach.fillna("unknown")
+# constant level columns become the first part of each peer-group key ("country/KE/CW/national", ...)
 adv["lvl_country"], adv["lvl_region"], adv["lvl_category"] = "country", "region", "category"
 lots = (spark.table(f"{GOLD}.tender_timelines").filter("competition = 'open' AND contract_amount_usd > 0")
         .filter(F.col("procurement_category_code").isin(*CATEGORIES))
         .select(F.col("borrower_country_code").alias("country_code"), "region", F.col("procurement_category_code").alias("category"),
                 F.col("contract_amount_usd").alias("lot_size_usd")).toPandas())
+# contracts do not carry the market approach, so lot-size peers use "any" in that key position
 lots["market_approach"] = "any"
 lots["lvl_country"], lots["lvl_region"], lots["lvl_category"] = "country", "region", "category"
 smp = merged.merge(sample[["notice_id", "category"]], on="notice_id")
@@ -414,6 +404,7 @@ peer_rows = (stats_rows(adv, "advertising_days", "advertising_days",
                            ["lvl_region", "region", "category", "market_approach"], ["lvl_category", "category", "market_approach"]]))
 for metric, col in [("bid_security_percent", "bid_security_percent_v"), ("bid_validity_days", "bid_validity_days"),
                     ("turnover_multiple", "turnover_multiple"), ("experience_years", "experience_years")]:
+    # the 400-notice sample is too small for country or region groups; category only
     peer_rows += stats_rows(smp, metric, col, [["lvl_category", "category", "any"]])
 peers_df = pd.DataFrame(peer_rows)
 n_peers = publish_table(
@@ -462,6 +453,8 @@ for r in pop.itertuples():
         notice.update({k: (None if pd.isna(q[c]) else q[c]) for k, c in
                        [("bid_security_percent", "bid_security_pct_of_award"), ("bid_validity_days", "bid_validity_days"),
                         ("turnover_multiple", "turnover_multiple"), ("experience_years", "experience_years"),
+                        # text-derived requirements exist only for the 400 sampled notices; the other notices get the
+                        # checks that need no text
                         ("electronic_submission", "electronic_submission")]})
     for f in tc.check_tender_design(notice, PEERS):
         flag_rows.append({**f, "notice_id": r.notice_id, "value": str(f["value"]), "reference": str(f["reference"]),
@@ -521,9 +514,11 @@ out = []
 for check, ids in flagged_by_check.items():
     base = pop[evaluable(check)]
     f, nf = base[base.notice_id.isin(ids)], base[~base.notice_id.isin(ids)]
+    # fewer than 5 notices on either side says nothing; skip the check rather than print a noisy difference
     if len(f) < 5 or len(nf) < 5:
         continue
     fb, nb = f.bidders.dropna().to_numpy(), nf.bidders.dropna().to_numpy()
+    # bootstrap the difference in mean bidders: no distribution assumption for small, skewed counts
     boot = [rng.choice(fb, len(fb)).mean() - rng.choice(nb, len(nb)).mean() for _ in range(1000)] if len(fb) and len(nb) else [np.nan]
     out.append({"check": check, "evaluable": len(base), "flagged": len(f),
                 "bidders flagged / not": f"{fb.mean():.2f} / {nb.mean():.2f}",

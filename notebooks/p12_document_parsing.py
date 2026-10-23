@@ -38,25 +38,6 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC <details><summary>Text version of the diagram</summary>
-# MAGIC
-# MAGIC ```
-# MAGIC  Documents API (pdfurl) --> PDF in volume --> PyMuPDF layout: text lines with font size / bold, ruled tables
-# MAGIC                                                 |
-# MAGIC        running headers, page numbers, contents lines dropped; headings -> section path (level 1 / 2), annex flag
-# MAGIC                                                 |
-# MAGIC        tables: cells cleaned, quality gate, caption attached, continued tables merged across page breaks
-# MAGIC                                                 v
-# MAGIC  proc_silver.doc_elements  (heading / text / table, in reading order, with section path and page)
-# MAGIC                                                 |
-# MAGIC        narrative chunks (sentences of ONE section)   table chunks (whole table, or row groups with the header repeated)
-# MAGIC        each prefixed by a contextual header "<project> > <section> > <sub-section> [> <table caption>]"
-# MAGIC                                                 v
-# MAGIC  proc_silver.doc_chunks_v2  (+ GTE embedding; section_id = parent for parent-child retrieval)
-# MAGIC ```
-# MAGIC
-# MAGIC </details>
-# MAGIC
 # MAGIC | Output | Grain | Key |
 # MAGIC |---|---|---|
 # MAGIC | `proc_bronze.parsed_documents` | one PDF read: source URL, pages, tables found and kept, pages without a text layer | `doc_id` |
@@ -68,27 +49,16 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## How it was built and tested
+# MAGIC ## Key design decisions
 # MAGIC
-# MAGIC **Step 1 — Which library, on this cluster?**
-# MAGIC - **Question:** what can read PDF layout on DBR 18 ML without heavy models?
-# MAGIC - **What we found:** no PDF library is installed (PyMuPDF, pdfplumber, pypdf, camelot all missing). PyMuPDF installs from a wheel in seconds and gives, per text line, font size and bold flags, plus `find_tables()` for ruled tables. None of the 10 PADs carries PDF bookmarks, so the section hierarchy has to come from typography.
-# MAGIC - **Decision:** PyMuPDF, pinned. Headings are lines at least 1 pt larger than the body font, or bold, that also look like titles; level 1 for ANNEX / Roman-numbered / all-caps titles, level 2 for "B. Fiduciary"-style sub-headings. OCR is not needed here (section 2 counts pages without a text layer) and is the documented fallback for scanned reports.
+# MAGIC | Decision | Rationale | Evidence |
+# MAGIC |---|---|---|
+# MAGIC | PyMuPDF, pinned; headings from typography (at least 1 pt above the body font, or bold, and title-like; level 1 for ANNEX / Roman-numbered / all-caps, level 2 for "B. Fiduciary"-style); OCR as the documented fallback for scanned reports | No PDF library is installed and no bookmarks exist; PyMuPDF gives font size, bold flags and `find_tables()` without heavy models | PyMuPDF, pdfplumber, pypdf and camelot are all missing on DBR 18 ML; PyMuPDF installs from a wheel in seconds; none of the 10 PADs carries PDF bookmarks; section 2 counts pages without a text layer |
+# MAGIC | "lines" table strategy plus a quality gate (at least 2 x 2 after removing empty rows and columns, 40% of cells filled, no paragraph-sized cells in a two-column frame); tables split by a page break merged, repeated header row dropped | The "text" strategy over-detects; "lines" also catches layout frames | On the first PAD the text strategy turned every page of prose into a 40-row "table"; the lines strategy found the real tables but also the datasheet box, acronym lists and framed paragraphs |
+# MAGIC | Dot-leader lines dropped as contents entries; an un-numbered bold heading needs 2+ words and a capital first letter; template codes removed; one document's section tree printed in section 3 | Initial heading rules were too generous | Contents lines ("III. IMPLEMENTATION ARRANGEMENTS ......"), single bold table labels ("Total", "Annual") and Word template codes (`BASIC_INFO_TABLE`, `RESULT_FRAME_TBL_PDO`) appeared as headings |
+# MAGIC | Table rows identified by distinctive tokens (in at most 3 of the document's old chunks): intact = one old chunk holds 90%; split = only several chunks together; missing = dropped; ordinary narrative sentences as a control | Matching on all words labels almost every row "intact" | Words like "procurement" or "2021" occur in every chunk |
 # MAGIC
-# MAGIC **Step 2 — Which table detector?**
-# MAGIC - **Question:** PyMuPDF offers a "lines" strategy (ruling lines) and a "text" strategy (aligned words).
-# MAGIC - **What we found:** on the first PAD the text strategy turned every page of prose into a 40-row "table"; the lines strategy found the real tables (costs, thresholds, procurement packages, risk matrices) but also layout frames: the datasheet drawn as one big box, acronym lists, paragraphs inside a frame.
-# MAGIC - **Decision:** lines strategy plus a quality gate (at least 2 x 2 after removing empty rows and columns, 40% of cells filled, no paragraph-sized cells in a two-column frame). Tables that a page break cuts in two (same columns, at the top of the next page, no caption of their own) are merged, and a repeated header row is dropped.
-# MAGIC
-# MAGIC **Step 3 — The first heading rules were too generous**
-# MAGIC - **Question:** do the detected headings form a readable section tree?
-# MAGIC - **What we found:** the first run took contents-page lines ("III. IMPLEMENTATION ARRANGEMENTS ......") and single bold table labels in the datasheet ("Total", "Annual") for headings, and Word template codes (`BASIC_INFO_TABLE`, `RESULT_FRAME_TBL_PDO`) leaked into headings.
-# MAGIC - **Decision:** dot-leader lines are dropped as contents entries, an un-numbered bold heading needs 2+ words and a capital first letter, template codes are removed. The section tree of one document is printed in section 3 so the remaining errors are visible.
-# MAGIC
-# MAGIC **Step 4 — A fair test of "the old chunks broke the tables"**
-# MAGIC - **Question:** how do we tell, for a table row found in the PDF, whether the plain-text chunks kept it whole?
-# MAGIC - **What we found:** matching rows by all their words says almost every row is "intact", because words like "procurement" or "2021" occur in every chunk.
-# MAGIC - **Decision:** a row is identified by its **distinctive** tokens (words and numbers that occur in at most 3 of the document's old chunks). Intact = one old chunk holds 90% of them; split = only several chunks together do; missing = dropped. As a control the same test is run on ordinary narrative sentences, which the old chunker handled well.
+# MAGIC Full reasoning: docs/decision_log.md
 
 # COMMAND ----------
 
@@ -129,6 +99,7 @@ from proc_intel import doc_parse as dp
 
 N_DOCS, PER_REGION = 10, 2
 PARSER_VERSION = "p12-v1"
+# same sizes as the old chunker, so the comparison in section 5 measures structure, not chunk size
 TARGET_WORDS, MAX_WORDS, TABLE_MAX_WORDS = 260, 320, 300
 DOCS_URL = "https://search.worldbank.org/api/v3/wds"
 PDF_DIR = f"{RAW_VOLUME}/doc_parse/pdf"
@@ -154,8 +125,10 @@ old = spark.table(OLD_CHUNKS).filter("doc_type = 'Project Appraisal Document'")
 per_doc = (old.groupBy("doc_id", "project_id", "project_name", "region", "approval_fy")
            .agg(F.count("*").alias("old_chunks"), F.sum("n_words").alias("old_words"),
                 F.max(F.lower("chunk_text").contains("procurement plan").cast("int")).alias("mentions_pp")))
+# FY2018+ PADs follow the current template; 30,000+ words is roughly 100 pages, the long reports this is about
 cand = per_doc.filter("approval_fy >= 2018 AND old_words >= 30000 AND mentions_pp = 1")
 docs = (cand.withColumn("_r", F.row_number().over(Window.partitionBy("region").orderBy(F.sha2("doc_id", 256))))
+        # at most 2 per region so ten documents are not all from one template variant
         .filter(f"_r <= {PER_REGION}").orderBy(F.sha2("doc_id", 256)).limit(N_DOCS).drop("_r", "mentions_pp").toPandas())
 print(f"candidate PADs: {cand.count()}; selected: {len(docs)}")
 display(docs)
@@ -170,6 +143,7 @@ def fetch_pdf(doc_id: str) -> dict:
     path = f"{PDF_DIR}/{doc_id}.pdf"
     meta = HTTP.get(DOCS_URL, params={"format": "json", "id": doc_id, "fl": "id,pdfurl"}, timeout=60).json()
     url = next(iter(v for k, v in meta["documents"].items() if k != "facets")).get("pdfurl", "").replace("http://", "https://")
+    # PDFs are downloaded once; a re-run parses the copy in the volume
     if not os.path.exists(path):
         resp = HTTP.get(url, timeout=300)
         resp.raise_for_status()
@@ -208,12 +182,14 @@ def page_lines(page) -> list[dict]:
             if not spans:
                 continue
             n = sum(len(s["text"].strip()) for s in spans)
+            # flag bit 16 is PyMuPDF's bold flag; some fonts only say "Bold" in their name, so both are checked
             bold = sum(len(s["text"].strip()) for s in spans if s["flags"] & 16 or "Bold" in s["font"]) >= 0.6 * n
             out.append({"text": dp.clean_line("".join(s["text"] for s in ln["spans"])), "size": max(s["size"] for s in spans),
                         "bold": bold, "bbox": ln["bbox"], "block": b["number"], "chars": n})
     return [l for l in out if l["text"]]
 
 
+# a line belongs to a table when its centre lies inside the table box (2 pt slack for rounding)
 def _inside(bbox, rect, pad=2) -> bool:
     cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
     return rect[0] - pad <= cx <= rect[2] + pad and rect[1] - pad <= cy <= rect[3] + pad
@@ -226,6 +202,7 @@ def extract_elements(doc, doc_id: str) -> tuple[list[dict], dict]:
     elements, prev_table = [], None
     stats = collections.Counter(pages=doc.page_count)
     for pno, page in enumerate(doc, start=1):
+        # almost no text but an image: probably a scanned page that would need OCR; counted, not parsed
         if sum(l["chars"] for l in pages[pno - 1]) < 50 and page.get_images():
             stats["pages_without_text"] += 1
         tables = []
@@ -233,20 +210,28 @@ def extract_elements(doc, doc_id: str) -> tuple[list[dict], dict]:
             stats["tables_found"] += 1
             rows = dp.clean_table(t.extract())
             q = dp.table_quality(rows)
+            # quality gate: the "lines" detector also returns layout frames (datasheet boxes, two-column text) that are
+            # not tables
             if dp.is_data_table(q):
                 tables.append({"bbox": t.bbox, "rows": rows, "q": q})
         items = [("line", l["bbox"][1], l) for l in pages[pno - 1]
+                 # lines inside a kept table are skipped, or the table's text would appear twice (as table and as prose)
                  if not dp.is_noise_line(l["text"], running) and not any(_inside(l["bbox"], t["bbox"]) for t in tables)]
         items += [("table", t["bbox"][1], t) for t in tables]
         cur = None
+        # lines and tables in one stream ordered by their top edge: reading order for single-column pages
         for kind, _, it in sorted(items, key=lambda x: x[1]):
             if kind == "table":
                 cur = None
+                # a caption counts only if it is printed just above the table (within 80 pt on the same page)
                 caps = [e for e in elements[-4:] if e["kind"] == "caption" and e["page"] == pno
                         and 0 <= it["bbox"][1] - e["y1"] <= 80]
                 caption = caps[-1]["text"] if caps else None
+                # continuation: same column count, at the top of the next page, nothing in between and no caption of its
+                # own
                 if (prev_table is not None and elements and elements[-1] is prev_table and prev_table["page"] == pno - 1
                         and prev_table["n_cols"] == it["q"]["n_cols"] and it["bbox"][1] < 0.2 * page.rect.height and not caption):
+                    # a repeated header row on the continued page is dropped
                     rows = it["rows"][1:] if it["rows"][0] == prev_table["rows"][0] else it["rows"]
                     prev_table.update(rows=prev_table["rows"] + rows, n_rows=len(prev_table["rows"]) + len(rows), continued=True)
                     stats["tables_merged_across_pages"] += 1
@@ -273,6 +258,7 @@ def extract_elements(doc, doc_id: str) -> tuple[list[dict], dict]:
             else:
                 cur = {"kind": "text", "page": pno, "text": text, "block": it["block"], "y1": it["bbox"][3]}
                 elements.append(cur)
+    # captions have done their job (attached to their tables) and are not kept as separate elements
     elements = dp.assign_sections([e for e in elements if e["kind"] != "caption"])
     for i, e in enumerate(elements):
         e["element_index"] = i
@@ -353,6 +339,7 @@ el_rows = []
 for d, (els, _) in parsed.items():
     for e in els:
         is_table = e["kind"] == "table"
+        # tables are stored as markdown so the element text stays readable and the header stays attached to the rows
         text = (dp.table_markdown(e["rows"][:dp.header_rows(e["rows"])], e["rows"][dp.header_rows(e["rows"]):])
                 if is_table else e["text"])
         el_rows.append({"doc_id": d, "element_index": e["element_index"], "kind": e["kind"], "level": e.get("level"),
@@ -382,7 +369,7 @@ display(E.groupBy("kind").agg(F.count("*").alias("elements"), F.sum(F.col("is_an
 # MAGIC
 # MAGIC **What:**
 # MAGIC 1. **Shape:** chunk counts, words, chunk types, annex share, for the old (`silver.rag_chunks`) and the new chunks.
-# MAGIC 2. **Table rows:** every body row of every kept table is looked up in the document's old chunks with `dp.locate_row` on its distinctive tokens: intact (one chunk), split (several chunks), missing (dropped by the old prose filter or lost in flattening). For intact rows we also check whether the table's header words are in the same old chunk.
+# MAGIC 2. **Table rows:** every body row of every kept table is looked up in the document's old chunks with `dp.locate_row` on its distinctive tokens: intact (one chunk), split (several chunks), missing (dropped by the old prose filter or lost in flattening). For intact rows, the check also tests whether the table's header words are in the same old chunk.
 # MAGIC 3. **Control:** 150 random narrative sentences per document go through the same test.
 # MAGIC
 # MAGIC **Why:** the claim "plain-text chunking breaks tables" should be a number, and the control shows that the test itself does not invent losses: if narrative sentences come out intact, the losses on table rows are real.
@@ -416,14 +403,19 @@ for d, (els, _) in parsed.items():
             n_head = dp.header_rows(e["rows"])
             head = dp.distinctive_tokens(dp.row_tokens([c for h in e["rows"][:n_head] for c in h]), toks)
             for r in e["rows"][n_head:]:
+                # only tokens rare among this document's old chunks identify a row; words like "procurement" occur
+                # everywhere
                 dt = dp.distinctive_tokens(dp.row_tokens(r), toks)
                 state = dp.locate_row(dt, toks, min_tokens=2)
                 with_head = None
+                # for an intact row, check whether its column header landed in the same old chunk (the numbers mean
+                # little without it)
                 if state == "intact" and len(head) >= 2:
                     best = max(range(len(toks)), key=lambda i: len(dt & toks[i]))
                     with_head = len(head & toks[best]) >= 0.5 * len(head)
                 row_res.append({"doc_id": d, "table_id": e["table_id"], "state": state, "header_in_same_chunk": with_head})
     sents = [s for e in els if e["kind"] == "text" for s in dp.split_sentences(e["text"]) if len(s.split()) >= 12]
+    # control: narrative sentences through the same test; if they come out intact, the test is not inventing losses
     random.Random(7).shuffle(sents)
     for s in sents[:150]:
         ctrl[dp.locate_row(dp.distinctive_tokens(dp.row_tokens([s]), toks), toks, min_tokens=2)] += 1
@@ -464,6 +456,7 @@ print(f"tables with testable rows: {per_table.size}; {per_table.value_counts().t
 # COMMAND ----------
 
 _HOST = spark.conf.get("spark.databricks.workspaceUrl")
+# the notebook's own short-lived token; nothing is stored or printed
 _TOKEN = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
 EMBED_TEXTS_PER_S = 10
 _clock, _lock, USAGE = {"t": 0.0}, threading.Lock(), collections.Counter()
@@ -476,6 +469,7 @@ def _invoke(endpoint: str, body: dict, timeout: int = 180, max_retries: int = 12
                               headers={"Authorization": f"Bearer {_TOKEN}"}, json=body, timeout=timeout)
             if r.status_code == 200:
                 return r.json()
+            # only rate limits and server errors are retried; a 4xx means a bad request and retrying will not help
             retry, err = r.status_code == 429 or r.status_code >= 500, f"HTTP {r.status_code}: {r.text[:300]}"
         except requests.exceptions.RequestException as e:
             retry, err = True, f"{type(e).__name__}: {str(e)[:200]}"
@@ -491,6 +485,7 @@ def embed_texts(texts: list[str], batch_size: int = 8) -> np.ndarray:
         batch = list(texts[i:i + batch_size])
         with _lock:
             wait = _clock["t"] - time.time()
+            # a shared pacing clock: each batch books its slot, so the rate holds even across threads
             _clock["t"] = max(_clock["t"], time.time()) + len(batch) / EMBED_TEXTS_PER_S
         if wait > 0:
             time.sleep(wait)
@@ -498,6 +493,7 @@ def embed_texts(texts: list[str], batch_size: int = 8) -> np.ndarray:
         USAGE["embed_tokens"] += (resp.get("usage") or {}).get("prompt_tokens", 0)
         out.extend(d["embedding"] for d in sorted(resp["data"], key=lambda d: d["index"]))
     X = np.asarray(out, dtype="float32")
+    # unit vectors, so a dot product is the cosine (as for the stored old embeddings)
     return X / np.linalg.norm(X, axis=1, keepdims=True)
 
 
@@ -508,6 +504,8 @@ print(f"embedded {len(newc)} new chunks in {time.time() - t0:.0f} s ({USAGE['emb
 
 # COMMAND ----------
 
+# written by hand from facts that sit in tables of these PADs; the third value is the string a correct chunk must
+# contain
 QUESTIONS = [
     ("31084172", "What is the prior review threshold for works contracts in the DRC Multisectoral Nutrition and Health Project?", "5,000,000"),
     ("31084172", "How much of the credit is allocated to cash transfers in the DRC nutrition project's eligible expenditure categories?", "4,350,000"),
@@ -569,6 +567,7 @@ display(pd.DataFrame([{"chunks": n, "scope": s, **{f"hit@{k}": f"{hits(f'{n}_ran
 
 # COMMAND ----------
 
+# ablation: the same chunks without their contextual header, to see how much retrieval depends on it
 text_only = embed_texts(list(newc.text))
 abl = [first_hit(qvecs[qi], text_only, newc.text.values, newc.doc_id.values, q.doc_id, q.answer, True)
        for qi, q in qdf.iterrows()]
@@ -593,6 +592,7 @@ chunk_cols = ["chunk_id", "doc_id", "project_id", "chunk_index", "chunk_type", "
 chunk_schema = ("chunk_id string, doc_id string, project_id string, chunk_index int, chunk_type string, section_path string, "
                 "section_id string, is_annex boolean, page_start int, page_end int, table_id string, row_start int, row_end int, "
                 "context_header string, text string, embed_text string, n_words int, text_hash string, embedding array<float>")
+# pandas turns missing ints into NaN floats; Spark's int columns need None
 _int = lambda v: None if v is None or (isinstance(v, float) and np.isnan(v)) else int(v)
 records = [[_int(r[c]) if c in ("chunk_index", "page_start", "page_end", "row_start", "row_end", "n_words") else
             (None if c == "table_id" and not isinstance(r[c], str) else r[c]) for c in chunk_cols] for r in newc.to_dict("records")]

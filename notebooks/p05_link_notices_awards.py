@@ -37,17 +37,6 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC <details><summary>Text version of the diagram</summary>
-# MAGIC
-# MAGIC ```
-# MAGIC  tender notice ---------------> bid deadline ------------> award notification ----> contract signed
-# MAGIC  (IFB / REOI / IFP)             (submission_deadline)      (award notice HTML)       (awards feed)
-# MAGIC     |<- advertising period ->|<----------- evaluation, award and signature ------------->|
-# MAGIC     |<------------------------------ days_notice_to_signing ------------------------------>|
-# MAGIC ```
-# MAGIC
-# MAGIC </details>
-# MAGIC
 # MAGIC Match tiers, strongest first, always **within the same project**:
 # MAGIC
 # MAGIC | Tier | Rule |
@@ -62,32 +51,17 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## How it was built and tested
+# MAGIC ## Key design decisions
 # MAGIC
-# MAGIC **Step 1 — How far does the exact reference go?**
-# MAGIC - **Question:** what share of contracts can be matched to a tender notice by reference alone?
-# MAGIC - **What we found:** exact project + reference matches found tender notices for about 61,500 contracts; the STEP activity id added only about 2,300 more (most STEP references are copied unchanged). About 6,000 links had the notice published **after** the contract was signed: a reference re-used for a later round, not the tender of this contract.
-# MAGIC - **Decision:** keep both tiers; links where the notice comes after signing are stored but flagged, and never used for durations.
+# MAGIC | Decision | Rationale | Evidence |
+# MAGIC |---|---|---|
+# MAGIC | Both exact tiers kept (project + reference, and STEP activity id); links where the notice is published after signing are stored, flagged, and never used for durations | A notice after signing indicates a reference re-used for a later round, not the tender of this contract | Exact project + reference matches found tender notices for about 61,500 contracts; the STEP id added only about 2,300 more; about 6,000 links had the notice published after signing |
+# MAGIC | The similarity ratio replaced by a structural rule: references must be equal after deleting one block of 1-3 letters (never digits) from the longer one, implemented as an equi-join on generated deletion keys | Ratio >= 0.9 also matched different packages one character apart; the rule needs no pairwise comparison | Lot markers ("17B/W/DNAAS/2018" for tender "17/W/DNAAS/2018") versus false matches ("TCP/CON/QCBS/B1/G" vs ".../B1/D", "ENU-02-22" vs "ENU-03-22") |
+# MAGIC | Description matching only for contracts without a STEP id, with >= 0.8 similarity and a clear margin over the second-best notice; the tier is measured separately in the hand audit | Descriptions are the only bridge when the contract reference is the borrower's own number, but they confuse near-identical packages | Even at >= 0.9, wrong-package matches occurred ("Civil Work Package (CWP) 7" vs "CWP 8", "Fish Landing in Brgy. Taruk" vs "Brgy. Tapian"); bridging matches read correctly ("Audit externe des comptes du projet PRAPS-II NE ...") |
+# MAGIC | An award link is kept when the notice's awarded supplier id is one of the contract's suppliers (confirmed), or when the pair is one-to-one and the notice names no awardee | One reference is shared by all lots and call-offs of a tender | Reference-only matching produced about 980,000 award-notice/contract pairs (section 3); one reference appears on 188 contracts; the confirmed share among one-to-one pairs with a named awardee is the automatic precision check |
+# MAGIC | Coverage reported per competition level; the phase 2 timeline model to be trained on openly competed contracts | Most contracts are never publicly advertised | Request for Quotations, direct selection and individual consultants make up about 80% of contracts |
 # MAGIC
-# MAGIC **Step 2 — Fuzzy reference matching was too loose**
-# MAGIC - **Question:** can a string-similarity threshold catch the remaining typos?
-# MAGIC - **What we found:** at ratio >= 0.9 most extra matches were lot markers ("17B/W/DNAAS/2018" for tender "17/W/DNAAS/2018"), but some were different packages one character apart ("TCP/CON/QCBS/B1/G" vs ".../B1/D", "ENU-02-22" vs "ENU-03-22").
-# MAGIC - **Decision:** replace the ratio with an exact structural rule: the references must be equal after deleting one block of 1-3 **letters** (never digits) from the longer one. Implemented as an equi-join on generated deletion keys, so no pairwise comparison is needed.
-# MAGIC
-# MAGIC **Step 3 — Description matching needs a guard**
-# MAGIC - **Question:** for contracts with no matching reference, does the description find the tender?
-# MAGIC - **What we found:** even at similarity >= 0.9, descriptions matched the wrong package where one project tenders near-identical packages ("Civil Work Package (CWP) 7" vs "CWP 8", "Fish Landing in Brgy. Taruk" vs "Brgy. Tapian"). Where the contract reference is the borrower's own contract number (no STEP id) and the notice carries the STEP reference, the description is the only bridge, and the matches read correctly ("Audit externe des comptes du projet PRAPS-II NE ...").
-# MAGIC - **Decision:** use descriptions only for contracts **without** a STEP id, require >= 0.8 similarity and a clear margin over the second-best notice, and measure the tier separately in the hand audit.
-# MAGIC
-# MAGIC **Step 4 — Award notices share references across lots**
-# MAGIC - **Question:** can award notices be linked the same way?
-# MAGIC - **What we found:** by reference alone, award notices and contracts formed about 980,000 pairs (section 3 shows the counts): one reference is shared by all lots and call-offs of a tender (one reference appears on 188 contracts).
-# MAGIC - **Decision:** an award link is kept when the notice's awarded supplier id is one of the contract's suppliers (confirmed), or when the pair is one-to-one and the notice names no awardee (nothing contradicts it). Among one-to-one pairs whose notice names an awardee, the share confirmed is the automatic precision check for reference matching.
-# MAGIC
-# MAGIC **Step 5 — What can be timed?**
-# MAGIC - **Question:** which contracts should have a tender notice at all?
-# MAGIC - **What we found:** most contracts are never publicly advertised: Request for Quotations, direct selection and individual consultants make up about 80% of contracts.
-# MAGIC - **Decision:** coverage is reported per competition level, and the timeline model in phase 2 should be trained on openly competed contracts, where the notice is the norm.
+# MAGIC Full reasoning: docs/decision_log.md
 
 # COMMAND ----------
 
@@ -123,12 +97,16 @@ from proc_intel.references import TIER_EXACT, TIER_STEP, TIER_VARIANT, variant_k
 from proc_intel.similarity import wilson_interval
 
 TIER_DESCRIPTION = "description"
+# lower = stronger evidence; used to keep the best tier when one pair is found by several joins
 TIER_ORDER = {TIER_EXACT: 1, TIER_STEP: 2, TIER_VARIANT: 3, TIER_DESCRIPTION: 4}
 TENDER_TYPES = ["Invitation for Bids", "Request for Expression of Interest", "Invitation for Prequalification"]
+# 0.9 still matched sibling packages ("CWP 7" vs "CWP 8"), so a looser floor plus a clear margin over the runner-up
+# works better
 DESCRIPTION_MIN = 0.80
 DESCRIPTION_MARGIN = 0.10
 MAX_TENDER_DAYS = 3 * 365          # a tender notice older than this before signing is not the same round
 AUDIT_PATH = os.path.join(os.path.dirname(SRC_DIR), "data", "tender_link_audit.csv")
+# more labels for the weaker tiers, where the precision is actually in doubt
 AUDIT_PER_TIER = {TIER_EXACT: 15, TIER_STEP: 10, TIER_VARIANT: 8, TIER_DESCRIPTION: 12}
 variant_keys_udf = as_udf(variant_keys, ArrayType(StringType()))
 
@@ -155,12 +133,14 @@ n_keys = notices.select("notice_id", "notice_type", "project_id", "reference_nor
 
 # COMMAND ----------
 
+# every tier joins inside the same project: references like "GO-01" repeat across projects
 exact = (c_keys.join(n_keys, ["project_id", "reference_norm"])
          .select("notice_id", "contract_id", F.lit(TIER_EXACT).alias("match_tier")))
 step = (c_keys.filter("step_activity_id IS NOT NULL").join(n_keys, ["project_id", "step_activity_id"])
         .select("notice_id", "contract_id", F.lit(TIER_STEP).alias("match_tier")))
 c_var = c_keys.select("contract_id", "project_id", F.explode(variant_keys_udf("reference_norm")).alias("key"))
 n_var = n_keys.select("notice_id", "project_id", F.explode(variant_keys_udf("reference_norm")).alias("key"))
+# both directions: either side can carry the extra lot / re-issue letters (e.g. "17B/W/..." vs "17/W/...")
 variant = (c_var.join(n_keys.withColumnRenamed("reference_norm", "key"), ["project_id", "key"])
            .select("notice_id", "contract_id")
            .union(n_var.join(c_keys.withColumnRenamed("reference_norm", "key"), ["project_id", "key"])
@@ -180,6 +160,7 @@ reference_links = (exact.union(step).union(variant)
                    .join(c_keys.select("contract_id", "signing_date"), "contract_id")
                    .withColumn("link_role", F.when(F.col("notice_type").isin(TENDER_TYPES), "tender")
                                .when(F.col("notice_type") == "Contract Award", "award"))
+                   # other notice types (general procurement notices, ...) do not advertise or award a single contract
                    .filter("link_role IS NOT NULL")
                    .cache())
 display(reference_links.groupBy("link_role", "match_tier").agg(F.count("*").alias("links"),
@@ -198,7 +179,10 @@ display(reference_links.groupBy("link_role", "match_tier").agg(F.count("*").alia
 
 # COMMAND ----------
 
+# a notice published after signing is a reused reference, not this contract's tender
 tender_linked = reference_links.filter("link_role = 'tender' AND notice_date <= signing_date").select("contract_id").distinct()
+# only contracts without a STEP id: with one, a missing reference match is a real gap and descriptions mostly find
+# siblings
 open_unlinked = (contracts.filter("competition = 'open' AND step_activity_id IS NULL")
                  .join(tender_linked, "contract_id", "left_anti")
                  .select("contract_id", "project_id", "procurement_category_code", "signing_date", "contract_description"))
@@ -208,16 +192,20 @@ candidates = (open_unlinked.join(tender_notices, ["project_id", "procurement_cat
               .filter(F.datediff("signing_date", "notice_date").between(0, MAX_TENDER_DAYS))
               .filter("contract_description IS NOT NULL AND bid_description IS NOT NULL")
               .select("contract_id", "notice_id", "contract_description", "bid_description")
+              # candidate set is small after the project/category/date filters, so the TF-IDF scoring runs on the driver
               .toPandas())
 vectorizer = TfidfVectorizer(analyzer="word", ngram_range=(1, 2), min_df=2, sublinear_tf=True, strip_accents="unicode")
+# fit on distinct texts so a description repeated across many candidate pairs does not skew the idf weights
 vectorizer.fit(pd.concat([candidates["contract_description"], candidates["bid_description"]]).drop_duplicates())
 a = vectorizer.transform(candidates["contract_description"])
 b = vectorizer.transform(candidates["bid_description"])
+# row-wise dot product of L2-normalised vectors = cosine for each (contract, notice) pair, without a full matrix
 candidates["description_similarity"] = np.asarray(a.multiply(b).sum(axis=1)).ravel()
 ranked = candidates.sort_values(["contract_id", "description_similarity"], ascending=[True, False])
 ranked["rank"] = ranked.groupby("contract_id").cumcount()
 second = ranked[ranked["rank"] == 1].set_index("contract_id")["description_similarity"]
 best = ranked[ranked["rank"] == 0].set_index("contract_id")
+# a contract with a single candidate gets the full score as margin
 best["margin"] = best["description_similarity"] - second.reindex(best.index).fillna(0.0)
 accepted = best[(best["description_similarity"] >= DESCRIPTION_MIN) & (best["margin"] >= DESCRIPTION_MARGIN)].reset_index()
 print(f"open contracts without STEP id or tender link: {open_unlinked.count():,} | with a candidate: {best.shape[0]:,} | "
@@ -242,6 +230,7 @@ description_links = (spark.createDataFrame(accepted[["notice_id", "contract_id",
 awarded = spark.table(f"{SILVER}.notice_bidders").filter("role = 'awarded'").select("notice_id", "supplier_id")
 cs_ids = spark.table(f"{SILVER}.contract_suppliers").select("contract_id", "supplier_id")
 award_ref = reference_links.filter("link_role = 'award'")
+# the awarded firm's id in the notice HTML must be one of the contract's suppliers: independent of the reference text
 confirmed = (award_ref.join(awarded, "notice_id").join(cs_ids, ["contract_id", "supplier_id"])
              .select("notice_id", "contract_id").distinct().withColumn("supplier_confirmed", F.lit(True)))
 named = awarded.select("notice_id").distinct().withColumn("notice_names_awardee", F.lit(True))
@@ -255,6 +244,7 @@ one_to_one_named = award_scored.filter("one_to_one AND notice_names_awardee")
 rate = one_to_one_named.agg(F.avg(F.col("supplier_confirmed").cast("int"))).first()[0]
 print(f"award links by reference: {award_ref.count():,} | one-to-one pairs whose notice names an awardee: "
       f"{one_to_one_named.count():,}, supplier confirmed in {rate:.1%}")
+# one-to-one pairs whose notice names a different awardee are dropped: the id contradicts the reference
 award_links = award_scored.filter("supplier_confirmed OR (one_to_one AND NOT notice_names_awardee)").select(
     "notice_id", "contract_id", "match_tier", "notice_type", "notice_date", "signing_date", "link_role", "supplier_confirmed")
 display(award_scored.groupBy("one_to_one", "notice_names_awardee", "supplier_confirmed").count()
@@ -277,6 +267,7 @@ tender_links = (reference_links.filter("link_role = 'tender'")
                 .withColumn("supplier_confirmed", F.lit(None).cast("boolean")))
 links = (tender_links.unionByName(award_links.withColumn("description_similarity", F.lit(None).cast("double")))
          .withColumn("days_notice_to_signing", F.datediff("signing_date", "notice_date"))
+         # links with the notice after signing are kept for the graph but flagged, and never used for durations
          .withColumn("notice_before_signing", F.col("days_notice_to_signing") >= 0)
          .select("notice_id", "contract_id", "link_role", "match_tier", "description_similarity", "supplier_confirmed",
                  "notice_before_signing", "days_notice_to_signing"))
@@ -314,6 +305,7 @@ display(L.groupBy("link_role", "match_tier").agg(F.count("*").alias("links"), F.
 sample = (L.filter("link_role = 'tender' AND notice_before_signing")
           .join(notices.select("notice_id", "bid_reference", "bid_description"), "notice_id")
           .join(contracts.select("contract_id", "borrower_reference", "contract_description"), "contract_id")
+          # hash order: a sample that looks random but is the same on every run, so the saved labels still line up
           .withColumn("audit_order", F.sha1(F.concat_ws("#", "notice_id", "contract_id")))
           .withColumn("rn", F.row_number().over(Window.partitionBy("match_tier").orderBy("audit_order")))
           .toPandas())
@@ -356,6 +348,8 @@ else:
 tender_first = (L.filter("link_role = 'tender' AND notice_before_signing")
                 .join(notices.select("notice_id", "notice_type", "notice_date", "submission_deadline"), "notice_id")
                 .withColumn("_rank", tier_rank[F.col("match_tier")])
+                # earliest notice first (the original advertisement; later ones are re-advertisements), strongest tier
+                # on ties
                 .withColumn("_rn", F.row_number().over(Window.partitionBy("contract_id").orderBy("notice_date", "_rank")))
                 .groupBy("contract_id").agg(
                     F.min(F.when(F.col("_rn") == 1, F.col("notice_id"))).alias("tender_notice_id"),
@@ -369,6 +363,7 @@ award_first = (L.filter("link_role = 'award'")
                .groupBy("contract_id").agg(F.min("award_notification_date").alias("award_notification_date"),
                                            F.min("notice_date").alias("award_notice_date"),
                                            F.max("n_named_firms").alias("n_named_firms_in_award_notice")))
+# leakage guard: year + 1 means a contract signed in year Y gets the indicators of Y-1, already published at signing
 wgi = spark.table(COUNTRY_YEAR).select(
     F.col("country_iso2").alias("borrower_country_code"), (F.col("year") + 1).alias("signing_year"),
     "wgi_gov_effectiveness", "wgi_control_corruption", "wgi_rule_of_law", "wgi_regulatory_quality", "log_gdp_pc")
@@ -384,6 +379,7 @@ timelines = (contracts
     .withColumn("days_deadline_to_signing", F.datediff("signing_date", "submission_deadline"))
     .withColumn("days_notice_to_signing", F.datediff("signing_date", "tender_notice_date"))
     .withColumn("days_award_notice_to_signing", F.datediff("signing_date", "award_notification_date"))
+    # implausible durations are labelled, not dropped, so the reason stays visible in the gold table
     .withColumn("timing_gap", F.when(F.col("tender_notice_date").isNull(),
                                      F.when(F.col("competition") == "open", "open method, no tender notice linked")
                                      .otherwise("method not normally advertised"))
@@ -436,7 +432,7 @@ print("tender_timelines:", n_timelines)
 # MAGIC - duration quantiles (days, notice -> signing) by category for openly competed, timed contracts;
 # MAGIC - coverage by signing year.
 # MAGIC
-# MAGIC **Why:** the honest denominator matters: "40% of contracts are timed" means something different when 80% of contracts were never advertised.
+# MAGIC **Why:** the correct denominator matters: "40% of contracts are timed" means something different when 80% of contracts were never advertised.
 
 # COMMAND ----------
 
@@ -487,6 +483,7 @@ checks = [
     ("notice_contract_links", "orphan contract_id", orphan_count(L, "contract_id", C, "contract_id"), "== 0"),
     ("tender_timelines", "rows vs contracts", tl.count() - C.count(), "== 0"),
     ("tender_timelines", "duplicate contract_id", duplicate_keys(tl, ["contract_id"]), "== 0"),
+    # can only fail if the "notice before signing" filter above is broken
     ("tender_timelines", "timed rows with negative notice->signing", timed.filter("days_notice_to_signing < 0").count(), "== 0"),
     ("tender_timelines", "contracts with a tender link", tl.filter("tender_notice_id IS NOT NULL").count(), "info"),
     ("tender_timelines", "contracts timed", timed.count(), "info"),

@@ -68,6 +68,7 @@ def strip_country_name(normalised: str, country_name: str | None, country_code: 
         if phrase:
             text = re.sub(rf"\b{re.escape(phrase)}\b", " ", text)
     tokens = text.split()
+    # the code only as the last word ("ACME BUILDERS NG"); elsewhere two letters are more likely initials
     if country_code and len(tokens) > 1 and tokens[-1] == country_code.upper():
         tokens = tokens[:-1]
     return " ".join(tokens) or normalised
@@ -94,6 +95,8 @@ def prepare_records(records: pd.DataFrame, rules: MatchRules = MatchRules(),
     Extra columns (e.g. a usage weight) are kept.
     """
     country_names = country_names or {}
+    # positions become node ids in the union-find, and the first record of a component names its entity: sort first so
+    # ids are stable across runs
     out = records.sort_values(["supplier_id", "name", "country_code"], na_position="last").reset_index(drop=True)
     out["block"] = out["country_code"].fillna(NO_COUNTRY)
     out["normalised"] = out["name"].map(normalise_supplier_name)
@@ -108,6 +111,7 @@ def prepare_records(records: pd.DataFrame, rules: MatchRules = MatchRules(),
         names = out.loc[idx, "comparison"]
         index = token_index(names)
         token_df = {t: len(v) for t, v in index.items()}
+        # a floor of 10 names for small countries, 0.5% of the distinct names for large ones
         generic_df = max(rules.generic_min_df, rules.generic_share * names.nunique())
         ambiguous.loc[idx] = [is_ambiguous_person_name(name, comp, index, rules.ambiguous_max_others)
                               for name, comp in zip(out.loc[idx, "name"], names, strict=True)]
@@ -136,6 +140,8 @@ def score_candidates(records: pd.DataFrame, rules: MatchRules = MatchRules()) ->
     i, j, cosine = candidate_pairs(matrix, records["block"].tolist(), rules.candidate_floor)
     pairs = pd.DataFrame({"i": i, "j": j})
     named = records[records["key"] != ""]
+    # identical keys are chained (n-1 pairs instead of n^2: one link each is enough to connect them);
+    # shared ids need every pair, because each pair is checked for similar names separately
     extra = _within_groups(named, ["block", "key"], chain=True) | _within_groups(records, ["supplier_id"], chain=False)
     extra = pd.DataFrame(sorted(extra), columns=["i", "j"])
     pairs = pd.concat([pairs, extra], ignore_index=True).drop_duplicates(["i", "j"], ignore_index=True)
@@ -158,12 +164,16 @@ def score_candidates(records: pd.DataFrame, rules: MatchRules = MatchRules()) ->
 
 def decide(pairs: pd.DataFrame, rules: MatchRules = MatchRules()) -> pd.Series:
     """Rule that links each pair ('same_id' / 'exact_name' / 'fuzzy_name'), or None."""
+    # a shared id links only names that look alike; otherwise one id carrying partner firms' names would chain them
+    # together
     same_id = pairs["same_id"] & ((pairs["cosine"] >= rules.same_id_min_cosine) | pairs["acronym"])
+    # same-id pairs are decided by the rule above only; name rules apply to pairs of different ids
     usable = ~pairs["ambiguous"] & ~pairs["same_id"] & ~pairs["no_country"]
     exact = usable & pairs["same_key"]
     fuzzy = (usable & ~pairs["same_key"] & (pairs["cosine"] >= rules.fuzzy_threshold)
              & pairs["digits_agree"] & pairs["consortium_agree"]
              & (pairs["core_similarity"] >= rules.core_min_similarity))
+    # np.select takes the first true condition, so a pair records its strongest rule
     return pd.Series(np.select([same_id, exact, fuzzy], ["same_id", "exact_name", "fuzzy_name"], default=None),
                      index=pairs.index, dtype=object)
 
@@ -182,5 +192,6 @@ def resolve(records: pd.DataFrame, pairs: pd.DataFrame, rule: pd.Series) -> pd.S
     for label in sorted(set(labels)):
         base = f"SE-{first_id[label]}"
         used[base] = used.get(base, 0) + 1
+        # labels are visited in sorted order, so which component gets the suffix is deterministic
         names[label] = base if used[base] == 1 else f"{base}-{used[base]}"
     return pd.Series([names[label] for label in labels], index=records.index)

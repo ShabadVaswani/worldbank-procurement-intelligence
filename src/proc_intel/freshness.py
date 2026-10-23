@@ -30,12 +30,15 @@ def quantile_edges(reference: Sequence[float], n_bins: int = 10) -> np.ndarray:
     values = np.asarray([v for v in reference if v is not None and not math.isnan(v)], dtype=float)
     if values.size == 0:
         return np.array([])
+    # inner edges only: the first and last bins stay open, so current values outside the reference range still land in a
+    # bin
     return np.unique(np.quantile(values, np.linspace(0, 1, n_bins + 1)[1:-1]))
 
 
 def bin_counts(values: Sequence[float], edges: np.ndarray) -> np.ndarray:
     """Counts per bin; bin i holds edges[i-1] < v <= edges[i] (first and last bins are open-ended)."""
     values = np.asarray([v for v in values if v is not None and not math.isnan(v)], dtype=float)
+    # side="left" puts a value equal to an edge into the lower bin, matching the edges[i-1] < v <= edges[i] rule
     return np.bincount(np.searchsorted(edges, values, side="left"), minlength=len(edges) + 1)
 
 
@@ -67,6 +70,7 @@ def ks_statistic(a: Sequence[float], b: Sequence[float]) -> float:
     a, b = np.sort(np.asarray(a, dtype=float)), np.sort(np.asarray(b, dtype=float))
     if a.size == 0 or b.size == 0:
         return float("nan")
+    # the largest CDF gap always occurs at one of the observed values, so evaluating there is exact
     grid = np.concatenate([a, b])
     cdf_a = np.searchsorted(a, grid, side="right") / a.size
     cdf_b = np.searchsorted(b, grid, side="right") / b.size
@@ -138,12 +142,14 @@ def champion_challenger_gate(champion: Mapping, challenger: Mapping, policy: Map
                    f"{champion.get('window')} vs {challenger.get('window')}"))
     checks.append(("enough evaluation rows", challenger.get("n", 0) >= policy["min_eval_rows"],
                    f"n={challenger.get('n', 0)} (min {policy['min_eval_rows']})"))
+    # a 2% margin, so evaluation noise alone does not swap champions back and forth
     target = champion["mae"] * (1 - policy["min_rel_improvement"])
     checks.append(("overall MAE improves", challenger["mae"] <= target,
                    f"{challenger['mae']:.2f} vs champion {champion['mae']:.2f} (needs <= {target:.2f})"))
     worse = []
     for seg, ch in (challenger.get("segments") or {}).items():
         base = (champion.get("segments") or {}).get(seg)
+        # small segments are skipped: their MAE swings too much to block a promotion
         if not base or min(ch.get("n", 0), base.get("n", 0)) < policy["min_segment_rows"]:
             continue
         if ch["mae"] > base["mae"] * (1 + policy["max_segment_regression"]):
@@ -168,6 +174,7 @@ def index_refresh_plan(indexed: Mapping[str, str], current: Mapping[str, str]) -
     new = sorted(k for k in current if k not in indexed)
     changed = sorted(k for k in current if k in indexed and indexed[k] != current[k])
     removed = sorted(k for k in indexed if k not in current)
+    # a changed chunk is deleted and re-embedded, since its old vector no longer matches its text
     return {"embed": new + changed, "new": new, "changed": changed, "delete": removed + changed,
             "removed": removed, "unchanged": len(current) - len(new) - len(changed)}
 

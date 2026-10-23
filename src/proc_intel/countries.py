@@ -40,8 +40,10 @@ NAME_TO_ISO2 = {
 def to_iso2(code: str | None, name: str | None = None) -> str | None:
     """ISO alpha-2 (or Bank regional code) for a code/name pair from the awards feed; None if unknown."""
     code = (code or "").strip().upper()
+    # the feed writes some missing codes as the literal text "NULL"
     if code and code != "NULL":
         return WB_TO_ISO2.get(code, code)
+    # no usable code: fall back to the name (Cote d'Ivoire and Somalia rows arrive without one)
     return NAME_TO_ISO2.get((name or "").strip())
 
 
