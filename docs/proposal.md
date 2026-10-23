@@ -24,7 +24,7 @@ I did not want to propose an architecture I had not tried. Every module below ha
 | Conflicting evidence | 35 of 68 projects that IEG rated unsatisfactory still had a satisfactory last ISR; a written resolution policy decides which source answers which question |
 | Continuous learning | Change Data Feed on 9 tables; an incremental graph update equals a full rebuild, row for row |
 
-How to read this document: sections 2 to 5 follow the brief's four modules. Each one has the same four parts, design, prototype, measured results, limits and next steps. Section 6 lists risks. Appendix A maps every bullet of the brief to the notebook and table that answers it.
+How to read this document: sections 2 to 5 follow the brief's four modules. Each one has the same four parts, design, prototype, measured results, limits and next steps. Section 6 lists risks. Appendix A maps every bullet of the brief to the notebook and table that answers it. References such as p13 are notebook numbers in the repository; Appendix A lists them.
 
 | Rubric dimension | Where it is answered |
 |---|---|
@@ -47,7 +47,7 @@ How to read this document: sections 2 to 5 follow the brief's four modules. Each
 
 - **One governed copy.** Raw files, tables, the graph, embeddings and models all live in the lakehouse under Unity Catalog. There is no second graph database or vector store to keep in sync. Section 2.3 explains why a graph database is not needed at this scale and what would change that.
 - **Every claim resolves to a row.** Records carry stable ids such as `contract:1823785` or `lesson_chunk:P123828-34118211-0110`. The agent may only cite ids that a tool returned, and code checks that before a user sees the answer.
-- **Measure before trusting.** Each step has an acceptance check on real data: a labelled sample (labels from the three-tier escalation in 1.5), a holdout window, or an equality proof. The numbers in this document come from those checks.
+- **Measure before trusting.** Each step has an acceptance check on real data: a labelled sample (method in 1.5), a holdout window, or an equality proof. The numbers in this document come from those checks.
 - **A consistent scope over a longer one.** Older contract-award data (FY2001–2016) covers only major, prior-reviewed contracts and leaves a FY2017–2019 gap, so the project uses the complete FY2020+ series rather than mixing two different populations.
 - **Leakage and truncation are design inputs.** The awards feed starts in FY2020, so old tenders look slow and new ones look fast. The models are trained only on cohorts that can be fully observed (section 3.1).
 - **Small pure functions, tested.** The logic shared by notebooks lives in `src/proc_intel` with 323 unit tests, run in CI with a linter on every push.
@@ -60,7 +60,7 @@ flowchart TB
         direction LR
         N["<b>Not public / not yet ingested</b><br/>amendments, milestones,<br/>CPIA, PPARs, CPFs"]:::designed
         S["<b>Sources</b><br/>Contract awards: 295,058 rows, FY2020+<br/>Procurement notices: 416,745<br/>Projects API: 3,768 projects<br/>Documents API: PAD, ISR, ICR, ICR Review<br/>WGI, IEG ratings, loan statements"]
-        B["<b>Bronze</b><br/>raw volume, one file per API page<br/>MERGE on key + row hash<br/>change data feed on<br/>layout PDF parser"]
+        B["<b>Bronze</b><br/>raw volume, one file per API page<br/>MERGE on key + row hash<br/>Change Data Feed enabled<br/>PDF layout parser"]
         SV["<b>Silver</b><br/>keyed relational model<br/>entity resolution: 344,273 ids -> 261,169 firms<br/>notice-contract links: 64,065<br/>ratings evidence: 2,381 ratings<br/>passages + embeddings"]
         N -.-> S --> B --> SV
     end
@@ -75,9 +75,9 @@ flowchart TB
     classDef designed stroke-dasharray: 5 5
 ```
 
-*Figure: End-to-end architecture. Solid boxes are built and run on real data; dashed boxes are designed, not built. A daily loop (section 5.1) feeds changes from the serving layers back into bronze.*
+*Figure: End-to-end architecture. Solid boxes are built and run on real data; the dashed box lists sources that are not public or not yet ingested. Platform services (Operations below) are not drawn. A daily loop (section 5.1) feeds changes from the serving layers back into bronze.*
 
-- **Sources.** World Bank APIs for awards, notices, projects and documents, plus the governance indicators already loaded by my first submission.
+- **Sources.** World Bank APIs for awards, notices, projects and documents, plus the Worldwide Governance Indicators.
 - **Bronze.** Every API page is saved as a file in a Unity Catalog volume, so a restart skips finished pages. Tables are loaded with `MERGE` on a deterministic key and a hash of the business columns. A second run changes 0 rows, and records that disappear from the source are soft-deleted.
 - **Silver.** A keyed relational model with declared primary and foreign keys, supplier entity resolution, notice-to-contract links, ratings evidence, and document passages with embeddings.
 - **Gold.** Tender timelines, the knowledge graph, peer-group benchmarks, scores for open tenders, resolved evidence, drift reports and pilot KPIs.
@@ -109,7 +109,7 @@ flowchart LR
 
 ## 1.5 How evaluation labels are produced
 
-Every measured result in this document is a comparison with labels, so the labels have a method of their own. They come from a three-tier escalation:
+The headline labelled results (supplier pairs and the 30-brief review pack) need labels with a method of their own. They come from a three-tier escalation; other checks use a single LLM judge or agent reference labels, marked where they appear:
 
 1. **Automatic, where code can decide.** Whether the actual duration falls inside the cited P10-P90 range, and whether every cited id was returned by a tool, are computed, not judged.
 2. **A panel of three LLM judges from different model families.** Everything else is labelled independently by gpt-oss-120b, Llama 4 Maverick and Qwen 3.5 for supplier pairs, and by gpt-oss-120b, Llama 4 Maverick and Llama 3.3 70B for briefs; Qwen is left out on briefs because it wrote them. Each judge gets the same written rubric, temperature 0 and a strict JSON schema. The judges read and code decides: for a timeline they report P10, P90 and the actual days, and code compares the numbers.
@@ -122,9 +122,9 @@ Every measured result in this document is a comparison with labels, so the label
 | Escalated to the adjudicator | 10 | 14, on 13 briefs |
 
 - **Why this design.** Every item gets the same rubric, so labels are consistent. Judges from different families are calibrated against each other: where all three agree the label stands (Fleiss' kappa 0.86 on pairs), and only real disagreements get the deeper look, 24 of 220 fields. Every escalated decision carries written evidence a reviewer can check.
-- **What the adjudicator changed.** It overturned 7 of 24 panel majorities, confirmed 15, and settled 2 items where the judges had no majority. Checking disputed claims against award-notice firm counts and project ids, it confirmed 2 real errors in the agent's briefs from the data: a precedent wrongly described as "same project" (r06) and an overstated firm-count range (r10).
+- **What the adjudicator changed.** Of 24 escalated items, it overturned 7 of the 22 panel majorities, confirmed 15, and settled the 2 with no majority. Checking disputed claims against award-notice firm counts and project ids, it confirmed 2 real errors in the agent's briefs from the data: a precedent wrongly described as "same project" (review-pack brief r06) and an overstated firm-count range (brief r10).
 - **Limits.** The adjudicator is an AI agent, and the rubrics were sharpened after seeing the judges' answers on these items. Independent validation by procurement specialists is part of the pilot plan (5.2).
-- Earlier checks in the build, p08's 30 precedent-relevance labels, p11's spot-checks (23 precedent pairs, 15 lesson cases) and the link audits, use reference labels made by an AI agent during the build. They are called agent reference labels below.
+- Some smaller checks (30 precedent-relevance labels for the agent, 23 precedent pairs and 15 lesson cases in the backtest, and the link audits) use reference labels made by an AI agent. They are called agent reference labels below.
 
 # 2. Module 1: ingestion and knowledge representation
 
@@ -141,9 +141,9 @@ Every measured result in this document is a comparison with labels, so the label
 Four details from the real APIs drove the design. Each one would have silently lost data in a naive pipeline:
 
 - The notices API sits on a search index that refuses offsets above 100,000, so a plain loop reaches about a quarter of the 423,000 notices. Date filters are ignored. The pipeline partitions by project country, where every partition is below the cap and the counts add up to the total.
-- On a re-run, 200 new notices had no country at all and fell outside every partition. A completeness check caught it; the pipeline now measures the gap and reads the unfiltered feed until it is closed.
+- Some new notices carry no country and fall outside every partition. A completeness check measures the gap, and the pipeline reads the unfiltered feed until it is closed.
 - In the awards feed, the amount on a joint-venture row is the whole contract value repeated for each member, not that member's share. Summing it double-counts 8,864 contracts. The model keeps the amount once per contract.
-- The facet list contains both "Turkiye" and "Türkiye". They produce the same folder name, so one country's pages would have overwritten the other's. Folder names now carry a short hash of the exact value.
+- The facet list contains both "Turkiye" and "Türkiye". They produce the same folder name, so one country's pages would have overwritten the other's. Folder names carry a short hash of the exact value.
 
 ## 2.2 Entity resolution
 
@@ -153,7 +153,7 @@ Suppliers are the hardest join. One firm holds many registration ids, one id som
 - **Blocking.** Names are compared only within the same supplier country. This keeps the work to minutes on one node and matches how firms register: "PWC Albania" and the Polish PricewaterhouseCoopers are different legal entities.
 - **Scoring.** Cosine of TF-IDF character trigrams. I tested Jaro-Winkler and token-set ratio and rejected both: Jaro-Winkler rewards shared prefixes such as "CONSTRUCTION", and token-set ratio scores 1.0 when one name contains another.
 - **Rules that stop chaining.** A fuzzy link must also match the country's rare words at 0.9 or more. Without that rule, 12 provincial "Land Registration Office of ... Province" records became one entity. Common personal names such as "Ajay Kumar", which appears under 24 ids, get no name links. A shared id links two names only if they are similar or one is the other's acronym; trusting every shared id once merged nine Nigerien firms into one.
-- **Measured.** On 100 labelled pairs drawn across similarity bands, labelled by the three-tier escalation (1.5): precision 1.00 (95% CI 0.90 to 1.00) and recall 0.90 (0.77 to 0.96) on the 97 pairs decided; 3 stay "unsure" (two common personal names, one firm whose relation could not be established). The threshold was chosen in p04 on the build's first labels of the same pairs, made by an AI agent (precision 0.97, recall 0.90 there); the final labels agree with them on 96 of 100 pairs. Because the threshold was chosen on these pairs, 40 random links the pipeline produced were also audited (agent reference labels): 34 are the same firm or corporate group and 30 the same legal entity.
+- **Measured.** On 100 labelled pairs drawn across similarity bands, labelled by the three-tier escalation (1.5): precision 1.00 (95% CI 0.90 to 1.00) and recall 0.90 (0.77 to 0.96) on the 97 pairs decided; 3 stay "unsure" (two common personal names, one firm whose relation could not be established). The threshold was chosen on an earlier set of AI-agent labels for the same pairs (precision 0.97, recall 0.90 there); the final labels agree with them on 96 of 100 pairs. Because the threshold was chosen on these pairs, 40 random links the pipeline produced were also audited (agent reference labels): 34 are the same firm or corporate group and 30 the same legal entity.
 
 ## 2.3 Entity-relationship schema and knowledge graph
 
@@ -274,7 +274,7 @@ Notices and contracts have no shared key in the source. The prototype links them
 
 A PAD or ICR runs to 100 pages or more, with numbered sections, tables, annexes and front matter. The strategy keeps the document's structure in every passage.
 
-- **Parse to structure first.** Use the text rendering when the Documents API has one; otherwise parse the PDF's layout. None of the 10 PADs parsed in p12 had bookmarks, so headings come from font size, weight and numbering. Detect headings by numbering pattern and capitalisation, and keep the full section path, for example "IV. Bank performance, compliance issues and risk > Fiduciary compliance". In the prototype the first rule mistook numbered paragraphs ("86. The concerned government agencies...") for headings; the fixed rules are unit-tested.
+- **Parse to structure first.** Use the text rendering when the Documents API has one; otherwise parse the PDF's layout. None of the 10 PADs parsed in p12 had bookmarks, so headings come from font size, weight and numbering. Detect headings by numbering pattern and capitalisation, and keep the full section path, for example "IV. Bank performance, compliance issues and risk > Fiduciary compliance". Numbered paragraphs ("86. The concerned government agencies...") must not be read as headings; the rules that tell them apart are unit-tested.
 - **Chunk by section, then by size.** Passages never cross a section boundary. Each carries its section path, document type, document date, project id and a content hash.
 - **Tables and annexes.** Rating tables are parsed into rows, not embedded as text: the ISR and ICR Review tables are fixed-width columns with wrapped cells, so the parser assigns each word to a column by its character offset. In PDFs, ruled tables are detected with a quality gate (at least 2 by 2 cells, 40% filled), joined across page breaks and given their caption; a table becomes one chunk, or groups of rows with the header repeated, and every chunk carries a contextual header (document, section, table caption) and an annex flag. Unruled tables such as results frameworks still come out as narrative, a known limit.
 - **Select before embedding.** Only sections that carry procurement or implementation evidence are embedded for the agent: lessons, key factors in preparation and implementation, fiduciary compliance, quality of supervision, and the appraisal risk sections. This gave 4,495 passages from 300 ICRs and 16,623 appraisal passages.
@@ -286,7 +286,7 @@ A PAD or ICR runs to 100 pages or more, with numbered sections, tables, annexes 
 - **Coverage.** 28,235 openly competed contracts have a measured notice-to-signing duration, 44.9% of 62,828. Coverage rises from 27% of contracts signed in 2019 to about 60% in 2026.
 - **Quality gates.** Primary and foreign keys are declared in Unity Catalog, which does not enforce them, so every notebook also counts duplicates and orphans and fails on a breach. The gates caught three real defects during the build: a missing method mapping, a country code mapped twice, and the country-less notices.
 - **Limits.** Individual consultants cannot be resolved by design. The awards feed starts in FY2020, so suppliers' earlier history is missing. Lesson passages come from 300 of about 8,100 ICRs.
-- **Next.** Ingest the full ICR and PAD corpus with the p12 chunker, add PPARs and Country Partnership Frameworks, and convert the remaining silver rebuilds to `MERGE`. Data gaps and how each one is handled are in [data_gaps.md](data_gaps.md).
+- **Next.** Ingest the full ICR and PAD corpus with the structure-aware chunker (p12), add PPARs and Country Partnership Frameworks, and convert the remaining silver rebuilds to `MERGE`. Data gaps and how each one is handled are in [data_gaps.md](data_gaps.md).
 
 # 3. Module 2: predictive and prescriptive engines
 
@@ -304,7 +304,7 @@ A PAD or ICR runs to 100 pages or more, with numbered sections, tables, annexes 
 | Slow-tender risk | classifier for duration above the P75 of its method and category | the brief's "re-bidding risk" is too rare to model here, see below |
 | Survival view | Kaplan-Meier with unsigned notices censored; Weibull AFT for readable time ratios | uses tenders that are still open, which a regression must drop |
 
-**Inputs known on the notice date only.** Notice type, method, category, advertising period, language and length; project region, sector, age, size and earlier tenders; governance indicators and GDP per capita for the year before; market history for the 36 months before, such as contracts, winning firms, foreign share and firms per award notice. I left out three tempting inputs. Contract amount is known only at award. Review type is not on the notice. My first submission's outcome-risk score exists only for projects still active in 2026, so its presence leaks the project's future.
+**Inputs known on the notice date only.** Notice type, method, category, advertising period, language and length; project region, sector, age, size and earlier tenders; governance indicators and GDP per capita for the year before; market history for the 36 months before, such as contracts, winning firms, foreign share and firms per award notice. I left out three tempting inputs. Contract amount is known only at award. Review type is not on the notice. Project outcome-risk scores, where they exist, are computed only for projects still active in 2026, so using one would leak the project's future.
 
 **Results on test notices advertised after July 2023 (6,624 contracts).**
 
@@ -322,11 +322,11 @@ A PAD or ICR runs to 100 pages or more, with numbered sections, tables, annexes 
 
 ## 3.2 Backtest
 
-The question a panel should ask is: had the platform existed when a tender was advertised, would its advice have been right? The backtest (p11) replays real tenders on their notice date.
+The question that matters is: had the platform existed when a tender was advertised, would its advice have been right? The backtest (p11) replays real tenders on their notice date.
 
 - **Sample.** 300 openly competed tenders from the test period (notices July 2023 to October 2024), stratified by region and category: 28 strata, at least 5 tenders each, one tender per project, 92 countries.
 - **As of the notice date.** The tender's own project and everything dated later are hidden from every tool, and each returned record is checked again for dates after the notice.
-- **Models.** Model A is the champion's recipe refit on notices before July 2023; it reproduces the p07 test error within one day. Model B is stricter: trained only on notices whose outcome was fully known by mid-2021. The deployed champion appears only as a labelled in-sample contrast.
+- **Models.** Model A is the champion's recipe refit on notices before July 2023; it reproduces the test error of section 3.1 within one day. Model B is stricter: trained only on notices whose outcome was fully known by mid-2021. The deployed champion appears only as a labelled in-sample contrast.
 - **Judging.** Precedent and lesson relevance by an LLM judge (gpt-oss), which agreed with agent reference labels on 20 of 23 precedent pairs and 13 of 15 lesson cases. The 30-brief review pack is labelled by the three-tier escalation (1.5).
 
 | Measure | Platform | Baseline |
@@ -342,8 +342,8 @@ The question a panel should ask is: had the platform existed when a tender was a
 
 - The model beats the peer table overall but not for consulting services (134 vs 127 days). For those, the brief should lead with the peer group.
 - 19% of packages get no precedent at all, and 47% of non-consulting-services packages. Real notice texts are terse ("Concrete poles"), and later contracts are hidden.
-- A rule-based relevance proxy (same category, method family and sector) did not work: it agreed with p08's agent reference labels on 16 of 30 pairs (kappa 0.21). Comparable goods are bought by projects in other sectors and with other methods, and metadata cannot see what was bought. Relevance needs a judge or a person.
-- **Review pack.** 30 full briefs run as of the notice date, with the actual outcome next to each: 22 complete and 8 partial; the actual duration fell inside the cited range in 20 of 30. On the final three-tier labels, 22 briefs list precedents (3.3 relevant on average, 90% of those listed) and 8 list none; there are 3.4 relevant risks per brief; and 5 of 30 (17%) contain an unsupported claim. The p11 judge alone had flagged 9: the adjudicator cleared claims such as "20 firms participated" against the award notices' firm counts, and confirmed two real errors, a precedent described as "same project" that belongs to another project (r06), and "recent similar contracts in the same project attracted between 2 and 6 bidding firms" where the same-project contracts had 2 and 5 (r10). One brief cites a supplier's contract signed after the notice, because the supplier profile reads the whole graph, not an as-of view. These are the failure modes the pilot's human review has to catch.
+- A rule-based relevance proxy (same category, method family and sector) did not work: it agreed with the 30 agent reference labels on 16 of 30 pairs (kappa 0.21). Comparable goods are bought by projects in other sectors and with other methods, and metadata cannot see what was bought. Relevance needs a judge or a person.
+- **Review pack.** 30 full briefs run as of the notice date, with the actual outcome next to each: 22 complete and 8 partial; the actual duration fell inside the cited range in 20 of 30. On the final three-tier labels, 22 briefs list precedents (3.3 relevant on average, 90% of those listed) and 8 list none; there are 3.4 relevant risks per brief; and 5 of 30 (17%) contain an unsupported claim. The single LLM judge used in the backtest had flagged 9: the adjudicator cleared claims such as "20 firms participated" against the award notices' firm counts, and confirmed two real errors, a precedent described as "same project" that belongs to another project (r06), and "recent similar contracts in the same project attracted between 2 and 6 bidding firms" where the same-project contracts had 2 and 5 (r10). One brief cites a supplier's contract signed after the notice, because the supplier profile reads the whole graph, not an as-of view. These are the failure modes the pilot's human review has to catch.
 
 ## 3.3 Agentic retrieval for a new procurement package
 
@@ -384,7 +384,7 @@ flowchart TD
 - The planner is Qwen 3.5 with at most six tool calls. A coverage check adds a core tool the planner skipped. I compared it with Llama 3.3 on three packages: equal quality, faster.
 - A writer step turns the gathered records into the brief. Each record is passed with its id, together with a short evidence-strength note computed in code: is the best precedent close enough, is there a benchmark, are the lessons close to the query.
 - If the evidence is too weak, the agent returns "insufficient evidence" with what it found instead of writing a brief.
-- **Only close precedents.** A re-ranked contract is shown as a precedent only if its GTE cosine is at least 0.68 and its TF-IDF cosine at least 0.08, so a brief has 0 to 5 precedents. A cosine cut alone failed, because the best relevant match scores anywhere from 0.70 to 0.87 depending on the query. The rule was chosen on 200 judged candidates; on the evaluation, 82% of cited precedents are relevant (76 of 93) against 74% before, and the one package with no comparable contract (speedboats) now gets none.
+- **Only close precedents.** A re-ranked contract is shown as a precedent only if its GTE cosine is at least 0.68 and its TF-IDF cosine at least 0.08, so a brief has 0 to 5 precedents. A cosine cut alone failed, because the best relevant match scores anywhere from 0.70 to 0.87 depending on the query. The rule was chosen on 200 judged candidates; on the evaluation, 82% of cited precedents are relevant (76 of 93) against 74% without the rule, and the one package with no comparable contract (speedboats) gets none.
 - **The model needs package details to beat the peer group.** On 20 evaluation packages, an indicative check because 17 of the 20 were in the model's training data: from package fields alone the forecast's error is 91 days against 85 for the peer group; with the project id it is 80, and with the real notice facts 60. Planning-time defaults cost the model its edge, so the brief asks for the project id and planned advertising period.
 - The code, not the writer, computes the difference between forecast and peer median: in one run the model wrote "129 days, faster than the peer median of 100".
 
@@ -401,7 +401,7 @@ flowchart TD
 - 672 of 1,939 international tenders were advertised below the Regulations' 30 business days (para 5.36). They drew 4.9 bidders on average against 5.6, and ended with a single bidder 28.5% of the time against 20.3%. Part of this is an artefact of the notice date, which is the date of publication on the Bank's site, but 555 were under 40 calendar days.
 - Packages larger than the country's P90 drew more bidders, not fewer, but signed later: 196 days against 115. Size is a schedule signal, not a competition one.
 - Notices rarely state qualification criteria: turnover in 9.8%, years of experience in 5.2%. Specifications live in bidding documents, which are not open data, so checking specifications against benchmarks needs STEP access.
-- 3,227 flags in `tender_design_flags`, available to the agent through `check_tender_design(notice, peers)`.
+- 3,227 flags in `tender_design_flags`, callable as `check_tender_design(notice, peers)`.
 
 **Execution early warnings (p14).** Six indicators per active project: stalled tenders, slow signings, disbursement lag against peers (from loan statements), closing date moved, ISR ratings, and the ISR's fiduciary risk rating.
 
@@ -412,16 +412,16 @@ flowchart TD
 
 ## 3.5 Results, limits and next steps
 
-| Measure, 20 evaluation packages written during the build from real contracts, source project held out | Phase 2 | After the phase 3 upgrades |
+| Measure, 20 evaluation packages written during the build from real contracts, source project held out | First version | Final version (precedent rule, coverage check) |
 |---|---|---|
 | Precedent precision@5, LLM judge agreeing 90% with 30 agent reference labels | 0.75 (TF-IDF alone 0.63) | 0.75 ranking; 0.82 of cited precedents relevant, vs 0.74 |
 | Citation validity, share of cited ids that a tool returned | 1.00 | 0.995: one malformed id, dropped by code |
-| Groundedness judge | 16 of 20 | 19 of 20; the one "no" is a harness artefact |
+| Groundedness judge | 16 of 20 | 19 of 20; the one "no" came from the evaluation script, not the brief |
 | Tool calls per brief / forced / invalid | 3.7 / 0 / 0 | 4.25 / 0 / 0 |
-| Median latency | 14.9 s | 23.1 s; 13.6 s in the previous run with the same tools, on shared endpoints |
+| Median latency | 14.9 s | 23.1 s; between 13.6 and 23.1 s across runs on shared endpoints |
 | Input guard on 3 out-of-scope and injection cases | 3 of 3 | |
 
-- The four phase 2 briefs the judge marked ungrounded were each read against their cited records. Two were statements about missing evidence, which the judge treats as unsupported. One was an artefact of my test harness. One was a real error: the brief called individual-consultant contracts "firm QCBS precedents".
+- In the first version, the four briefs the judge marked ungrounded were each checked against their cited records. Two were statements about missing evidence, which the judge treats as unsupported. One came from the evaluation script, not the agent. One was a real error: the brief called individual-consultant contracts "firm QCBS precedents".
 - **Limits.** The labels that checked the judge here are agent reference labels made during the build; the review pack's final labels come from the three-tier escalation (1.5); none has yet been validated by procurement specialists. Twenty packages is a small evaluation set and the judge is not deterministic: the same 30 pairs gave 93% agreement on one run and 90% on the next. Country is a soft preference in contract search, so a Kenyan road package can get Sri Lankan precedents when they are the closest text. That is useful for specifications, but the brief must say so.
 - The stable entry point for other components is `run_agent(package)`, which returns the brief, both timelines, the precedents, every cited record and the run's flags.
 - **Next.** A labelled set of 100 or more packages written with procurement specialists in the pilot, specialist validation of the three-tier labels, and the full ICR corpus behind `lessons_learned`.
@@ -457,7 +457,7 @@ flowchart LR
 
 | Layer | What it does | Where | Measured |
 |---|---|---|---|
-| 1. Input guard | a model from a different family from the planner classifies scope and prompt injection; free text is wrapped and treated as data | `input_guard` in `proc_rag_core` | 3 of 3 test cases |
+| 1. Input guard | a model from a different family from the planner classifies scope and prompt injection; free text is wrapped and treated as data | `input_guard` in the shared agent notebook `proc_rag_core` | 3 of 3 test cases |
 | 2. Tool arguments | schema check, numeric coercion, country names and method codes resolved; invalid calls rejected and counted | `src/proc_intel/agent_tools.py` | 0 invalid calls in 20 runs |
 | 3. Evidence only from tools | records are passed as delimited blocks with ids; prompts say tool output is data, not instructions | writer prompt | |
 | 4. Evidence strength | computed in code; weak evidence gives "insufficient evidence", not a brief; only close precedents are listed, 0 to 5 | `evidence_strength`, precedent rule | 82% of cited precedents relevant |
@@ -477,7 +477,7 @@ The design idea is that the model is never the last check. Layers 2, 5 and 6 are
 
 ## 4.3 Conflicting institutional evidence
 
-**What the data shows.** On 400 closed projects drawn in hash order, I read the last ISR, a mid-period ISR and the ICR Review from the Documents API text. IEG's outcome read from the text matched IEG's own dataset for 381 of 381 reviews.
+**What the data shows.** On 400 closed projects drawn in hash order, the parser extracted the ratings of the last ISR, a mid-period ISR and the ICR Review from the Documents API text. IEG's outcome read from the text matched IEG's own dataset for 381 of 381 reviews.
 
 - 35 of the 68 projects IEG rated unsatisfactory (51%) still had a satisfactory development-objective rating in their last ISR.
 - IEG rated the outcome below the ICR's self-rating for 91 of 381 projects and above it for 6.
@@ -498,7 +498,7 @@ The design idea is that the model is never the last check. Layers 2, 5 and 6 are
 
 ## 4.4 Results, limits and next steps
 
-- **Measured.** Citation validity 0.995 after one malformed id was dropped, groundedness 19 of 20, guard 3 of 3, parser accuracy 381 of 381 against IEG's dataset. On the 30 replayed briefs of the backtest, 5 contain an unsupported concrete claim on the final three-tier labels (the p11 judge alone flagged 9); that is the number to drive down in phase 0.
+- **Measured.** Citation validity 0.995 before code checks (one malformed id, which code drops), groundedness 19 of 20, guard 3 of 3, parser accuracy 381 of 381 against IEG's dataset. On the 30 replayed briefs of the backtest, 5 contain an unsupported concrete claim on the final three-tier labels (the single backtest judge alone flagged 9); that is the number to drive down in phase 0.
 - **Limits.** Validation checks that a cited record exists and that numbers match. It does not prove that a passage supports a sentence; that is left to the groundedness judge and to human review. The conflict sample covers closed projects only, so the "current status" path has not been tested on many active projects.
 - **Next.** A sentence-level entailment check between each risk and its cited passage, and a review queue where specialists label disputed briefs. The labels become the next evaluation set.
 
@@ -525,7 +525,7 @@ flowchart LR
     subgraph learn["Step 3: learn and measure"]
         direction TB
         drift["drift checks (PSI, KS)"]
-        chall["challenger trained<br/>(p07 recipe)"]
+        chall["challenger trained<br/>(same recipe as 3.1)"]
         champ["champion / challenger<br/>gate -> @champion"]
         kpis["pilot KPIs + user feedback<br/>-> back to the backlog"]
         drift -->|"retrain trigger"| chall --> champ --> kpis
@@ -648,11 +648,11 @@ What costs money is embedding and LLM calls, not storage. The design keeps both 
 | Finances and disbursement feeds | partly | IBRD and IDA loan statements, 40,842 rows from 4 snapshots, for disbursement lag and closing-date moves (p14); co-financing not used |
 | Procurement notices | yes | 416,745 notices with HTML text; bidders parsed from award notices |
 | ISRs | yes | rating blocks from 400 closed projects' last and mid-period ISRs (p09) and 300 active projects' latest ISRs (p14) |
-| PADs | yes | 50,000 passages of PADs, PIDs and Program Documents from 453 projects, from my first submission; 10 PADs re-parsed from PDF with tables (p12) |
+| PADs | yes | 50,000 passages of PADs, PIDs and Program Documents from 453 projects; 10 PADs re-parsed from PDF with tables (p12) |
 | ICRs and ICR Reviews | yes | 300 ICRs as lessons; 381 ICR Reviews for ratings |
 | IEG evaluations | partly | IEG ratings dataset and ICR Reviews; PPARs and thematic studies not yet |
 | Procurement guidance, CPFs | partly | the Procurement Regulations' minimum advertising periods are applied as rules in p13; CPFs not yet |
-| CPIA | no | not in the loaded indicators; WGI is used instead |
+| CPIA | no | not ingested; WGI is used instead |
 | WGI | yes | six indicators per country-year, taken for the year before each notice |
 
 Full list of gaps, how each one is handled today, and what closing it would take: [data_gaps.md](data_gaps.md).
