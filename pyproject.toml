@@ -25,6 +25,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/test_evidence.py" = ["E501"]  # fixed-width document text copied verbatim from the reports
+"slides/build_deck.py" = ["E501"]  # speaker cues kept as one bullet per line
 
 [tool.ruff.lint.flake8-bugbear]
 extend-immutable-calls = ["proc_intel.resolution.MatchRules"]  # frozen dataclass, safe as a default

@@ -1,66 +1,6 @@
-# Speaker notes
+# Likely panel questions
 
-Talk of about 20 minutes over 5 slides, then 10 minutes of questions. The deck is `slides/procurement_intelligence.pptx` (PDF copy next to it); the full design is in [proposal.md](proposal.md).
-
-| Slide | Topic | Minutes | Cumulative |
-|---|---|---|---|
-| 1 | Problem and what I built | 4 | 4 |
-| 2 | Data model and knowledge graph | 4.5 | 8.5 |
-| 3 | AI methods: duration model and cited agent | 4.5 | 13 |
-| 4 | Trust: evaluation, conflicting evidence, data gaps | 4 | 17 |
-| 5 | Rollout: continuous learning, pilot, next steps | 3 | 20 |
-| | Questions | 10 | 30 |
-
-## Slide 1. Problem and what I built
-
-- Open with the problem in one sentence. The registry says what happened, the notices say how, and the completion reports say why, but they sit in three places and nobody reads the third one at planning time.
-- I chose to build, not only design. Everything on the slide runs on Azure Databricks on the real public data: the awards feed, procurement notices, project data, ISRs, ICRs and IEG reviews.
-- Walk the architecture left to right in one breath: sources, bronze with idempotent loads, a keyed silver model, gold tables and the graph, then the engines and the users. The bottom band is governance: Unity Catalog, MLflow, Workflows.
-- Point at the dashed boxes. They are designed but not built, for example disbursements and CPIA. I would rather show the gap than hide it.
-- The four numbers: 282,890 contracts linked to notices and projects; 261,169 firms resolved at precision 1.00 and recall 0.90; a duration model 13 days better than the lookup an analyst would use, measured on tenders it never saw; and a backtest that replays 300 real tenders as of their notice date.
-- If asked about 75 vs 76: p07 logged 76 on the same test set; the backtest refit the same recipe and got 75.5. Same model recipe, different row order in bagging.
-- Transition: "The thing that makes the rest possible is the data model, so let me start there."
-
-## Slide 2. Data model and knowledge graph
-
-- Grain first. One row per contract; joint-venture members live in `contract_suppliers`, because the feed repeats the whole contract value on every member's row. Summing it would double-count 8,864 contracts.
-- Keys are declared in Unity Catalog, but Unity Catalog does not enforce them, so every notebook counts duplicates and orphans and stops on a breach. Those checks caught three real defects during the build.
-- Entity resolution in three sentences: block by country, TF-IDF character trigrams, and rules that stop chaining. The rules came from failures: twelve provincial land registries merged into one firm, and "Ajay Kumar" under 24 ids. Measured on 100 labelled pairs: precision 1.00 and recall 0.90 on the final three-tier labels (0.97 on the build's first labels, where the threshold was chosen), plus a random audit of 40 links.
-- Tender timelines: notices and contracts share no key, so links are tiered and each tier was audited on a sample. 44.9% of openly competed contracts get a measured duration, median 158 days.
-- The graph is Delta tables built from those keys: 1.03 million nodes and 2.28 million edges with zero dangling edges. Why not Neo4j: the questions are two to four hops in batch, and one copy keeps one set of permissions.
-- Answer the brief's example on the slide: contract, then project, then the completion-report passage, with time deciding whether a lesson is an explanation or a precedent.
-
-## Slide 3. AI methods
-
-- Duration model. Start with the trap: the feed starts in FY2020, so old tenders look slow and new ones look fast, and a naive test says tenders got twice as fast. I trained only on cohorts that can be fully observed.
-- LightGBM quantiles for P10, P50 and P90, then a conformal step because the raw interval covered 68% instead of 80%. After it, 80.7%.
-- Re-bidding risk: I looked, and only 1.3 to 1.5% of contracts show a second tender notice. I report the rate instead of modelling noise, and model "slow tender" instead: ROC-AUC 0.747 against 0.584 for the peer rate.
-- Agent: input guard from a different model family, a planner limited to six tool calls, five tools, a writer, and then code that checks the brief. The model is never the last check.
-- Read the excerpt aloud. The timeline sentence cites a benchmark row; the rainy-season risk cites a completion-report passage. A reviewer can open both.
-- Precedents: only close ones are shown, 0 to 5, by a rule on two similarity scores. 82% of cited precedents are relevant, up from 74%, and a package with nothing comparable gets none instead of five weak ones.
-- forecast_timeline: honest finding. From the package fields alone the model is no better than the peer group (91 vs 85 days on 20 cases, and 17 of those were in training, so indicative only). With the project id it is 80, with real notice facts 60. So the brief asks for those details.
-- Tender checks: 672 of 1,939 international tenders were advertised for less than the Regulations' 30 business days; they drew fewer bidders (4.9 vs 5.6) and more single-bidder outcomes (28.5% vs 20.3%). Correlation, not proof, and part of it is the publication date on the Bank site.
-- Early warnings: 1,340 active projects, 73 red and 238 amber, each with its reasons. A weak mid-term ISR rating went with IEG-unsatisfactory 23.8% of the time vs 14.0%.
-
-## Slide 4. Trust
-
-- Lead with the leak, because it shows how I test. The registered @champion was refit on all data after evaluation, which is normal before deployment. Scored on the test tenders it gets 50 days and 95% coverage, because it has seen them. So every evaluation number comes from a refit at the cutoff: 75 days vs 88 for the peer lookup, coverage 81% vs 77%.
-- The backtest replays 300 real tenders on their notice date with everything later hidden: 87 days (CI 77-98) vs 100; slow-flag AUC 0.74 vs 0.58; the model does not beat the peer table for consulting (134 vs 127), so the brief leads with the peer group there.
-- Lessons: retrieved passages named a problem that the project's own completion report says happened in 38% of cases vs 8% for random passages.
-- Be straight about the evaluation size: 20 packages, and an LLM judge that agreed 90% of the time with 30 reference labels made by an AI agent during the build and is not deterministic. Evaluation labels come from a three-tier escalation: code decides what it can, a panel of three judges from different model families labels the rest, and disagreements go to an AI adjudicator that records its evidence. The pilot's first job is a larger labelled set with procurement specialists, who also validate these labels.
-- Weak spots, said plainly: 19% of packages get no precedent; on the final labels 5 of the 30 full briefs contain an unsupported claim, two of them confirmed against the data (a precedent called "same project" that is not, and an overstated firm-count range); a rule-based relevance check failed (kappa 0.21), so relevance needs a judge or a person.
-- Conflicting evidence is the most interesting finding. Half of the projects IEG rated unsatisfactory still looked satisfactory in their last ISR. So the platform cannot just "pick the best source"; the source depends on the question. Outcome: IEG first. Current status: the newest ISR. Both sides are always shown with a flag.
-- Data gaps: contract amendments, milestones and payments are not public (production would read STEP, Client Connection, PRAMS); no CPIA; awards only from FY2020; 300 of about 8,100 ICRs. Plain-text chunking had lost 26.8% of table rows in PADs; the table-aware parser fixes that, though it is worse at rank 1 (5 vs 8 of 12). Each gap has a stated workaround in data_gaps.md.
-
-## Slide 5. Rollout
-
-- The loop is real, not a diagram: Change Data Feed on nine tables, the graph updated by one MERGE, and the result equals a full rebuild row for row. Re-embedding is driven by content hashes.
-- Retraining needs a reason and data: drift, error or age, plus at least 1,000 new labelled contracts. Promotion is an alias move after a challenger beats the champion on the same window, so rollback is one alias move.
-- Pilot in three phases with go/no-go thresholds. Phase 0 shadow mode is where the hard trust KPIs must pass before any user sees an answer.
-- KPIs: planning cycle time baseline 160 days today; compare pilot hubs with similar non-pilot hubs, because durations depend on much more than this tool.
-- Close: what I would do in the first 90 days. Full ICR and PAD corpus, an amendment feed, the labelled evaluation set with specialists, and shadow mode.
-
-## Likely panel questions
+Questions a panel may ask about the prototype, with short answers. The slide deck (`slides/procurement_intelligence.pptx`, PDF copy next to it) carries its own speaker cues in the slide notes; the full design is in [proposal.md](proposal.md).
 
 1. **Why keep the knowledge graph in Delta tables and not a graph database?**
    - The questions are batch, two to four hops, over a few million edges; Spark joins and GraphFrames answer in seconds and gave identical answers in a check.
@@ -142,5 +82,5 @@ Talk of about 20 minutes over 5 slides, then 10 minutes of questions. The deck i
     - If asked which model adjudicated: Claude (Anthropic). It is the same family as the coding agents I used, so it was kept off the panel, and as adjudicator it settled factual questions with SQL or web evidence, recorded in the log, rather than its own opinion.
     - No person labelled items by hand, and I say so up front. The labels come from a three-tier escalation. Code decides what code can: is the actual duration inside the cited P10-P90 range, is every citation valid. A panel of three LLM judges from different model families labels the rest independently: gpt-oss-120b, Llama 4 Maverick, and Qwen 3.5 on supplier pairs or Llama 3.3 70B on briefs, because Qwen wrote the briefs. Where the judges disagree, an AI adjudicator agent with access to the warehouse tables and the web decides and writes down its evidence.
     - Why this design: every item gets the same rubric, so the labels are consistent; it is cheap, because only real disagreements get the deeper look (24 of 220 fields); judges from different families are calibrated against each other (kappa 0.86 on pairs); and every escalated decision has written evidence anyone can audit, in data/human_review/adjudication_log.md.
-    - It earns its keep: the adjudicator overturned 7 of 24 panel majorities and confirmed 2 real errors in the agent's briefs from the data, a precedent wrongly called "same project" and an overstated firm-count range. Final numbers: entity resolution precision 1.00 and recall 0.90 on 97 decided pairs; an unsupported claim in 5 of 30 briefs.
+    - It earns its keep: the adjudicator overturned 7 of 24 panel majorities and confirmed 2 real errors in the agent's briefs from the data, a precedent wrongly called "same project" and an overstated firm-count range. Final numbers: entity resolution precision 1.00 and recall 0.90 on 97 decided pairs; an unsupported claim in 5 of 30 briefs in the first version, 2 of 30 after the facts lines and the code fact-check, and 1 of 10 on a holdout.
     - Next: independent validation by procurement specialists is part of the pilot plan. Their labels become the next evaluation set and a check on the panel itself.

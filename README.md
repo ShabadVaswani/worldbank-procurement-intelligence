@@ -43,7 +43,7 @@ flowchart TB
 | What | Where |
 |---|---|
 | Technical proposal, organised by the brief's four modules (PDF, and Markdown with Mermaid diagrams) | [docs/proposal.pdf](docs/proposal.pdf), [docs/proposal.md](docs/proposal.md) |
-| Presentation deck (5 slides) and speaker notes with likely panel questions | [slides/procurement_intelligence.pptx](slides/procurement_intelligence.pptx), [PDF](slides/procurement_intelligence.pdf), [docs/speaker_notes.md](docs/speaker_notes.md) |
+| Presentation deck (7 slides, speaker cues in the slide notes) and likely panel questions | [slides/procurement_intelligence.pptx](slides/procurement_intelligence.pptx), [PDF](slides/procurement_intelligence.pdf), [docs/speaker_notes.md](docs/speaker_notes.md) |
 | Data gaps and how each one is handled | [docs/data_gaps.md](docs/data_gaps.md) |
 | Notebooks as Databricks source / as run, with outputs | `notebooks/`, `executed/` |
 | Evaluation labels: panel votes, tier-3 adjudication decisions with evidence and their log, final labels; the 30-brief review pack, the same 30 briefs after the fact-check, and 10 holdout briefs | `data/human_review/` ([adjudication_log.md](data/human_review/adjudication_log.md)) |
