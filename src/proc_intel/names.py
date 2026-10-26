@@ -80,12 +80,15 @@ BUSINESS_WORDS = frozenset({
 })
 
 # Joint-venture role markers carry no identity: 'ROHLET TRADING PLC (LEAD)', 'SMEC (LEAD PARTNER)'.
+# matches '(LEAD)' or '(LEAD PARTNER|FIRM|MEMBER|CONSULTANT)', with optional spaces inside the brackets
 _JV_ROLE = re.compile(r"\(\s*LEAD(?:\s+(?:PARTNER|FIRM|MEMBER|CONSULTANT))?\s*\)")
 # Words skipped when reading an acronym from a name ('LES CABLERIES DU SENEGAL' -> LCS).
 ACRONYM_STOPWORDS = frozenset({"AND", "OF", "THE", "FOR", "DE", "DU", "DES", "D", "ET", "EN", "POUR", "Y", "E",
                                "DA", "DO", "DI", "DEL", "LA", "LE", "L"})
+# one letter or digit at a word start followed by a dot: 'S.A.' -> 'SA', 'A.B.C.' -> 'ABC'; in 'INC.' the C does not
+# start a word, so that dot is left to _NON_ALNUM
 _ACRONYM_DOT = re.compile(r"\b([A-Z0-9])\.")
-_NON_ALNUM = re.compile(r"[^A-Z0-9]+")
+_NON_ALNUM = re.compile(r"[^A-Z0-9]+")  # runs of anything else; used after upper-casing, so it covers all punctuation
 
 
 def _ascii_upper(text: str) -> str:
@@ -98,6 +101,8 @@ def _ascii_upper(text: str) -> str:
 def _join_single_letters(tokens: list[str]) -> list[str]:
     out: list[str] = []
     run = ""
+    # run collects consecutive one-letter tokens and is flushed as one token when a longer token or the end arrives:
+    # ['S', 'A', 'TRADERS'] -> ['SA', 'TRADERS']
     for tok in tokens:
         # digits are not joined: "LOT 1 2" must not become "LOT12"
         if len(tok) == 1 and tok.isalpha():
@@ -119,9 +124,10 @@ def _remove_phrases(tokens: list[str]) -> list[str]:
         # LEGAL_PHRASES lists longer phrases before their shorter prefixes ("S DE RL DE CV" before "S DE RL"), so the
         # first match is the longest
         for phrase in LEGAL_PHRASES:
-            if tuple(tokens[i:i + len(phrase)]) == phrase:
+            if tuple(tokens[i:i + len(phrase)]) == phrase:  # near the end the slice is shorter than the phrase and cannot match
                 i += len(phrase)
                 break
+        # for/else: this branch runs only when no phrase matched at position i, so the token is kept
         else:
             out.append(tokens[i])
             i += 1
@@ -132,16 +138,19 @@ def base_tokens(name: str | None) -> list[str]:
     """Steps 1-4: transliterated, upper-case, punctuation-free tokens (legal forms still present)."""
     if not name:
         return []
+    # steps 1-3: ASCII upper case, '(LEAD)' markers removed while their brackets are still there, '&' spelled out
     text = _JV_ROLE.sub(" ", _ascii_upper(name)).replace("&", " AND ")
     # "S.A." -> "SA" before punctuation becomes spaces; otherwise it would split into the single letters "S A"
     text = _ACRONYM_DOT.sub(r"\1", text)
-    return _join_single_letters(_NON_ALNUM.sub(" ", text).split())
+    return _join_single_letters(_NON_ALNUM.sub(" ", text).split())  # rest of step 3, then step 4
 
 
 def normalise_supplier_name(name: str | None) -> str:
     """Comparison key for a supplier name, e.g. 'M/S. Aires Ingegneria S.p.A.' -> 'AIRES INGEGNERIA'."""
     tokens = base_tokens(name)
+    # steps 5 and 6: multi-word legal phrases first, then one-word legal forms anywhere in the name
     stripped = [t for t in _remove_phrases(tokens) if t not in LEGAL_FORMS]
+    # step 7: designators only at the front, one at a time ('MS THE X' loses both)
     while stripped and stripped[0] in LEADING_DESIGNATORS:
         stripped = stripped[1:]
     # a name that is only a legal form ("THE COMPANY LTD") keeps its tokens rather than becoming empty
@@ -155,6 +164,8 @@ def compact_key(normalised: str) -> str:
 
 def is_consortium(name: str | None) -> bool:
     """True for joint-venture / consortium names (one supplier record naming several firms)."""
+    # the pattern runs on the cleaned tokens, so tabs and punctuation around a marker do not hide it; \b keeps 'JVR'
+    # from matching 'JV'
     return bool(name) and bool(CONSORTIUM_PATTERN.search(" ".join(base_tokens(name))))
 
 
@@ -172,12 +183,14 @@ def is_person_like(name: str | None) -> bool:
         return False
     if any(t in LEGAL_FORMS or t in BUSINESS_WORDS for t in tokens):
         return False
+    # finally, no multi-word legal phrase may start at any position ('S DE RL')
     return not any(tuple(tokens[i:i + len(p)]) == p for p in LEGAL_PHRASES for i in range(len(tokens)))
 
 
 def token_index(normalised_names: Iterable[str]) -> dict[str, set[str]]:
     """Token -> the set of (distinct) normalised names containing it."""
     index: dict[str, set[str]] = defaultdict(set)
+    # set() first, so a name repeated in the input is counted once
     for name in set(normalised_names):
         for token in name.split():
             index[token].add(name)
@@ -202,6 +215,8 @@ def is_ambiguous_person_name(name: str | None, normalised: str, index: Mapping[s
         return False
     # names containing every word of this one (its own spelling variants) are not evidence that the words are common
     sharing_all = set.intersection(*(set(index.get(t, ())) for t in tokens))
+    # per word: names containing it minus the variants that contain every word; ambiguous when even the rarest word
+    # passes max_others. In the tests ARUN and KUMAR are each in 5 names and only 'ARUN KUMAR' has both: 4 and 4 > 3
     return min(len(index.get(t, ())) - len(sharing_all) for t in tokens) > max_others
 
 
@@ -214,6 +229,7 @@ def is_acronym_of(short_name: str | None, long_name: str | None) -> bool:
     # an acronym is one alphabetic word of 2-8 letters; anything else is not tested
     if len(short) != 1 or not 2 <= len(short[0]) <= 8 or not short[0].isalpha() or len(words) < 2:
         return False
+    # two readings of the initials: every word ('LES CABLERIES DU SENEGAL' -> 'LCDS') or no connecting words ('LCS')
     with_all = "".join(w[0] for w in words)
     without_small = "".join(w[0] for w in words if w not in ACRONYM_STOPWORDS)
     return short[0] in (with_all, without_small)
@@ -226,11 +242,12 @@ def drop_self_acronym(normalised: str) -> str:
     tokens = normalised.split()
     if len(tokens) < 3:
         return normalised
+    # try each word as the initials of the others (with and without connecting words) and drop the first hit
     for k, tok in enumerate(tokens):
         others = [t for i, t in enumerate(tokens) if i != k]
         initials = {"".join(t[0] for t in others),
                     "".join(t[0] for t in others if t not in ACRONYM_STOPWORDS)}
-        if len(tok) >= 2 and tok in initials:
+        if len(tok) >= 2 and tok in initials:  # a one-letter word is never treated as initials
             return " ".join(others)
     return normalised
 

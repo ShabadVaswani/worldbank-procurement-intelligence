@@ -37,6 +37,7 @@ def _block_scores(matrix: sparse.csr_matrix, blocks: Sequence[Hashable], min_sco
     Within a block almost every pair shares some trigram, so a chunk's product has about
     chunk_size x block_size non-zeros; the chunk size bounds that memory.
     """
+    # block -> row positions of its members, in increasing order
     by_block: dict[Hashable, list[int]] = defaultdict(list)
     for idx, block in enumerate(blocks):
         by_block[block].append(idx)
@@ -44,12 +45,15 @@ def _block_scores(matrix: sparse.csr_matrix, blocks: Sequence[Hashable], min_sco
         if len(members) < 2:
             continue
         ids = np.asarray(members)
-        sub = matrix[ids]
+        sub = matrix[ids]  # the block's rows: position p in sub is row ids[p] of matrix
         for start in range(0, len(ids), chunk_size):
+            # cosines of a chunk of rows against the whole block (rows are unit length, so a dot product is a cosine);
+            # tocoo() lists the non-zero entries as (row, col, value)
             scores = (sub[start:start + chunk_size] @ sub.T).tocoo()
-            rows = scores.row + start
+            rows = scores.row + start  # chunk-local row numbers -> positions in the block, comparable with scores.col
             # rows < cols keeps each unordered pair once and drops the diagonal (a name with itself)
             keep = (scores.data >= min_score) & (rows < scores.col)
+            # ids is increasing, so i < j between block positions stays i < j between matrix rows
             yield ids[rows[keep]], ids[scores.col[keep]], scores.data[keep]
 
 
@@ -64,6 +68,8 @@ def candidate_pairs(matrix: sparse.csr_matrix, blocks: Sequence[Hashable], min_s
     parts = list(_block_scores(matrix, blocks, min_score, chunk_size))
     if not parts:
         return np.array([], dtype=np.int64), np.array([], dtype=np.int64), np.array([], dtype=np.float32)
+    # parts is a list of (i, j, cosine) chunks; zip(*parts) regroups them into the i chunks, the j chunks and the
+    # cosine chunks
     return tuple(np.concatenate(arrays) for arrays in zip(*parts, strict=True))
 
 
@@ -74,12 +80,14 @@ def score_band_counts(matrix: sparse.csr_matrix, blocks: Sequence[Hashable], gro
     Used to weight a stratified labelled sample: counts are accumulated chunk by chunk, so the
     pairs themselves are never held in memory.
     """
-    codes = pd.factorize(pd.Series(list(groups)))[0]
+    codes = pd.factorize(pd.Series(list(groups)))[0]  # one integer per group, so the same-group test below is vectorised
     counts: dict[float, int] = defaultdict(int)
     for i, j, score in _block_scores(matrix, blocks, min_score, chunk_size):
         keep = codes[i] != codes[j]
         # float64 and round(2) so the band keys match the bands computed for the labels in p04
+        # floor(score / band_width) * band_width is the lower edge of the band (0.73 -> 0.7), capped at 1.0
         bands = np.minimum(np.floor(score[keep].astype(np.float64) / band_width) * band_width, 1.0).round(2)
+        # count this chunk's pairs per band and add them to the running totals
         for band, n in zip(*np.unique(bands, return_counts=True), strict=True):
             counts[float(band)] += int(n)
     return dict(counts)
@@ -105,12 +113,14 @@ def soft_word_match(words_a: str, words_b: str, extra_words: int = 1) -> float:
     if not a or not b:
         return 0.0
     short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    # best fuzz.ratio (0-100) of each word against any word of the other list, from both sides; the long side is
+    # sorted so its worst-matched words come first
     short_scores = [max(fuzz.ratio(w, v) for v in long_) for w in short]
     long_scores = sorted(max(fuzz.ratio(w, v) for v in short) for w in long_)
     # an extra word is only forgiven next to at least two matched words: a one-word name such as
     # 'MULTISERVICES' would otherwise match every 'X MULTISERVICES' and become a hub
-    allowed = min(extra_words, len(long_) - len(short)) if len(short) >= 2 else 0
-    kept = long_scores[allowed:]
+    allowed = min(extra_words, len(long_) - len(short)) if len(short) >= 2 else 0  # never more than the length difference
+    kept = long_scores[allowed:]  # drop the `allowed` worst-matched words of the longer list
     return min(short_scores + kept) / 100.0
 
 
@@ -132,6 +142,7 @@ class UnionFind:
         ra, rb = self.find(a), self.find(b)
         if ra == rb:
             return
+        # union by size: the smaller tree goes under the larger root, which keeps find() short
         if self.size[ra] < self.size[rb]:
             ra, rb = rb, ra
         self.parent[rb] = ra
@@ -145,6 +156,7 @@ def connected_components(n: int, edges: Iterable[tuple[int, int]]) -> list[int]:
         uf.union(a, b)
     smallest: dict[int, int] = {}
     roots = [uf.find(i) for i in range(n)]
+    # nodes are visited in index order, so setdefault records the first (smallest) node of each root
     for i, root in enumerate(roots):
         smallest.setdefault(root, i)
     return [smallest[root] for root in roots]
@@ -161,12 +173,13 @@ def precision_recall(labels: Sequence[bool], predicted: Sequence[bool],
     if len(labels) != len(predicted) or (weights is not None and len(weights) != len(labels)):
         raise ValueError("labels, predictions and weights must have the same length")
     w = [1.0] * len(labels) if weights is None else [float(x) for x in weights]
+    # weighted counts: each pair adds its weight (1.0 without weights)
     tp = sum(wi for y, p, wi in zip(labels, predicted, w, strict=True) if y and p)
     fp = sum(wi for y, p, wi in zip(labels, predicted, w, strict=True) if not y and p)
     fn = sum(wi for y, p, wi in zip(labels, predicted, w, strict=True) if y and not p)
     precision = tp / (tp + fp) if tp + fp else float("nan")
     recall = tp / (tp + fn) if tp + fn else float("nan")
-    f1 = 2 * precision * recall / (precision + recall) if tp else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if tp else 0.0  # no true positive: F1 is 0, even when precision or recall is NaN
     counts = {"tp": sum(1 for y, p in zip(labels, predicted, strict=True) if y and p),
               "fp": sum(1 for y, p in zip(labels, predicted, strict=True) if not y and p),
               "fn": sum(1 for y, p in zip(labels, predicted, strict=True) if y and not p)}
@@ -178,6 +191,8 @@ def wilson_interval(successes: int, trials: int, z: float = 1.96) -> tuple[float
     if trials == 0:
         return float("nan"), float("nan")
     p = successes / trials
+    # Wilson score interval: the centre is p pulled towards 0.5 by z^2 / (2n), the half-width adds z^2 / (4n^2) to the
+    # binomial variance p(1 - p) / n, and both are scaled by 1 / (1 + z^2 / n)
     centre = (p + z * z / (2 * trials)) / (1 + z * z / trials)
     half = z * math.sqrt(p * (1 - p) / trials + z * z / (4 * trials * trials)) / (1 + z * z / trials)
     return centre - half, centre + half

@@ -64,6 +64,8 @@ def strip_country_name(normalised: str, country_name: str | None, country_code: 
     """Remove the block's own country from a name: its name anywhere, its code as the last word."""
     text = normalised
     if country_name:
+        # the country name is normalised like the supplier names ("Cote d'Ivoire" -> 'COTE D IVOIRE'); the \b anchors
+        # below remove it only as whole words
         phrase = normalise_supplier_name(country_name)
         if phrase:
             text = re.sub(rf"\b{re.escape(phrase)}\b", " ", text)
@@ -71,7 +73,7 @@ def strip_country_name(normalised: str, country_name: str | None, country_code: 
     # the code only as the last word ("ACME BUILDERS NG"); elsewhere two letters are more likely initials
     if country_code and len(tokens) > 1 and tokens[-1] == country_code.upper():
         tokens = tokens[:-1]
-    return " ".join(tokens) or normalised
+    return " ".join(tokens) or normalised  # a name that was only the country ('NIGERIA') is kept whole
 
 
 def distinctive_words(comparison: str, token_df: Mapping[str, int], generic_df: float) -> str:
@@ -81,8 +83,11 @@ def distinctive_words(comparison: str, token_df: Mapping[str, int], generic_df: 
     of one firm do not end up with different distinctive words.
     """
     def frequency(word: str) -> int:
+        # document frequency of the word, its plural and its singular ('SOLUTIONS' -> 'SOLUTION'); the most frequent
+        # form decides
         variants = {word, word + "S", word[:-1] if word.endswith("S") else word}
         return max(token_df.get(v, 0) for v in variants)
+    # keep the words found in at most generic_df of the country's names; sorting makes word order irrelevant
     return " ".join(sorted(t for t in comparison.split() if frequency(t) <= generic_df))
 
 
@@ -98,19 +103,24 @@ def prepare_records(records: pd.DataFrame, rules: MatchRules = MatchRules(),
     # positions become node ids in the union-find, and the first record of a component names its entity: sort first so
     # ids are stable across runs
     out = records.sort_values(["supplier_id", "name", "country_code"], na_position="last").reset_index(drop=True)
+    # records without a country share the '<none>' block; decide() gives pairs in it no name links
     out["block"] = out["country_code"].fillna(NO_COUNTRY)
     out["normalised"] = out["name"].map(normalise_supplier_name)
+    # comparison string: the normalised name without the block's country name or trailing code (only when the country
+    # is known), then without a word that is just the initials of the others ('... ASSOCIATES ECA')
     out["comparison"] = [drop_self_acronym(strip_country_name(n, country_names.get(c), c) if isinstance(c, str) else n)
                          for n, c in zip(out["normalised"], out["country_code"], strict=True)]
     out["key"] = out["comparison"].map(compact_key)
     out["is_consortium"] = out["name"].map(is_consortium)
-    out["digits"] = out["normalised"].map(digit_tokens)
+    out["digits"] = out["normalised"].map(digit_tokens)  # numbers in the name, e.g. {'145'}; fuzzy links need equal sets
     ambiguous = pd.Series(False, index=out.index)
     distinctive = pd.Series("", index=out.index)
+    # per country block (idx = the block's row labels): a token index of the block's comparison strings gives each
+    # word's document frequency, which drives both the ambiguous-person flag and the generic-word cut
     for _, idx in out.groupby("block").groups.items():
         names = out.loc[idx, "comparison"]
         index = token_index(names)
-        token_df = {t: len(v) for t, v in index.items()}
+        token_df = {t: len(v) for t, v in index.items()}  # word -> number of distinct names in the block that contain it
         # a floor of 10 names for small countries, 0.5% of the distinct names for large ones
         generic_df = max(rules.generic_min_df, rules.generic_share * names.nunique())
         ambiguous.loc[idx] = [is_ambiguous_person_name(name, comp, index, rules.ambiguous_max_others)
@@ -125,8 +135,10 @@ def _within_groups(records: pd.DataFrame, columns: list[str], chain: bool) -> se
     """Index pairs inside each group: consecutive members (chain) or all pairs."""
     pairs: set[tuple[int, int]] = set()
     for _, idx in records.groupby(columns if len(columns) > 1 else columns[0]).groups.items():
+        # idx holds the group's row labels, i.e. positions 0..n-1 after prepare_records' reset_index, so sorted members
+        # give pairs with i < j; groupby drops missing keys, so a record without a supplier_id gets no same-id pairs
         members = sorted(idx)
-        pairs.update(pairwise(members) if chain else combinations(members, 2))
+        pairs.update(pairwise(members) if chain else combinations(members, 2))  # chain: (a, b), (b, c), ...; otherwise every combination
     return pairs
 
 
@@ -138,26 +150,37 @@ def score_candidates(records: pd.DataFrame, rules: MatchRules = MatchRules()) ->
     """
     matrix = char_ngram_tfidf(records["comparison"].tolist())
     i, j, cosine = candidate_pairs(matrix, records["block"].tolist(), rules.candidate_floor)
+    # i, j, cosine: aligned arrays of name candidates (i < j, same block, cosine >= candidate_floor); only i and j are
+    # kept, because the cosine is recomputed below for every pair, including the extra ones
     pairs = pd.DataFrame({"i": i, "j": j})
-    named = records[records["key"] != ""]
+    named = records[records["key"] != ""]  # an empty key must not link all nameless records together
     # identical keys are chained (n-1 pairs instead of n^2: one link each is enough to connect them);
     # shared ids need every pair, because each pair is checked for similar names separately
     extra = _within_groups(named, ["block", "key"], chain=True) | _within_groups(records, ["supplier_id"], chain=False)
     extra = pd.DataFrame(sorted(extra), columns=["i", "j"])
+    # a pair found both by cosine and by key or id appears once
     pairs = pd.concat([pairs, extra], ignore_index=True).drop_duplicates(["i", "j"], ignore_index=True)
+    # no pairs at all: return an empty frame that still has every feature column, so decide() works on it
     if pairs.empty:
         return pairs.assign(cosine=0.0, same_id=False, acronym=False, same_key=False, digits_agree=False,
                             consortium_agree=False, ambiguous=False, no_country=False, core_similarity=0.0)
+    # rows of the TF-IDF matrix are unit length, so the row-wise sum of the elementwise product of rows i and j is
+    # their cosine; this also scores the key and same-id pairs that candidate_pairs did not return
     pairs["cosine"] = np.asarray(matrix[pairs["i"].to_numpy()].multiply(matrix[pairs["j"].to_numpy()]).sum(axis=1)).ravel()
+    # a and b are the two sides of the pairs, row k of each describing pair k
     a, b = records.loc[pairs["i"]].reset_index(drop=True), records.loc[pairs["j"]].reset_index(drop=True)
     pairs["same_id"] = (a["supplier_id"] == b["supplier_id"]).to_numpy()
+    # the acronym test, in both directions, runs only for same-id pairs: the same_id rule is the only one that uses it
     pairs["acronym"] = [same and (is_acronym_of(x, y) or is_acronym_of(y, x))
                         for same, x, y in zip(pairs["same_id"], a["name"], b["name"], strict=True)]
     pairs["same_key"] = ((a["key"] == b["key"]) & (a["key"] != "") & (a["block"] == b["block"])).to_numpy()
     pairs["digits_agree"] = (a["digits"] == b["digits"]).to_numpy()
     pairs["consortium_agree"] = (a["is_consortium"] == b["is_consortium"]).to_numpy()
     pairs["ambiguous"] = (a["ambiguous_person"] | b["ambiguous_person"]).to_numpy()
+    # a's block is enough: name-rule pairs always lie in one block, and same-id pairs (which may span blocks) ignore
+    # this flag
     pairs["no_country"] = (a["block"] == NO_COUNTRY).to_numpy()
+    # word-by-word match of the distinctive words, 0-1 (see similarity.soft_word_match)
     pairs["core_similarity"] = [soft_word_match(x, y) for x, y in zip(a["distinctive"], b["distinctive"], strict=True)]
     return pairs
 
@@ -169,11 +192,15 @@ def decide(pairs: pd.DataFrame, rules: MatchRules = MatchRules()) -> pd.Series:
     same_id = pairs["same_id"] & ((pairs["cosine"] >= rules.same_id_min_cosine) | pairs["acronym"])
     # same-id pairs are decided by the rule above only; name rules apply to pairs of different ids
     usable = ~pairs["ambiguous"] & ~pairs["same_id"] & ~pairs["no_country"]
+    # exact_name: the same comparison key (spaces ignored) in the same country
     exact = usable & pairs["same_key"]
+    # fuzzy_name: a high trigram cosine plus every guard (same numbers, same joint-venture status, matching
+    # distinctive words)
     fuzzy = (usable & ~pairs["same_key"] & (pairs["cosine"] >= rules.fuzzy_threshold)
              & pairs["digits_agree"] & pairs["consortium_agree"]
              & (pairs["core_similarity"] >= rules.core_min_similarity))
     # np.select takes the first true condition, so a pair records its strongest rule
+    # pairs that meet no rule get None and are not links
     return pd.Series(np.select([same_id, exact, fuzzy], ["same_id", "exact_name", "fuzzy_name"], default=None),
                      index=pairs.index, dtype=object)
 
@@ -186,12 +213,14 @@ def resolve(records: pd.DataFrame, pairs: pd.DataFrame, rule: pd.Series) -> pd.S
     """
     linked = rule.notna()
     labels = connected_components(len(records), zip(pairs.loc[linked, "i"], pairs.loc[linked, "j"], strict=True))
+    # labels[k] is the smallest record position in record k's component, so first_id[label] is the supplier_id of the
+    # component's first record in sort order
     first_id = records["supplier_id"].to_numpy()
     names: dict[int, str] = {}
     used: dict[str, int] = {}
     for label in sorted(set(labels)):
         base = f"SE-{first_id[label]}"
-        used[base] = used.get(base, 0) + 1
+        used[base] = used.get(base, 0) + 1  # components named after this supplier_id so far
         # labels are visited in sorted order, so which component gets the suffix is deterministic
         names[label] = base if used[base] == 1 else f"{base}-{used[base]}"
     return pd.Series([names[label] for label in labels], index=records.index)

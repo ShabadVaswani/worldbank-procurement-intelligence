@@ -139,6 +139,7 @@ _LOCK = threading.Lock()
 LEDGER = {}                       # endpoint -> [prompt tokens, completion tokens, calls]
 SCHEMA_OK = {}                    # endpoint -> accepts response_format json_schema
 
+# endpoint name -> its ready state ("READY" when it can take requests)
 served = {e.name: (e.state.ready.value if e.state and e.state.ready else None) for e in WorkspaceClient().serving_endpoints.list()}
 for name in JUDGES:
     print(f"{name:42s} {FAMILY[name]:8s} {served.get(name)}")
@@ -148,11 +149,14 @@ assert not missing, f"endpoints missing or not ready: {missing}"
 
 
 def dbu_spent():
+    # estimated DBU so far: each endpoint's prompt and completion tokens times its price per million tokens
     with _LOCK:
         return sum((p * DBU_PER_M[m][0] + c * DBU_PER_M[m][1]) / 1e6 for m, (p, c, _) in LEDGER.items())
 
 
 def _post(endpoint, body, timeout=180, max_retries=8):
+    # retries a 429 (throttled), a 5xx or a network error with exponential backoff plus jitter, at most 30 s per wait;
+    # any other status fails at once
     for attempt in range(max_retries):
         try:
             r = requests.post(f"https://{_HOST}/serving-endpoints/{endpoint}/invocations",
@@ -186,6 +190,7 @@ class _Fallback(Exception):
 
 def _openrouter_chat(endpoint, system, user, schema, max_tokens):
     """The same model through OpenRouter (strict schema required of the provider); _Fallback -> Databricks endpoint."""
+    # past the run budget, or after a 402, every later call goes straight to the Databricks endpoint
     with _LOCK:
         if OR_STATE["usd"] > OR_MAX_USD:
             OR_STATE["off"] = "run budget reached"
@@ -203,6 +208,7 @@ def _openrouter_chat(endpoint, system, user, schema, max_tokens):
         try:
             r = requests.post("https://openrouter.ai/api/v1/chat/completions", json=body, timeout=120,
                               headers={"Authorization": f"Bearer {_OR_KEY}"})
+            # 402 (out of credit) switches OpenRouter off for the run; 429 falls back for this call only
             if r.status_code == 402:
                 with _LOCK:
                     OR_STATE["off"] = "HTTP 402 (credit)"
@@ -216,6 +222,7 @@ def _openrouter_chat(endpoint, system, user, schema, max_tokens):
         except requests.exceptions.RequestException as e:
             err = type(e).__name__
         time.sleep(1 + attempt * 2)
+    # other failures: 3 attempts in all, then this call falls back
     if j is None:
         raise _Fallback(f"3 failed attempts ({err})")
     content = j["choices"][0]["message"].get("content")
@@ -253,6 +260,7 @@ def chat(endpoint, system, user, schema, max_tokens):
         body["reasoning_effort"] = "none"
     if "gpt-oss" in endpoint:
         body["reasoning_effort"] = "low"
+    # SCHEMA_OK starts as True; the first HTTP 400 marks the endpoint as rejecting the schema; later calls omit it
     if SCHEMA_OK.get(endpoint, True):
         try:
             resp = _post(endpoint, {**body, "response_format": schema})
@@ -273,6 +281,7 @@ def chat(endpoint, system, user, schema, max_tokens):
     return (content or "").strip()
 
 
+# a tiny pair request per judge proves that it answers and that the answer parses, before any labelling
 for name in JUDGES:
     t0 = time.time()
     text = chat(name, pn.PAIR_RUBRIC, pn.pair_message("ACME TRADING LTD", "ACME TRADING LIMITED", "GH"), pn.PAIR_SCHEMA, 600)
@@ -290,6 +299,7 @@ for name in JUDGES:
 
 # COMMAND ----------
 
+# one row per labelled supplier pair: supplier_id_a, name_a, supplier_id_b, name_b, country_code and the earlier label
 pairs = pd.read_csv(PAIRS_PATH, dtype=str, keep_default_na=False)
 if not WITH_PAIRS:                # a re-measured review pack: the pairs keep the first run's final labels
     pairs = pairs.iloc[0:0].copy()
@@ -302,9 +312,11 @@ assert (briefs["n_precedents"] == [pn.listed_items(t, "Similar precedents") for 
 
 def record_lines(pairs):
     """(supplier_id, name) -> (kind, up to CONTRACTS_PER_RECORD lines, newest first) for every record of the pairs."""
+    # every distinct (supplier_id, name) record of the pairs, from both sides
     records = spark.createDataFrame(
         pd.concat([pairs[["supplier_id_a", "name_a"]].set_axis(["supplier_id", "name"], axis=1),
                    pairs[["supplier_id_b", "name_b"]].set_axis(["supplier_id", "name"], axis=1)]).drop_duplicates())
+    # one line per contract of a record: signing year, project, category and the start of the description
     contract_lines = (spark.table(f"{SILVER}.contract_suppliers").select("contract_id", "supplier_id", F.col("supplier_name").alias("name"))
                       .join(records, ["supplier_id", "name"])
                       .join(spark.table(f"{SILVER}.contracts").select("contract_id", "project_id", "signing_date",
@@ -312,6 +324,7 @@ def record_lines(pairs):
                       .select("supplier_id", "name", F.col("signing_date").alias("d"),
                               F.concat_ws(" ", F.year("signing_date"), "project_id", "procurement_category_code",
                                           F.substring("contract_description", 1, 90)).alias("line")))
+    # one line per award notice naming a record, with the record's role in it
     notice_lines = (spark.table(f"{SILVER}.notice_bidders").select("notice_id", "supplier_id", F.col("firm_name").alias("name"), "role")
                     .join(records, ["supplier_id", "name"])
                     .join(spark.table(f"{SILVER}.notices").select("notice_id", "project_id", "notice_date", "bid_description"), "notice_id")
@@ -319,6 +332,7 @@ def record_lines(pairs):
                             F.concat_ws(" ", F.year("notice_date"), "project_id", F.concat(F.lit("award notice, "), "role"),
                                         F.substring("bid_description", 1, 90)).alias("line")))
     ctx = {}
+    # contracts are read first and each source newest first, so a record keeps its latest lines
     for source in (contract_lines, notice_lines):
         for r in source.orderBy(F.desc("d")).collect():
             key = (r.supplier_id, r.name)
@@ -334,11 +348,13 @@ def record_lines(pairs):
 ctx = record_lines(pairs) if WITH_PAIRS else {}
 n_records = len(pd.concat([pairs[["supplier_id_a", "name_a"]].set_axis(["supplier_id", "name"], axis=1),
                            pairs[["supplier_id_b", "name_b"]].set_axis(["supplier_id", "name"], axis=1)]).drop_duplicates())
+# a record with no contract or notice line gets an empty text
 pairs["contracts_a"] = ["\n".join(ctx.get((s, n), ("", []))[1]) for s, n in zip(pairs["supplier_id_a"], pairs["name_a"])]
 pairs["contracts_b"] = ["\n".join(ctx.get((s, n), ("", []))[1]) for s, n in zip(pairs["supplier_id_b"], pairs["name_b"])]
 print(f"pairs {len(pairs)} | records with contract or notice lines: {len(ctx)} of {n_records} | "
       f"briefs {len(briefs)}, precedents listed {briefs['n_precedents'].sum()}, risks listed {briefs['n_risks'].sum()}")
 if WITH_PAIRS:
+    # one example of the message a judge sees (the pair at index 87)
     print(pn.pair_message(*pairs.loc[87, ["name_a", "name_b", "country_code", "contracts_a", "contracts_b"]]))
 
 # COMMAND ----------
@@ -387,6 +403,8 @@ def judge(endpoint, system, user, schema, max_tokens):
     return answer, text
 
 
+# jobs: one tuple per item and judge, (item_type, item_id, endpoint, rubric, message, schema, max_tokens);
+# job[2:] are judge()'s arguments, and pool.map returns the answers in job order
 jobs = ([("pair", r.pair_id, j, pn.PAIR_RUBRIC,
           pn.pair_message(r.name_a, r.name_b, r.country_code, r.contracts_a, r.contracts_b), pn.PAIR_SCHEMA, 700)
          for r in pairs.itertuples() for j in PANEL_A]
@@ -410,6 +428,7 @@ print(f"{len(jobs)} judgements in {time.time() - t0:.0f} s; schema accepted: {SC
 
 # COMMAND ----------
 
+# (review_id, judge) -> that judge's parsed step-3 answer on the brief
 brief_answer = {(job[1], job[2]): a for job, (a, _) in zip(jobs, answers, strict=True) if job[0] == "brief"}
 pooled = {}
 for r in briefs.to_dict("records"):
@@ -417,15 +436,18 @@ for r in briefs.to_dict("records"):
     # pool every claim any judge quoted; each judge then checks the same list, so a split means a real disagreement, not
     # one judge missing a claim
     pooled[r["review_id"]] = pn.candidate_claims([f if isinstance(f, list) else [] for f in found])
+# one check per brief and judge, only for briefs with at least one pooled claim
 claim_jobs = [(r["review_id"], j, pn.claim_message(r, pooled[r["review_id"]], PACKAGE_FACTS))
               for r in briefs.to_dict("records") if pooled[r["review_id"]] for j in PANEL_B]
 t0 = time.time()
 with ThreadPoolExecutor(max_workers=WORKERS) as pool:
     claim_answers = list(pool.map(lambda job: judge(job[1], CLAIM_RUBRIC, job[2], pn.CLAIM_SCHEMA, 1200), claim_jobs))
 json.dump(CACHE, open(CACHE_PATH, "w"))
+# (review_id, judge) -> ("yes" or "no", rationale) from the pooled-claim check
 claim_vote = {(rid, j): pn.claim_vote(a, pooled[rid]) for (rid, j, _), (a, _) in zip(claim_jobs, claim_answers, strict=True)}
 print(f"briefs with a quoted claim: {sum(bool(c) for c in pooled.values())} of {len(briefs)}; pooled claims: "
       f"{sum(map(len, pooled.values()))}; {len(claim_jobs)} checks in {time.time() - t0:.0f} s")
+# how many answers each judge got from each backend, and how many came from the cache
 served_df = (pd.DataFrame(SERVED, columns=["judge", "served_by", "from_cache"]).assign(judge=lambda d: d["judge"].map(SHORT))
              .value_counts().rename("answers").reset_index().sort_values(["judge", "served_by", "from_cache"]))
 served_df.to_csv(f"{OUT_DIR}/panel_providers{TAG}.csv", index=False)
@@ -453,6 +475,7 @@ brief_of = briefs.set_index("review_id")
 vote_rows = []
 for (item_type, item_id, endpoint, *_), (answer, text) in zip(jobs, answers, strict=True):
     if item_type == "pair":
+        # one field per pair; an invalid answer is stored as None, with the start of the raw text as its rationale
         v = pn.normalise("same_firm", (answer or {}).get("answer"))
         votes = {"same_firm": (v, str((answer or {}).get("reason", "")) if v else f"no valid answer: {text[:150]}")}
     else:
@@ -461,10 +484,12 @@ for (item_type, item_id, endpoint, *_), (answer, text) in zip(jobs, answers, str
         # Llama models got that comparison wrong
         votes = pn.brief_votes(answer, int(b["n_precedents"]), int(b["n_risks"]))
         if votes["any_unsupported_claim"][0] is not None:          # the check of the pooled claims decides
+            # a brief with no pooled claim had no claim job, hence the "no" default
             votes["any_unsupported_claim"] = claim_vote.get((item_id, endpoint), ("no", "no judge quoted an unsupported claim"))
     for field, (value, why) in votes.items():
         vote_rows.append({"item_type": item_type, "item_id": str(item_id), "judge": endpoint, "field": field,
                           "value": value, "rationale": " ".join(why.split())[:300]})
+# votes_df: one row per item x judge x field, the grain of proc_gold.label_panel
 votes_df = pd.DataFrame(vote_rows)
 n_panel = publish_table(
     spark.createDataFrame(votes_df.astype(object).where(votes_df.notna(), None),
@@ -495,20 +520,24 @@ display(votes_df.groupby(["item_type", "field", "judge"])["value"].value_counts(
 
 vote_of = {(r["item_type"], r["item_id"], r["field"], r["judge"]): r["value"] for r in vote_rows}
 keys = list(dict.fromkeys((r["item_type"], r["item_id"], r["field"]) for r in vote_rows))     # job order
+# items: one row per item x field with the votes in panel order, the panel value and the escalation reason
 items = []
 for item_type, item_id, field in keys:
     judges = PANEL_A if item_type == "pair" else PANEL_B
     v = [vote_of[(item_type, item_id, field, j)] for j in judges]
+    # n_listed (items the brief lists) is only defined for the two count fields
     n_listed = None
     if item_type == "brief":
         b = brief_of.loc[item_id]
         n_listed = {"precedents_relevant": int(b["n_precedents"]), "risks_relevant": int(b["n_risks"])}.get(field)
+    # reason is "" when the panel value stands, otherwise why the field escalates to tier 3
     reason = pn.disagreement(field, v, n_listed)
     items.append({"item_type": item_type, "item_id": item_id, "field": field, "n_listed": n_listed, "votes": v,
                   "judges": judges, "panel_value": pn.panel_value(field, v), "needs_owner": bool(reason), "reason": reason})
 agg = pd.DataFrame(items)
 
 # earlier automated labels, for comparison only: neither side is ground truth
+# earlier pair labels are "1" or "0"; risks_relevant has no earlier score, so it is left out
 earlier = {("pair", p, "same_firm"): {"1": "same", "0": "different"}.get(v) for p, v in zip(pairs["pair_id"], pairs["label_same_entity"])}
 for b in briefs.to_dict("records"):
     earlier[("brief", b["review_id"], "timeline_ok")] = pn.normalise("timeline_ok", b["auto_timeline_ok"])
@@ -517,9 +546,11 @@ for b in briefs.to_dict("records"):
     earlier[("brief", b["review_id"], "any_unsupported_claim")] = pn.normalise("any_unsupported_claim", b["auto_unsupported_claim"])
 agg["earlier_label"] = [earlier.get((t, i, f)) for t, i, f in zip(agg["item_type"], agg["item_id"], agg["field"])]
 
+# stats: one row per item_type x field with unanimity, escalations, judge agreement and agreement with the earlier labels
 stats = []
 for (item_type, field), g in agg.groupby(["item_type", "field"], sort=False):
     judges = g["judges"].iloc[0]
+    # by_judge: judge -> its votes on this field's items, in item order
     by_judge = {SHORT[j]: [v[k] for v in g["votes"]] for k, j in enumerate(judges)}
     kind = pn.FIELD_KIND[field]
     pw = pn.pairwise_agreement(by_judge)
@@ -528,6 +559,7 @@ for (item_type, field), g in agg.groupby(["item_type", "field"], sort=False):
            **{f"agree {k}": v for k, v in pw["pairs"].items()},
            "fleiss_kappa": pn.fleiss_kappa(list(g["votes"])) if kind != "count" else None,
            "pairwise_within_1": pn.pairwise_agreement(by_judge, tolerance=1)["mean"] if kind == "count" else None}
+    # compared on all items and on the settled ones only (those keep the panel value as the final label)
     if g["earlier_label"].notna().any():
         settled = g[~g["needs_owner"]]
         row["agree_with_earlier_all"] = pn.agreement_with(list(g["earlier_label"]), list(g["panel_value"]))["agreement"]
@@ -567,11 +599,13 @@ if WITH_PAIRS:                    # a re-measured review pack keeps the first ru
     assert (old["tp"], old["fp"], old["fn"]) == (36, 1, 4), "the published entity map no longer matches p04's evaluation"
 
     pa = agg[agg["item_type"] == "pair"].set_index("item_id")
+    # settled pairs: the panel value stands without tier 3 (needs_owner is the escalation flag)
     settled = pairs[pairs["pair_id"].map(lambda p: not pa.at[p, "needs_owner"])]
     y = pn.er_labels([pa.at[p, "panel_value"] for p in settled["pair_id"]])
     # pairs the panel settled as "unsure" carry no label and are left out of precision and recall
     keep = [v is not None for v in y]
     pr = precision_recall([v for v, k in zip(y, keep) if k], [p for p, k in zip(settled["pipeline_same"], keep) if k])
+    # 95% Wilson intervals: precision over merged pairs (tp + fp), recall over truly same pairs (tp + fn)
     p_lo, p_hi = wilson_interval(pr["tp"], pr["tp"] + pr["fp"])
     r_lo, r_hi = wilson_interval(pr["tp"], pr["tp"] + pr["fn"])
     print(f"pipeline vs panel on {sum(keep)} settled pairs: tp {pr['tp']} fp {pr['fp']} fn {pr['fn']} | "
@@ -602,6 +636,7 @@ for r in agg.to_dict("records"):                     # job order: pairs by pair_
         row["pipeline_same"] = int(p["pipeline_same"])
         if r["needs_owner"]:
             row["contracts_a"], row["contracts_b"] = p["contracts_a"], p["contracts_b"]
+    # judge_k, vote_k and why_k for k = 1..3, in panel order
     for k, (j, v) in enumerate(zip(r["judges"], r["votes"]), 1):
         row[f"judge_{k}"], row[f"vote_{k}"] = SHORT[j], v
         # rationales only for escalated rows, to keep the CSV small; settled rows keep their votes
@@ -665,6 +700,7 @@ assert (dq["status"] != "FAIL").all()
 
 # COMMAND ----------
 
+# to_adjudicate: per item type, the items with at least one escalated field
 summary = {"panel_rows": n_panel, "to_adjudicate": {t: int(g.groupby("item_id")["needs_owner"].any().sum()) for t, g in agg.groupby("item_type")},
            "agreement": stats_df[["item_type", "field", "pairwise_agreement", "fleiss_kappa"]].round(3).to_dict("records"),
            "calls": {SHORT[m]: c for m, (_, _, c) in LEDGER.items()}, "dbu": round(dbu_spent(), 2),

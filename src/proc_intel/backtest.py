@@ -43,18 +43,20 @@ def allocate_sample(sizes: Mapping[Any, int], n_total: int, floor: int = 5) -> d
     Largest-remainder rounding; no stratum gets more than its size. If the floors alone exceed n_total, the
     floors are kept (the sample is then larger than n_total) because a stratum with no rows cannot be reported.
     """
-    sizes = {k: int(v) for k, v in sizes.items() if v > 0}
-    alloc = {k: min(v, floor) for k, v in sizes.items()}
+    sizes = {k: int(v) for k, v in sizes.items() if v > 0}  # empty strata are left out
+    alloc = {k: min(v, floor) for k, v in sizes.items()}  # the floor, or the whole stratum when it is smaller
     remaining = n_total - sum(alloc.values())
     # loop because a stratum can hit its size cap; the places it cannot take are shared out again in the next round
     while remaining > 0:
+        # room: places each stratum can still take; quota: the remaining places shared in proportion to stratum size;
+        # add: the whole part of each quota, capped at the room
         room = {k: sizes[k] - alloc[k] for k in sizes if sizes[k] > alloc[k]}
         if not room:
             break
         total = sum(sizes[k] for k in room)
         quota = {k: remaining * sizes[k] / total for k in room}
         add = {k: min(int(math.floor(q)), room[k]) for k, q in quota.items()}
-        left = remaining - sum(add.values())
+        left = remaining - sum(add.values())  # places lost by rounding the quotas down
         # largest remainders first; ties broken by stratum key for determinism
         for k in sorted(room, key=lambda k: (-(quota[k] - math.floor(quota[k])), str(k))):
             if left <= 0:
@@ -80,6 +82,8 @@ def stratified_pick(rows: Sequence[Mapping], stratum: Callable[[Mapping], Any], 
     sample spreads over many projects. Second pass, only for strata still short: repeats of the last key (the
     project) are allowed, the first (the notice) still not.
     """
+    # hash order acts as a reproducible shuffle: it depends only on the seed and the row id, not on the input order;
+    # by_stratum keeps that order within each stratum
     ordered = sorted(rows, key=lambda r: stable_hash(seed, r[id_key]))
     by_stratum: dict[Any, list[Mapping]] = {}
     for r in ordered:
@@ -93,17 +97,20 @@ def stratified_pick(rows: Sequence[Mapping], stratum: Callable[[Mapping], Any], 
             for r in by_stratum.get(s, []):
                 if len(picked[s]) >= alloc[s]:
                     break
+                # skip a row whose notice (or, in pass 1, project) is already used, or whose row id is already among
+                # this stratum's picks
                 if any(r[k] in used[k] for k in keys) or any(r[id_key] == p[id_key] for p in picked[s]):
                     continue
                 picked[s].append(dict(r))
                 for k in unique_keys:
                     used[k].add(r[k])
-    return [r for s in sorted(picked, key=str) for r in picked[s]]
+    return [r for s in sorted(picked, key=str) for r in picked[s]]  # strata in sorted order, each in hash order
 
 
 def design_weights(sample_strata: Sequence[Any], population_sizes: Mapping[Any, int]) -> np.ndarray:
     """Inverse-probability weight N_h / n_h of each sampled row, so weighted means estimate the population."""
     counts: dict[Any, int] = {}
+    # counts[s] = n_h, the number of sampled rows in stratum s
     for s in sample_strata:
         counts[s] = counts.get(s, 0) + 1
     return np.array([population_sizes[s] / counts[s] for s in sample_strata], dtype=float)
@@ -112,7 +119,7 @@ def design_weights(sample_strata: Sequence[Any], population_sizes: Mapping[Any, 
 def weighted_mean(values, weights=None) -> float:
     v = np.asarray(values, dtype=float)
     w = np.ones_like(v) if weights is None else np.asarray(weights, dtype=float)
-    ok = ~np.isnan(v)
+    ok = ~np.isnan(v)  # NaN values are dropped together with their weights
     return float(np.sum(v[ok] * w[ok]) / np.sum(w[ok])) if ok.any() else float("nan")
 
 
@@ -126,6 +133,7 @@ def bootstrap_ci(values, stat: Callable[[np.ndarray], float] = np.mean, n_boot: 
     rng = np.random.default_rng(seed)
     # resample rows with replacement; a fixed seed makes the interval identical on every run
     stats = np.array([stat(v[rng.integers(0, len(v), len(v))]) for _ in range(n_boot)])
+    # percentile interval: the alpha/2 and 1 - alpha/2 quantiles of the replicates (2.5% and 97.5% by default)
     return float(np.quantile(stats, alpha / 2)), float(np.quantile(stats, 1 - alpha / 2))
 
 
@@ -141,6 +149,8 @@ def interval_metrics(y, lo, mid, hi) -> dict:
     y, lo, mid, hi = y[ok], lo[ok], mid[ok], hi[ok]
     if len(y) == 0:
         return {"n": 0}
+    # each bound gets the pinball loss at its own level; coverage is the share of outcomes inside [P10, P90], and
+    # below_p10 / above_p90 split the misses by side
     out = {"n": int(len(y)), "mae_days": float(np.mean(np.abs(y - mid))),
            "median_ae_days": float(np.median(np.abs(y - mid))),
            "pinball_p10": pinball_loss(y, lo, 0.1), "pinball_p50": pinball_loss(y, mid, 0.5),
@@ -163,6 +173,7 @@ def roc_auc(y, score) -> float:
     order = np.argsort(s, kind="mergesort")
     ranks = np.empty(len(s), dtype=float)
     sorted_s = s[order]
+    # walk the sorted scores in runs of ties [i, j]: each member gets the average 1-based rank (i + j) / 2 + 1
     i = 0
     while i < len(s):
         j = i
@@ -171,6 +182,8 @@ def roc_auc(y, score) -> float:
         ranks[order[i:j + 1]] = (i + j) / 2 + 1
         i = j + 1
     # Mann-Whitney U of the positives divided by the number of positive-negative pairs equals the ROC-AUC
+    # U = rank sum of the positives minus its minimum n_pos(n_pos + 1) / 2, i.e. the number of positive-negative pairs
+    # where the positive scores higher, ties counting half
     return float((ranks[y == 1].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
 
 
@@ -179,12 +192,14 @@ def roc_auc(y, score) -> float:
 # ---------------------------------------------------------------------------------------------------------
 
 def _as_date(value) -> date | None:
-    if value is None or (isinstance(value, float) and math.isnan(value)):
+    if value is None or (isinstance(value, float) and math.isnan(value)):  # pandas gives NaN for a missing value
         return None
+    # datetime is a subclass of date, so it is checked first and cut to its date
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
         return value
+    # strings and timestamps: the first 10 characters of an ISO value are YYYY-MM-DD; anything else gives None
     text = str(value)[:10]
     try:
         return date.fromisoformat(text)
@@ -219,7 +234,7 @@ METHOD_FAMILIES = {
     "quotations": ("Request for Quotations", "Commercial Practices"),
     "direct": ("Direct Selection", "UN Agencies (Direct)", "Non-Profit Organizations"),
 }
-_FAMILY_OF = {m.lower(): f for f, ms in METHOD_FAMILIES.items() for m in ms}
+_FAMILY_OF = {m.lower(): f for f, ms in METHOD_FAMILIES.items() for m in ms}  # reverse lookup: lower-cased method name -> family
 
 
 def method_family(method: str | None) -> str:
@@ -270,7 +285,7 @@ def proxy_relevant(package: Mapping, precedent: Mapping, use_method: bool = True
     if use_method:
         ok = ok and method_family(package.get("method")) == method_family(precedent.get("method"))
     if use_sector:
-        ok = ok and bool(set(package["sectors"]) & set(precedent.get("sectors") or ()))
+        ok = ok and bool(set(package["sectors"]) & set(precedent.get("sectors") or ()))  # a precedent without sectors shares none
     return bool(ok)
 
 
@@ -286,15 +301,18 @@ def precision_of_returned(relevant: Sequence[bool | None]) -> float | None:
 
 def agreement(a: Sequence, b: Sequence) -> dict:
     """Raw agreement and Cohen's kappa between two labelings (pairs where either is None are dropped)."""
+    # keep only pairs where both labels are present (neither None nor NaN)
     pairs = [(x, y) for x, y in zip(a, b, strict=True) if x is not None and y is not None
              and not (isinstance(x, float) and math.isnan(x)) and not (isinstance(y, float) and math.isnan(y))]
     n = len(pairs)
     if n == 0:
         return {"n": 0, "agreement": None, "kappa": None}
-    po = sum(x == y for x, y in pairs) / n
+    po = sum(x == y for x, y in pairs) / n  # observed agreement
     labels = sorted({x for x, _ in pairs} | {y for _, y in pairs}, key=str)
     # chance agreement: product of the two labelings' marginal shares, summed over labels
     pe = sum((sum(x == lab for x, _ in pairs) / n) * (sum(y == lab for _, y in pairs) / n) for lab in labels)
+    # example from the tests: [T, T, F, F] vs [T, F, F, F] gives po = 0.75, pe = 0.5 * 0.25 + 0.5 * 0.75 = 0.5 and
+    # kappa = 0.5; pe is 1 only when both labelings use one and the same label, and kappa is then undefined
     kappa = None if pe == 1 else (po - pe) / (1 - pe)
     return {"n": n, "agreement": po, "kappa": kappa}
 
@@ -304,10 +322,11 @@ def agreement(a: Sequence, b: Sequence) -> dict:
 # ---------------------------------------------------------------------------------------------------------
 
 LESSON_VERDICTS = ("yes", "partial", "no", "none_occurred")
-_JSON_OBJ = re.compile(r"\{.*\}", re.S)
+_JSON_OBJ = re.compile(r"\{.*\}", re.S)  # greedy and across lines: from the first '{' to the last '}', so text around the JSON is ignored
 
 
 def _short_list(x) -> list[str]:
+    # at most 6 items of at most 200 characters; a single value becomes a one-item list, an empty one an empty list
     if isinstance(x, list):
         return [str(i)[:200] for i in x][:6]
     return [str(x)[:200]] if x else []
@@ -322,7 +341,7 @@ def parse_lesson_verdict(text: str) -> dict | None:
         v = json.loads(m.group(0))
     except json.JSONDecodeError:
         return None
-    verdict = str(v.get("verdict", "")).strip().lower()
+    verdict = str(v.get("verdict", "")).strip().lower()  # so 'Partial' is accepted as 'partial'
     if verdict not in LESSON_VERDICTS:
         return None
     return {"verdict": verdict, "materialised": _short_list(v.get("materialised")), "matched": _short_list(v.get("matched")),
@@ -332,7 +351,7 @@ def parse_lesson_verdict(text: str) -> dict | None:
 def lesson_score(verdict: str | None) -> float | None:
     """yes = 1, partial = 0.5, no = 0; None for none_occurred or a failed judgement (not scorable)."""
     # "partial" (a generic warning) earns half: it would have pointed a team at the area, not at the mechanism
-    return {"yes": 1.0, "partial": 0.5, "no": 0.0}.get(verdict or "")
+    return {"yes": 1.0, "partial": 0.5, "no": 0.0}.get(verdict or "")  # none_occurred, unknown verdicts and None give None
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -345,6 +364,7 @@ LABEL_COLUMNS = ("timeline_ok", "precedents_relevant", "risks_relevant", "any_un
 def _to_bool(v) -> bool | None:
     if v is None or (isinstance(v, float) and math.isnan(v)):
         return None
+    # CSV cells arrive as text or numbers; anything outside these spellings counts as no label
     s = str(v).strip().lower()
     if s in ("1", "true", "yes", "y"):
         return True
@@ -355,6 +375,7 @@ def _to_bool(v) -> bool | None:
 
 def _to_int(v) -> int | None:
     try:
+        # float() first, so 4, '4' and '4.0' all parse; NaN (an empty cell) counts as missing
         f = float(v)
     except (TypeError, ValueError):
         return None
@@ -376,6 +397,8 @@ def review_agreement(rows: Sequence[Mapping]) -> dict:
     u_a = [_to_bool(r.get("auto_unsupported_claim")) for r in rows]
     out["any_unsupported_claim"] = agreement(u_h, u_a)
     p = [(_to_int(r.get("precedents_relevant")), _to_int(r.get("auto_precedents_relevant"))) for r in rows]
+    # keep rows where both the label and the judge's count are present; they are compared as numbers (exact match,
+    # within one, mean absolute difference)
     p = [(h, a) for h, a in p if h is not None and a is not None]
     if p:
         diff = [abs(h - a) for h, a in p]
@@ -388,6 +411,7 @@ def review_agreement(rows: Sequence[Mapping]) -> dict:
     r = [_to_int(x.get("risks_relevant")) for x in rows]
     r = [x for x in r if x is not None]
     out["risks_relevant"] = {"n": len(r), "mean_owner": (sum(r) / len(r)) if r else None}
+    # a row counts as labelled when any of the first four label columns (all but notes) holds a value
     out["n_labelled"] = sum(any(_to_bool(x.get(c)) is not None or _to_int(x.get(c)) is not None
                                 for c in LABEL_COLUMNS[:4]) for x in rows)
     return out
@@ -415,6 +439,7 @@ def render_review_html(rows: Sequence[Mapping], title: str = "Procurement agent:
                      f"{e(r.get('description'))}</p>")
         parts.append(f"<p><span class='k'>Actual outcome:</span> {e(r.get('actual_outcome'))}</p>")
         parts.append(f"<pre>{e(r.get('brief_text'))}</pre>")
+        # cited_records may be a list or its JSON text; text that does not parse shows no table
         cited = r.get("cited_records") or []
         if isinstance(cited, str):
             try:

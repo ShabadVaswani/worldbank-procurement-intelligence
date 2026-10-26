@@ -40,6 +40,8 @@ SATISFACTORY_FROM = 4
 
 # A rating phrase, or a placeholder for "no rating" ("---", "Not Rated", "Non-Evaluable", "N/A").
 # Placeholders are matched too, so that an empty cell does not shift the next row's rating up.
+# order matters: two-word phrases come first, so 'Moderately Satisfactory' is not read as 'Satisfactory', and
+# 'Unsatisfactory' comes before 'Satisfactory', which would otherwise match its tail (the pattern ignores case)
 _PHRASE = re.compile(r"(?:Highly|Moderately)\s+(?:Satisfactory|Unsatisfactory)|Unsatisfactory|Satisfactory"
                      r"|Not\s+Rated|Non[\s-]*Evaluable|Not\s+Applicable|N/A|-{2,}", re.I)
 
@@ -48,6 +50,8 @@ def normalise_rating(text: str | None) -> tuple[str, int] | None:
     """('Moderately Satisfactory', 4) for any spelling or abbreviation; None for no rating."""
     if not text:
         return None
+    # collapse whitespace (a wrapped cell can contain a newline), expand an abbreviation such as 'MS', then match the
+    # label ignoring case
     cleaned = re.sub(r"\s+", " ", text).strip()
     if cleaned.upper() in ABBREVIATION:
         cleaned = ABBREVIATION[cleaned.upper()]
@@ -85,6 +89,8 @@ def _column_phrases(lines: list[str], bounds: dict[str, tuple[int, float]]) -> d
     for name, words in text.items():
         # joining the column's words top to bottom reunites "Moderately" (above the row label) with "Satisfactory"
         # (below it)
+        # a placeholder such as '---' normalises to None, and `or (None,)` turns it into a None entry, so the ratings
+        # below it keep their row order
         out[name] = [(normalise_rating(m.group()) or (None,))[0] for m in _PHRASE.finditer(" ".join(words))]
     return out
 
@@ -102,6 +108,8 @@ def _bounds(header: str, columns: list[str], tail: int | None) -> dict[str, tupl
     column stays there. The free-text column (`tail`) starts 3 characters before its title.
     """
     titles = [header.index(c) for c in columns]
+    # a column starts HEADER_SLACK before its title, but at least SECOND_WORD after the previous title; it ends where
+    # the next column starts (the last one 3 characters before the free-text column, or at the end of the line)
     starts = [max(0, titles[0] - HEADER_SLACK)] + [max(t - HEADER_SLACK, prev + SECOND_WORD)
                                                     for prev, t in pairwise(titles)]
     ends = starts[1:] + [tail - 3 if tail is not None else float("inf")]
@@ -125,6 +133,7 @@ _MONTHS = {m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun",
 
 
 def _archived_date(text: str) -> date | None:
+    # e.g. 'ARCHIVED on 15-Jun-2023' -> date(2023, 6, 15); an unknown month or an impossible day gives None
     m = _ARCHIVED.search(text)
     if not m or m.group(2).lower() not in _MONTHS:
         return None
@@ -154,6 +163,7 @@ def parse_isr_ratings(text: str | None) -> dict:
         return out
     lines = text[header.end():].split("\n")
     block = []
+    # read at most 40 lines below the header, stopping at the risk-rating or key-decisions section
     for line in lines[:40]:
         if _ISR_STOP.search(line):
             break
@@ -190,6 +200,7 @@ def parse_icrr_ratings(text: str | None) -> dict:
     header = _ICRR_HEADER.search(text)
     if not header:
         return out
+    # the line just above the header, and the lines below it
     before = text[:header.start()].rstrip("\n").split("\n")[-1]
     after = text[header.end():].lstrip("\n").split("\n")
     # the free-text column title wraps: "Reason for" sits on the line above the header, "Disagreements" on the line
@@ -280,9 +291,10 @@ def resolve_evidence(records: list[dict], question_type: str, reference_date=Non
     if question_type not in HIERARCHY:
         raise ValueError(f"question_type must be one of {sorted(HIERARCHY)}")
     rules = HIERARCHY[question_type]
-    rank_of = {(s, d): (i, spec) for i, (s, d, spec) in enumerate(rules)}
+    rank_of = {(s, d): (i, spec) for i, (s, d, spec) in enumerate(rules)}  # (source_type, dimension) -> (rank, specificity)
     usable, not_used = [], []
     for raw in records:
+        # a record is usable only when the hierarchy lists its (source_type, dimension) and its rating is readable
         norm = normalise_rating(raw.get("rating"))
         rec = {**raw, "rating": norm[0] if norm else raw.get("rating"), "score": norm[1] if norm else None,
                "as_of": _as_date(raw.get("as_of"))}
@@ -314,14 +326,17 @@ def resolve_evidence(records: list[dict], question_type: str, reference_date=Non
             result["superseded"].append(c)
             continue
         gap = abs(rec["score"] - top["score"])
-        crosses = is_satisfactory(rec["score"]) != is_satisfactory(top["score"])
+        crosses = is_satisfactory(rec["score"]) != is_satisfactory(top["score"])  # opposite sides of the satisfactory line (score 4)
         c["points_from_answer"] = gap
         (result["conflicting"] if gap >= CONFLICT_POINTS or crosses else result["supporting"]).append(c)
 
+    # a gap of 2 or more is a conflict; a conflicting record with a smaller gap only crossed the line, which is a
+    # disagreement
     gaps = [c["points_from_answer"] for c in result["conflicting"]]
     flag = "conflict" if any(g >= CONFLICT_POINTS for g in gaps) else "disagreement" if gaps else "consistent"
     result["flag"] = flag
 
+    # top tier: rank 0 of the hierarchy, and for an outcome question only an IEG validation
     is_top_tier = top_rank == 0 and (question_type != "outcome" or top["source_type"] == "ieg_validation")
     stale = False
     if question_type == "current_status" and reference_date is not None and top["as_of"] is not None:

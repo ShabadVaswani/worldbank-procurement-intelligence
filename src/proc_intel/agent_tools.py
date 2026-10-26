@@ -114,6 +114,7 @@ def fit_search_index(texts: Sequence[str], n_features: int = 2 ** 20):
 def query_scores(vec, matrix: sparse.csr_matrix, query: str) -> np.ndarray:
     """Cosine similarity of the query to every indexed row (rows and query are unit length)."""
     q = vec.transform([query])
+    # (n_rows x n_features) @ (n_features x 1) is a sparse column of dot products; flattened to one score per row
     return np.asarray((matrix @ q.T).todense()).ravel()
 
 
@@ -125,18 +126,20 @@ def boosted_top_k(scores: np.ndarray, boosts: np.ndarray, k: int, min_score: flo
     from another region still wins, but among comparable matches local ones come first, because they share the
     implementing agencies, market and regulations. Returns [(row, raw score)] best first.
     """
+    # the min_score floor is applied to the raw score, so the boost cannot lift a weak match over it
     keep = scores >= min_score
     if allowed is not None:
         keep &= allowed
-    idx = np.flatnonzero(keep)
+    idx = np.flatnonzero(keep)                             # row numbers of the candidates
     if not len(idx):
         return []
-    total = scores[idx] + boosts[idx]
+    total = scores[idx] + boosts[idx]                      # ranking score, aligned with idx
     if len(idx) > k:
         # argpartition finds the k best in linear time without sorting all candidates; only those k are sorted below
         part = np.argpartition(-total, k - 1)[:k]
         idx, total = idx[part], total[part]
     order = np.lexsort((idx, -total))                      # ties broken by row number: deterministic
+    # the boost only sets the order; the score returned is the raw one
     return [(int(idx[o]), float(scores[idx[o]])) for o in order]
 
 
@@ -155,6 +158,7 @@ def location_boost(row_country: np.ndarray, row_region: np.ndarray, country: str
 def diverse_top_k(order: Sequence[int], groups: Sequence, k: int, per_group: int = 2) -> list[int]:
     """The first k items of `order` (best first) with at most per_group items from one group (e.g. one document),
     so that six evidence passages do not all come from the same report."""
+    # seen: group -> number of items already taken from it; an item from a full group is skipped, not deferred
     seen: dict = {}
     out = []
     for i in order:
@@ -179,6 +183,7 @@ def resolve_country(value: str | None, names_by_code: dict[str, str]) -> str | N
     v = value.strip()
     if v.upper() in names_by_code:
         return v.upper()
+    # not a code: look the value up by display name, case-insensitively (lowercase name -> code)
     by_name = {n.lower(): c for c, n in names_by_code.items() if n}
     return by_name.get(v.lower())
 
@@ -207,7 +212,9 @@ def choose_peer_group(groups: Sequence[dict], min_n: int = 20) -> dict | None:
     groups: dicts with at least 'level' (one of PEER_LEVELS) and 'n'. Order of preference is PEER_LEVELS.
     Returns None when no group is large enough (the agent then says there is no reliable benchmark).
     """
+    # by_level: level -> group dict; groups with no contract count are left out
     by_level = {g["level"]: g for g in groups if g.get("n") is not None}
+    # walk from the most specific level to the broadest and stop at the first one that is large enough
     for level in PEER_LEVELS:
         g = by_level.get(level)
         if g is not None and g["n"] >= min_n:
@@ -235,6 +242,7 @@ def check_tool_call(name: str, raw_arguments: str | dict | None, tool_specs: dic
     if name not in tool_specs:
         return None, f"unknown tool '{name}'; available: {sorted(tool_specs)}"
     try:
+        # a dict is used as given; a JSON string is parsed, and None or "" means no arguments
         args = raw_arguments if isinstance(raw_arguments, dict) else json.loads(raw_arguments or "{}")
     except json.JSONDecodeError as e:
         return None, f"arguments are not valid JSON: {e.msg}"
@@ -243,14 +251,17 @@ def check_tool_call(name: str, raw_arguments: str | dict | None, tool_specs: dic
     params = tool_specs[name].get("parameters", {})
     props = params.get("properties", {})
     clean = {}
+    # each argument is dropped (unknown or null), coerced (quoted numbers) or rejected (wrong type, not in the enum);
+    # clean collects the accepted ones and the first rejection returns an error at once
     for key, value in args.items():
         if key not in props or value is None:
             continue
         spec = props[key]
-        want = _JSON_TYPES.get(spec.get("type", "string"), object)
+        want = _JSON_TYPES.get(spec.get("type", "string"), object)   # Python type(s) to accept; an unknown type accepts anything
         typ = spec.get("type", "string")
         if typ in ("integer", "number") and isinstance(value, str) and re.fullmatch(r"\s*-?\d+(\.\d+)?\s*", value):
             value = float(value)                                 # models often quote numbers: "k": "5"
+        # 5.0 (or "5" after the line above) becomes 5; 2.5 stays a float and fails the type check below
         if typ == "integer" and isinstance(value, float) and value.is_integer():
             value = int(value)
         # bool is a subclass of int in Python, so True would otherwise pass as the integer 1
@@ -261,6 +272,7 @@ def check_tool_call(name: str, raw_arguments: str | dict | None, tool_specs: dic
         if "enum" in spec and value not in spec["enum"]:
             return None, f"argument '{key}' must be one of {spec['enum']}"
         clean[key] = value
+    # checked on the cleaned arguments, so a required argument sent as null counts as missing
     missing = [r for r in params.get("required", []) if r not in clean]
     if missing:
         return None, f"missing required argument(s): {missing}"
@@ -321,7 +333,9 @@ def parse_brief(text: str) -> tuple[dict | None, str | None]:
                      ("precedents", list), ("evidence_gaps", list), ("status", str)):
         if not isinstance(b.get(key), typ):
             problems.append(f"'{key}' must be a {typ.__name__}")
+    # the checks below index into these fields, so they run only when every top-level field has the right type
     if not problems:
+        # a timeline without the number fields (an older brief shape) gets them as None
         for f in TIMELINE_NUMBERS:
             b["timeline"].setdefault(f, None)
         if not isinstance(b["timeline"].get("citations"), list) or not isinstance(b["market_approach"].get("citations"), list):
@@ -336,6 +350,7 @@ def parse_brief(text: str) -> tuple[dict | None, str | None]:
 
 
 def _clean_ids(ids: Iterable, known: set[str], invalid: list[str]) -> list[str]:
+    # returns the known ids in first-seen order without duplicates; every unknown one is appended to `invalid`
     out = []
     for c in ids:
         # writers sometimes copy the brackets from "[contract:123]"; strip them before matching
@@ -349,6 +364,7 @@ def _clean_ids(ids: Iterable, known: set[str], invalid: list[str]) -> list[str]:
 
 
 def _num_equal(a, b, tol: float = 0.5) -> bool:
+    # None or a non-numeric value on either side never counts as equal
     try:
         return abs(float(a) - float(b)) <= tol
     except (TypeError, ValueError):
@@ -357,16 +373,16 @@ def _num_equal(a, b, tol: float = 0.5) -> bool:
 
 # standalone numbers only: digits inside ids or words ("P123456", "FY2024") are not checked
 _NUMBER = re.compile(r"(?<![\w.])\d+(?:\.\d+)?(?!\w)")
-_THOUSANDS = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
+_THOUSANDS = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")      # a thousands comma ("1,200"), removed so the number reads as 1200
 # percentile and interval names a timeline summary may use without a record holding them ("P90", "90th", "80% interval")
 _GENERIC_NUMBERS = {10.0, 50.0, 75.0, 80.0, 90.0}
-# flags that mean something was wrong or missing (they lower 'complete' to 'partial'); the others record repairs
 # the writer must not compare the two medians (the code does, see compare_medians)
 _COMPARISON_RE = re.compile(r"\b(?:faster|slower|shorter|longer|quicker|lower|higher|below|above|exceeds?|less|more) than\b"
                             r"|\b(?:below|above) the (?:country |regional )?peer", re.I)
 # a summary that says there is no forecast while a scored one is cited contradicts its own numbers
 _NO_FORECAST_PHRASES = ("peer group only", "peer-group only", "forecast is not available", "forecast not available",
                         "could not score")
+# flags that mean something was wrong or missing (they lower 'complete' to 'partial'); the others record repairs
 _PROBLEM_FLAGS = {"invalid_citation", "uncited_risk", "timeline_uncited", "timeline_corrected", "timeline_text_replaced",
                   "market_uncited", "precedent_not_close", "no_close_precedent"}
 
@@ -379,13 +395,15 @@ def numbers_in(value: Any) -> set[float]:
         return out
     if isinstance(value, (int, float)):
         v = float(value)
-        if v == v:
+        if v == v:                                       # False only for NaN, which contributes nothing
+            # the value itself, rounded to a whole number and to one decimal: a text may write 128.4 days as "128"
             out |= {v, float(round(v)), round(v, 1)}
             if 0 <= v <= 1:
                 out |= {float(round(v * 100)), round(v * 100, 1)}
         return out
     if isinstance(value, str):
         return {float(x) for x in _NUMBER.findall(_THOUSANDS.sub("", value))}
+    # a dict contributes its values only (its keys are field names); lists are searched recursively
     if isinstance(value, dict):
         value = list(value.values())
     if isinstance(value, (list, tuple)):
@@ -400,6 +418,7 @@ def unsupported_numbers(text: str, sources: Sequence[Any]) -> list[str]:
     for s in sources:
         allowed |= numbers_in(s)
     bad = []
+    # every standalone number in the text must be within 0.5 of an allowed one; the misses are returned as written
     for x in _NUMBER.findall(_THOUSANDS.sub("", text or "")):
         if not any(abs(float(x) - a) <= 0.5 for a in allowed):
             bad.append(x)
@@ -407,12 +426,14 @@ def unsupported_numbers(text: str, sources: Sequence[Any]) -> list[str]:
 
 
 def _equal(field: str, a, b) -> bool:
+    # slow_probability is a fraction in [0, 1], so it gets a much tighter tolerance than the day counts
     return _num_equal(a, b, tol=0.005 if field == "slow_probability" else 0.5)
 
 
 def timeline_summary(tl: dict, records: dict[str, dict]) -> str:
     """A summary written from the timeline fields only (used when the writer's summary has an unsupported number)."""
     parts = []
+    # fc: the first cited forecast record, or None; it only decides whether to say that the model could not score
     fc = next((records[c] for c in tl["citations"] if records.get(c, {}).get("type") == "forecast"), None)
     if tl.get("forecast_p50_days") is not None:
         parts.append(f"The duration model forecasts a median of {tl['forecast_p50_days']:.0f} days from tender notice to "
@@ -429,8 +450,8 @@ def timeline_summary(tl: dict, records: dict[str, dict]) -> str:
 def compare_medians(forecast_p50: float, peer_p50: float) -> str:
     """The forecast-vs-peer comparison, computed in code (writers got the direction wrong: '129 days, faster than
     the peer median of 100')."""
-    d = round(float(forecast_p50) - float(peer_p50))
-    if d == 0:
+    d = round(float(forecast_p50) - float(peer_p50))      # whole days; positive means the forecast is longer
+    if d == 0:                                             # a difference under half a day counts as equal
         return "the forecast median equals the peer-group median"
     return f"the forecast median is {abs(d)} days {'longer' if d > 0 else 'shorter'} than the peer-group median"
 
@@ -438,6 +459,8 @@ def compare_medians(forecast_p50: float, peer_p50: float) -> str:
 def _timeline_refs(citations: list[str], records: dict[str, dict]) -> dict[str, dict | None]:
     """The record each timeline source is checked against: a scored forecast first, the chosen benchmark first."""
     cited = [records[c] for c in citations]
+    # sort key `not scored` / `not chosen`: False sorts before True, so a scored forecast and a chosen benchmark
+    # come first; otherwise the first one cited is used
     fc = sorted((r for r in cited if r.get("type") == "forecast"), key=lambda r: not r.get("scored"))
     bm = sorted((r for r in cited if r.get("type") == "benchmark"), key=lambda r: not r.get("chosen"))
     return {"forecast": fc[0] if fc else None, "benchmark": bm[0] if bm else None}
@@ -464,20 +487,25 @@ def validate_brief(brief: dict, records: dict[str, dict], package_text: str = ""
     - status 'complete' is lowered to 'partial' when a problem flag is raised or no risk survived.
     Returns (cleaned brief, report).
     """
+    # records: record_id -> record dict ('type' plus type-specific fields such as p50_days, scored, chosen,
+    # close_precedent); known: the ids the tools returned in this run, the only ones the brief may cite
     known = set(records)
-    invalid: list[str] = []
+    invalid: list[str] = []                    # every invalid mention, repeats included (used in citation_validity)
     flags: list[str] = []
     b = json.loads(json.dumps(brief))          # deep copy
 
     tl = b["timeline"]
     tl["citations"] = _clean_ids(tl.get("citations", []), known, invalid)
-    refs = _timeline_refs(tl["citations"], records)
+    refs = _timeline_refs(tl["citations"], records)    # "forecast" / "benchmark" -> the cited record to check against
+    # when a scored forecast (or the chosen benchmark) exists but the brief cites none, or cites only an unscored /
+    # unchosen one, the best record is cited and becomes the reference
     for kind, flag in (("forecast", "forecast_added"), ("benchmark", "benchmark_added")):
         best = [r for r in records.values() if r.get("type") == kind and (r.get("scored") if kind == "forecast" else r.get("chosen"))]
         if best and (refs[kind] is None or not (refs[kind].get("scored") or refs[kind].get("chosen"))):
             tl["citations"].append(best[0]["record_id"])
             refs[kind] = best[0]
             flags.append(flag)
+    # each timeline number against its source field: no reference record -> cleared; missing or different -> copied
     for field, (kind, src) in TIMELINE_SOURCES.items():
         ref = refs[kind]
         if ref is None:
@@ -490,12 +518,16 @@ def validate_brief(brief: dict, records: dict[str, dict], package_text: str = ""
                 flags.append("timeline_corrected")
             tl[field] = ref.get(src)
     forecasts = [r for r in records.values() if r.get("type") == "forecast"]
+    # the forecast tool ran but could not score the package: unless a gap already mentions the forecast, one is added
+    # with the reason, taken from the record's label after "...: "
     if forecasts and not any(r.get("scored") for r in forecasts):
         flags.append("forecast_unavailable")
         if not any("forecast" in str(g).lower() for g in b["evidence_gaps"]):
             b["evidence_gaps"].append("model forecast not available (" + forecasts[0].get("label", "").split(": ", 1)[-1]
                                       + "); the timeline uses the peer-group benchmark only")
     says_no_forecast = any(x in tl.get("summary", "").lower() for x in _NO_FORECAST_PHRASES)
+    # three reasons to rewrite the summary: a number that no cited record (nor the package text) holds, "no forecast"
+    # while a forecast median is set, or a forecast-vs-peer comparison in words
     if (unsupported_numbers(tl.get("summary", ""), [records[c] for c in tl["citations"]] + [package_text])
             or (says_no_forecast and tl.get("forecast_p50_days") is not None)
             or _COMPARISON_RE.search(tl.get("summary", ""))):
@@ -508,6 +540,7 @@ def validate_brief(brief: dict, records: dict[str, dict], package_text: str = ""
         flags.append("market_uncited")
 
     risks = []
+    # a risk keeps only its valid citations and is dropped when none is left
     for r in b["risks"]:
         r["citations"] = _clean_ids(r.get("citations", []), known, invalid)
         if r["citations"]:
@@ -517,6 +550,8 @@ def validate_brief(brief: dict, records: dict[str, dict], package_text: str = ""
     b["risks"] = risks
 
     precedents, seen = [], set()
+    # each precedent: unknown id -> invalid; known but not a close-precedent contract -> flagged and dropped;
+    # a repeat, or one past max_precedents, is dropped without a flag
     for p in b["precedents"]:
         rid = str(p.get("record_id", "")).strip().strip("[]")
         if rid not in known:
@@ -531,6 +566,7 @@ def validate_brief(brief: dict, records: dict[str, dict], package_text: str = ""
     b["precedents"] = precedents
     if not precedents:
         flags.append("no_close_precedent")
+        # case-insensitive: a gap the writer already wrote ("No close precedent found outside ...") is kept as is
         if not any(NO_PRECEDENT_GAP in str(g).lower() for g in b["evidence_gaps"]):
             # cite the similar_past_contracts tool_log record so the added gap has a source too
             log = next((r["record_id"] for r in records.values()
@@ -555,8 +591,10 @@ def validate_brief(brief: dict, records: dict[str, dict], package_text: str = ""
 
     if invalid:
         flags.append("invalid_citation")
+    # repair-only flags (forecast_added, benchmark_added, forecast_unavailable) are not in _PROBLEM_FLAGS and keep 'complete'
     if b["status"] == "complete" and (_PROBLEM_FLAGS & set(flags) or not risks):
         b["status"] = "partial"
+    # cited: the distinct valid ids used anywhere in the cleaned brief, gap text included
     cited = sorted(set(tl["citations"] + ma["citations"] + [c for r in risks for c in r["citations"]]
                        + [p["record_id"] for p in precedents] + gap_ids))
     # validity = valid distinct ids / (valid distinct ids + invalid mentions)
@@ -572,9 +610,10 @@ def render_brief(brief: dict, records: dict[str, dict] | None = None) -> str:
     tl, ma = brief["timeline"], brief["market_approach"]
 
     def cites(ids):
-        return " [" + ", ".join(ids) + "]" if ids else ""
+        return " [" + ", ".join(ids) + "]" if ids else ""      # " [a, b]", or nothing when there is no id
 
     def of_type(kind):
+        # the cited timeline ids of one record type, read from the record or, for an id not in records, from its prefix
         return [c for c in tl["citations"] if records.get(c, {}).get("type") == kind or c.startswith(kind + ":")]
 
     lines = [f"Package: {brief['package_summary']}", f"Status: {brief['status']}", "",
@@ -632,6 +671,7 @@ def compact(records: Sequence[dict], keep: Sequence[str], max_text: int = 400) -
             if isinstance(v, float):
                 v = round(v, 3)
             if isinstance(v, str) and len(v) > max_text:
+                # cut back to the last whole word within max_text and mark the cut
                 v = v[:max_text].rsplit(" ", 1)[0] + " ..."
             d[k] = v
         out.append(d)
@@ -652,13 +692,15 @@ def precedent_rule_metrics(rows: Sequence[dict], min_cosine: float, min_tfidf: f
     Per package the first k candidates that pass the rule are taken (the tool fills up from lower ranks).
     precision = relevant taken / taken; recall = relevant taken / sum over packages of min(k, relevant candidates);
     zero_groups = packages left with no precedent."""
+    # by_group: package -> its candidate rows in re-ranked order
     by_group: dict = {}
     for r in sorted(rows, key=lambda r: (str(r["group"]), r["rank"])):
         by_group.setdefault(r["group"], []).append(r)
+    # taken: precedents listed; tp: relevant ones among them; cap: the most relevant ones that k slots could hold
     taken = tp = cap = 0
     zero = []
     for g, rs in by_group.items():
-        keep = [r for r in rs if is_close_precedent(r["cosine"], r["tfidf"], min_cosine, min_tfidf)][:k]
+        keep = [r for r in rs if is_close_precedent(r["cosine"], r["tfidf"], min_cosine, min_tfidf)][:k]   # the tool's list
         taken += len(keep)
         tp += sum(bool(r["relevant"]) for r in keep)
         cap += min(k, sum(bool(r["relevant"]) for r in rs))
@@ -674,11 +716,12 @@ def choose_precedent_rule(rows: Sequence[dict], cosine_grid: Iterable[float], tf
     over recall: a listed precedent that is not comparable misleads, a missed one only costs coverage. Ties keep
     the first (lowest) thresholds in grid order. Returns the metrics of the chosen pair with its f_beta."""
     best = None
-    tfidf_grid = list(tfidf_grid)
+    tfidf_grid = list(tfidf_grid)               # a list, since an iterator would be used up after the first cosine value
     for a in cosine_grid:
         for b in tfidf_grid:
             m = precedent_rule_metrics(rows, float(a), float(b), k)
             p, r = m["precision"], m["recall"]
+            # F-beta = (1 + beta^2) P R / (beta^2 P + R); 0 when precision or recall is None or 0
             m["f_beta"] = (1 + beta ** 2) * p * r / (beta ** 2 * p + r) if p and r else 0.0
             # strictly better only (with a float tolerance), so ties keep the first, lowest thresholds
             if best is None or m["f_beta"] > best["f_beta"] + 1e-12:

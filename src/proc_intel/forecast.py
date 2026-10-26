@@ -65,6 +65,7 @@ def _lower_median(values) -> float:
     v = np.sort(np.asarray(values, dtype=float))
     # not np.median: the model was trained on Spark's value, which for an even count is the lower middle value, not the
     # mean of the two
+    # example: [10, 20, 30, 40] -> index ceil(2) - 1 = 1 -> 20, where np.median would give 25
     return float(v[math.ceil(0.5 * len(v)) - 1]) if len(v) else float("nan")
 
 
@@ -85,6 +86,7 @@ def market_features(hist_contracts: pd.DataFrame, hist_winners: pd.DataFrame, hi
     win = _window(hist_winners, cc, n_month)
     bid = _window(hist_bidders, cc, n_month)
     dur = _window(past_durations, {"country_code": country, "procurement_method_name": method}, n_month)
+    # denominators of the two ratios below; a zero denominator (no history) leaves the ratio NaN
     rows = float(win["rows"].sum())
     notices = float(bid["notices"].sum())
     return {"mkt_contracts_3y": float(vol["n_contracts"].sum()),
@@ -101,6 +103,7 @@ def notice_defaults(defaults: Mapping, method: str | None, category: str | None)
     `defaults` maps (method, category) and (method, None) to {"notice_type", "advertising_days", "notice_chars", "n"}.
     Returns (values, scope label) or (None, "") when the method has no history.
     """
+    # most specific key first: method x category, then the method across all categories
     for key, scope in (((method, category), f"{method} x {category}"), ((method, None), f"{method}, all categories")):
         if key in defaults:
             return dict(defaults[key]), scope
@@ -199,6 +202,7 @@ def planning_features(package: Mapping, *, method: str | None, category: str | N
                                f"the notice, {gov_year})")
     row.update({k: _num(market.get(k)) for k in ("mkt_contracts_3y", "mkt_winners_3y", "mkt_foreign_share_3y",
                                                  "mkt_mean_named_firms_3y", "hist_median_days_cm", "hist_n_cm")})
+    # any categorical column still unset becomes None (missing)
     for k in CATEGORICAL:
         row.setdefault(k, None)
     # the model takes the columns by name, but returning them in p07's order keeps rows comparable in logs and hashes
@@ -229,6 +233,8 @@ def scoring_problems(row: Mapping, categories: Mapping[str, list]) -> tuple[list
 def model_frame(row: Mapping) -> pd.DataFrame:
     """The feature row as the registered pyfunc takes it (missing categories become the placeholder string)."""
     X = pd.DataFrame([{k: row.get(k) for k in FEATURES}])
+    # missing categories become the '(missing)' placeholder used in p07's training; numeric columns become float, so
+    # None turns into NaN
     X[CATEGORICAL] = X[CATEGORICAL].astype(object).where(X[CATEGORICAL].notna(), MISSING)
     X[NUMERIC] = X[NUMERIC].astype(float)
     return X
@@ -240,4 +246,4 @@ def forecast_key(row: Mapping, model_version: str) -> str:
     clean = {k: (None if isinstance(v, float) and v != v else (round(v, 6) if isinstance(v, float) else v))
              for k, v in sorted(row.items())}
     raw = json.dumps({"v": model_version, "x": clean}, sort_keys=True, default=str)
-    return hashlib.sha1(raw.encode()).hexdigest()[:12]
+    return hashlib.sha1(raw.encode()).hexdigest()[:12]  # first 12 hex characters of the SHA-1

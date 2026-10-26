@@ -42,7 +42,7 @@ KEY_COLUMNS = ("country_code", "region", "procurement_method_name", "procurement
 def cap_at_horizon(days, horizon: int = HORIZON_DAYS) -> tuple[np.ndarray, np.ndarray]:
     """Durations capped at the horizon, and whether the event (signing) was seen within it."""
     d = np.asarray(days, dtype=float)
-    return np.minimum(d, horizon), d <= horizon
+    return np.minimum(d, horizon), d <= horizon  # the second array is True when signing fell within the horizon (not censored)
 
 
 def pinball_loss(y, pred, alpha: float) -> float:
@@ -60,6 +60,7 @@ def interval_coverage(y, lo, hi) -> float:
 
 def sort_quantiles(*preds) -> tuple[np.ndarray, ...]:
     """Remove quantile crossing: per row, sort the predictions so P10 <= P50 <= P90."""
+    # stack to shape (rows, quantiles), sort each row, then split back into one array per quantile
     stacked = np.sort(np.column_stack([np.asarray(p, dtype=float) for p in preds]), axis=1)
     return tuple(stacked[:, i] for i in range(stacked.shape[1]))
 
@@ -126,15 +127,18 @@ def peer_aggregate(train: pd.DataFrame, test: pd.DataFrame, target: str, stats: 
     out = pd.DataFrame(index=test.index, columns=[*stats, "n"], dtype=float)
     out["level"] = None
     for level, cols in LEVELS:
+        # rows still without a group; each pass tries the next coarser level for them only
         todo = out["level"].isna()
         if not todo.any():
             break
         cols = list(cols)
         grouped = train.groupby(cols)[target]
+        # one row per peer group: its size n and each statistic; groups under min_n are dropped
         table = pd.concat([grouped.size().rename("n")] + [grouped.agg(fn).rename(name) for name, fn in stats.items()],
                           axis=1)
         table = table[table["n"] >= min_n].reset_index()
         # merge loses the index; carry it as a column so results land on the right test rows
+        # the merge is an inner join: rows whose group was dropped stay unmatched and wait for the next level
         hit = test.loc[todo, cols].rename_axis("_row").reset_index().merge(table, on=cols).set_index("_row")
         out.loc[hit.index, [*stats, "n"]] = hit[[*stats, "n"]].to_numpy(dtype=float)
         out.loc[hit.index, "level"] = level
@@ -144,6 +148,7 @@ def peer_aggregate(train: pd.DataFrame, test: pd.DataFrame, target: str, stats: 
 def peer_baseline(train: pd.DataFrame, test: pd.DataFrame, target: str,
                   quantiles=QUANTILES, min_n: int = MIN_PEER_N) -> pd.DataFrame:
     """Naive benchmark forecast: the training quantiles (columns q0.1, q0.5, ...) of each test row's peer group."""
+    # q=q binds each quantile when its lambda is made; a plain closure would see only the last q
     return peer_aggregate(train, test, target, {f"q{q}": (lambda s, q=q: s.quantile(q)) for q in quantiles}, min_n)
 
 
@@ -154,6 +159,7 @@ def rolling_origin_folds(dates, origins, val_months: int) -> list[tuple[np.ndarr
     for origin in origins:
         start = np.datetime64(pd.Timestamp(origin))
         end = np.datetime64(pd.Timestamp(origin) + pd.DateOffset(months=val_months))
+        # each fold is two boolean masks over `dates`: train = before the origin, validate = [origin, end)
         folds.append((d < start, (d >= start) & (d < end)))
     return folds
 
@@ -179,4 +185,5 @@ def conformal_shift(scores, miss_rate: float) -> float:
     n = len(s)
     k = int(np.ceil((n + 1) * (1 - miss_rate)))
     # k can exceed n on a small calibration set; the largest violation is then the most conservative shift available
+    # s[k - 1] is the k-th smallest violation: the finite-sample (1 - miss_rate) quantile of the scores
     return float(s[min(k, n) - 1])

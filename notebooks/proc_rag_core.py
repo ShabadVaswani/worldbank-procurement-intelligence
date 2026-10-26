@@ -148,7 +148,9 @@ _RUN = threading.local()         # per-agent-run usage (evaluation runs agents i
 
 
 def _charge(model, usage):
+    # usage is the endpoint's "usage" dict; a missing or null count is charged as 0
     p, c = usage.get("prompt_tokens") or 0, usage.get("completion_tokens") or 0
+    # the lock keeps the read-modify-write safe when several agent threads charge at the same time
     with _LEDGER_LOCK:
         row = LEDGER.setdefault(model, [0, 0, 0])
         row[0] += p
@@ -157,6 +159,7 @@ def _charge(model, usage):
     # outside an agent run (e.g. a direct tool call) there is no per-run ledger, only the session one
     run = getattr(_RUN, "usage", None)
     if run is not None:
+        # a per-run row is [prompt tokens, completion tokens], without a call count
         r = run.setdefault(model, [0, 0])
         r[0] += p
         r[1] += c
@@ -170,6 +173,7 @@ def dbu(model, prompt_tokens, completion_tokens):
 
 
 def ledger_frame():
+    # LEDGER values are [prompt, completion, calls], unpacked here as (p, o, c)
     rows = [{"model": m, "calls": c, "prompt_tokens": p, "completion_tokens": o, "dbu": round(dbu(m, p, o), 3)}
             for m, (p, o, c) in LEDGER.items()]
     return pd.DataFrame(rows)
@@ -177,8 +181,10 @@ def ledger_frame():
 
 def _invoke(endpoint, body, timeout=None, max_retries=8, max_timeouts=1):
     """POST with backoff on 429 / 5xx; a call that times out is retried once (max_timeouts), then fails."""
+    # timeouts are counted apart from attempts: a second timeout fails the call even when attempts remain
     timeouts = 0
     for attempt in range(max_retries):
+        # each pass sets retry (try again?) and err (the message if it gives up), or returns the parsed JSON body
         try:
             r = requests.post(f"https://{_HOST}/serving-endpoints/{endpoint}/invocations",
                               headers={"Authorization": f"Bearer {_TOKEN}"}, json=body, timeout=timeout or CALL_TIMEOUT_S)
@@ -190,7 +196,9 @@ def _invoke(endpoint, body, timeout=None, max_retries=8, max_timeouts=1):
             timeouts += 1
             retry, err = timeouts <= max_timeouts, f"timeout after {timeout or CALL_TIMEOUT_S} s: {str(e)[:150]}"
         except requests.exceptions.RequestException as e:
+            # connection errors (reset, DNS) are always retried, like a server error
             retry, err = True, f"{type(e).__name__}: {str(e)[:200]}"
+        # give up on a non-retryable error, or when the last attempt has failed too
         if not retry or attempt == max_retries - 1:
             raise RuntimeError(f"{endpoint} failed: {err}")
         # the pay-per-token limits are per minute (requests and output tokens), so a throttled call waits up to a minute;
@@ -208,6 +216,7 @@ def _extra_for(model, reasoning_effort=None):
     return {}
 
 
+# OpenRouter session state: the API key (read once), why the switch was turned off (None while it is on), US$ spent
 _OR = {"key": None, "disabled": None, "usd": 0.0}
 PROVIDER_LOG = []                # one row per OpenRouter call: role, model, serving provider, latency, USD
 
@@ -219,17 +228,23 @@ def _openrouter_chat(messages, model, max_tokens, temperature, reasoning_effort,
         return None
     if _OR["key"] is None:
         _OR["key"] = dbutils.secrets.get("procurement", "openrouter_api_key")        # never printed
+    # the same defaults as _extra_for: thinking off unless asked for, low effort for gpt-oss
     effort = reasoning_effort or ("low" if "gpt-oss" in model else "none")
+    # as on Databricks, the reasoning counts against max_tokens, so the budget grows by THINKING_TOKENS when it is on;
+    # "usage": {"include": True} asks OpenRouter to report the call's cost in US$
     body = {"model": OPENROUTER_MODELS[model], "messages": messages, "max_tokens": max_tokens + (THINKING_TOKENS if effort != "none" else 0),
             "temperature": temperature, "usage": {"include": True}, **extra}
     if "qwen" in model or "gpt-oss" in model:
+        # OpenRouter's reasoning switch: an effort level, or thinking disabled explicitly
         body["reasoning"] = {"effort": effort} if effort != "none" else {"enabled": False}
     t0 = time.time()
+    # up to 3 attempts; the for-else below runs only when no attempt reached `break`
     for attempt in range(3):
         try:
             r = requests.post("https://openrouter.ai/api/v1/chat/completions", json=body, timeout=CALL_TIMEOUT_S,
                               headers={"Authorization": f"Bearer {_OR['key']}", "Content-Type": "application/json"})
         except requests.exceptions.RequestException as e:
+            # a network error or timeout is retried at once, without the sleep below
             err = f"{type(e).__name__}"
             continue
         # 402 = the key's budget is spent, 429 = rate limited: stop using OpenRouter for the session, not just this call
@@ -237,6 +252,7 @@ def _openrouter_chat(messages, model, max_tokens, temperature, reasoning_effort,
             with _LEDGER_LOCK:
                 _OR["disabled"] = f"HTTP {r.status_code}"
             return None
+        # success needs HTTP 200 and a non-empty message content; an empty answer is retried like an error
         if r.status_code == 200 and (r.json().get("choices") or [{}])[0].get("message", {}).get("content"):
             j = r.json()
             break
@@ -247,6 +263,7 @@ def _openrouter_chat(messages, model, max_tokens, temperature, reasoning_effort,
         return None
     msg, usage = j["choices"][0]["message"], j.get("usage") or {}
     if j["choices"][0].get("finish_reason") == "length":      # the reasoning used up the budget: the JSON is cut off
+        # the spend is still booked and the call logged as truncated; None makes chat() repeat it on Databricks
         with _LEDGER_LOCK:
             _OR["usd"] += float(usage.get("cost") or 0.0)
             PROVIDER_LOG.append({"role": role, "model": OPENROUTER_MODELS[model], "provider": j.get("provider"),
@@ -261,7 +278,9 @@ def _openrouter_chat(messages, model, max_tokens, temperature, reasoning_effort,
                              "latency_s": round(time.time() - t0, 2), "usd": usage.get("cost")})
         if _OR["usd"] >= OPENROUTER_BUDGET_USD:
             _OR["disabled"] = f"budget US${OPENROUTER_BUDGET_USD} reached"
+    # a separate ledger key, which dbu() prices at 0 because OpenRouter is paid in US$
     _charge(f"openrouter:{OPENROUTER_MODELS[model]}", usage)
+    # the same dict shape as chat() returns for a Databricks call
     return {"text": (content or "").strip(), "tool_calls": msg.get("tool_calls") or [],
             "finish_reason": j["choices"][0].get("finish_reason"),
             "usage": {"prompt_tokens": usage.get("prompt_tokens", 0), "completion_tokens": usage.get("completion_tokens", 0)},
@@ -277,12 +296,15 @@ def chat(messages, model, max_tokens=1200, temperature=0.0, tools=None, reasonin
         if r is not None:
             return r
     t0 = time.time()
+    # think: the reasoning field for the request body ({} for a model without a reasoning switch, e.g. Llama)
     think = _extra_for(model, reasoning_effort)
     effort = think.get("reasoning_effort")
     if "qwen35" in model and effort != "none":
         max_tokens += THINKING_TOKENS           # the reasoning counts against max_tokens
+    # extra carries call-specific fields such as response_format (the JSON schema of the guard, the writer or a judge)
     body = {"messages": messages, "max_tokens": max_tokens, "temperature": temperature, **think, **extra}
     if tools:
+        # "auto" lets the planner answer with plain text (DONE) instead of a tool call
         body.update(tools=tools, tool_choice="auto")
     resp = _invoke(model, body)
     msg = resp["choices"][0]["message"]
@@ -291,6 +313,7 @@ def chat(messages, model, max_tokens=1200, temperature=0.0, tools=None, reasonin
         content = "".join(b.get("text", "") for b in content if b.get("type") == "text")
     usage = resp.get("usage") or {}
     _charge(model, usage)
+    # tool_calls are in the OpenAI format: [{"id", "type": "function", "function": {"name", "arguments"}}], [] when none
     return {"text": (content or "").strip(), "tool_calls": msg.get("tool_calls") or [],
             "finish_reason": resp["choices"][0].get("finish_reason"),
             "usage": {"prompt_tokens": usage.get("prompt_tokens", 0), "completion_tokens": usage.get("completion_tokens", 0)},
@@ -307,6 +330,7 @@ def embed_texts(texts, batch_size=8):
     for i in range(0, len(texts), batch_size):
         batch = list(texts[i:i + batch_size])
         with _LEDGER_LOCK:
+            # wait > 0 when earlier batches have booked the clock into the future: this batch sleeps until its slot
             wait = _embed_clock["t"] - time.time()
             # shared pacing clock: each batch books its time slot under the lock, so parallel agents together stay under
             # the rate
@@ -315,7 +339,9 @@ def embed_texts(texts, batch_size=8):
             time.sleep(wait)
         resp = _invoke(EMBED_ENDPOINT, {"input": batch}, max_retries=12)
         _charge(EMBED_ENDPOINT, {"prompt_tokens": (resp.get("usage") or {}).get("prompt_tokens", 0)})
+        # each item carries the position of its input text; sorting keeps the vectors in the order of `texts`
         out.extend(d["embedding"] for d in sorted(resp["data"], key=lambda d: d["index"]))
+    # X: one row per input text (1,024 numbers for GTE-large)
     X = np.asarray(out, dtype="float32")
     # GTE vectors are not unit length; normalise so a dot product is the cosine
     return X / np.linalg.norm(X, axis=1, keepdims=True)
@@ -336,14 +362,17 @@ _cache = globals().get("_cache", {})        # survives a re-run of this notebook
 
 def refs():
     if "refs" not in _cache:
+        # countries: ISO2 code -> country name
         countries = {r.country_code: r.country_name for r in spark.table(f"{SILVER}.dim_country").collect()}
         # a country's region = the most common region of its projects ("Other"/"Africa" are umbrella labels, not
         # regions)
+        # max_by(region, n) keeps the region with the most projects of that country
         region_of = {r.country_code: r.region for r in spark.sql(f"""
             SELECT country_code, max_by(region, n) AS region FROM (
               SELECT country_code, region, count(*) AS n FROM {SILVER}.dim_project
               WHERE country_code IS NOT NULL AND region IS NOT NULL AND region NOT IN ('Other', 'Africa')
               GROUP BY 1, 2) GROUP BY 1""").collect()}
+        # methods: upper-case method code -> the name most often written with that code in the notices
         methods = {r.code: r.name for r in spark.sql(f"""
             SELECT upper(procurement_method_code) AS code, max_by(procurement_method_name, n) AS name FROM (
               SELECT procurement_method_code, procurement_method_name, count(*) AS n FROM {SILVER}.notices
@@ -353,6 +382,7 @@ def refs():
         for name in spark.sql(f"SELECT DISTINCT procurement_method_name FROM {SILVER}.contracts").toPandas().iloc[:, 0]:
             if name and name not in methods.values():
                 methods[re.sub(r"[^A-Z]", "", name.upper())[:12]] = name
+        # projects: project_id -> Row(project_id, project_name, country_code, region, major_sector)
         projects = {r.project_id: r for r in spark.table(f"{SILVER}.dim_project")
                     .select("project_id", "project_name", "country_code", "region", "major_sector").collect()}
         _cache["refs"] = {"countries": countries, "region_of": region_of, "methods": methods, "projects": projects}
@@ -379,6 +409,11 @@ def _contracts():
         return _cache["contracts"]
     t0 = time.time()
     # one row per contract with its winners (first 3 resolved entities, anonymised individuals left out) and timeline
+    # - sup: per contract, up to 3 winning entities as "SE-id name; ..." text and as an id list (array_sort keeps the 3 stable)
+    # - aw: per contract, distinct firms in notice_bidders of its award-role notices, counted the way the adjudication
+    #   counts them (decision_log.md: tender_timelines.n_named_firms_in_award_notice differed on 6,188 contracts);
+    #   nullif turns 0 (an award notice that names no firm) into null, and a contract with no award notice gets no aw row
+    # - the left joins keep every contract: timeline, tender notice, winners and firm count are null where missing
     df = spark.sql(f"""
         WITH sup AS (
           SELECT cs.contract_id,
@@ -407,10 +442,13 @@ def _contracts():
         LEFT JOIN {SILVER}.notices n ON n.notice_id = t.tender_notice_id
         LEFT JOIN sup USING (contract_id)
         LEFT JOIN aw USING (contract_id)""").toPandas()
+    # the indexed text: contract description | notice description | project name (search_text skips a repeated part)
     df["text"] = [search_text(a, b, c) for a, b, c in
                   zip(df.contract_description, df.notice_description, df.project_name)]
+    # X: sparse TF-IDF matrix with one unit-length row per contract, in df order, so one row number indexes both
     vec, X = fit_search_index(df["text"].tolist())
     df = df.drop(columns=["text", "notice_description", "major_sector"])      # keep the driver footprint small
+    # plain numpy copies of the filter columns, so similar_past_contracts can mask all 283k rows without pandas
     C = {"df": df, "vec": vec, "X": X,
          "country": df.country_code.fillna("").to_numpy(), "region": df.region.fillna("").to_numpy(),
          "category": df.category.fillna("").to_numpy(), "project": df.project_id.fillna("").to_numpy()}
@@ -422,10 +460,15 @@ def _contracts():
 def _contract_record(row, similarity, rerank_cosine=None, package_country=None, close=False):
     # x == x is False only for NaN: a contract missing from tender_timelines comes back as NaN after the left join
     timed = bool(row.is_timed) if row.is_timed == row.is_timed and row.is_timed is not None else False
+    # pandas holds a null count as NaN (a float); the record holds None or an int
     n_firms = None if pd.isna(row.n_firms_in_award_notice) else int(row.n_firms_in_award_notice)
+    # the one-line summary the writer quotes from and factcheck_brief checks against, e.g.
+    # "project P146314 | LK | South Asia | Request for Quotations | 2019 | firms in award notice: not recorded"
     facts = contract_facts({"project_id": row.project_id, "country_code": row.country_code, "region": row.region,
                             "method": row.method,
                             "signing_date": row.signing_date, "n_firms_in_award_notice": n_firms})
+    # similarity = TF-IDF cosine to the package, rerank_cosine = GTE cosine (None without re-ranking);
+    # days_notice_to_signing is kept only for a timed contract
     return {"record_id": record_id("contract", row.contract_id), "type": "contract", "facts": facts,
             "label": (row.contract_description or "")[:160], "project_id": row.project_id,
             "project_name": row.project_name, "country_code": row.country_code, "region": row.region,
@@ -448,40 +491,55 @@ _DEFAULT = object()
 def similar_past_contracts(description, country=None, category=None, k=5, rerank=None, exclude_project_ids=(),
                            min_cosine=_DEFAULT):
     rerank = RERANK if rerank is None else rerank
+    # by default the precedent rule applies only with re-ranking, since it needs the GTE cosine
     min_cosine = (MIN_PRECEDENT_COSINE if rerank else None) if min_cosine is _DEFAULT else min_cosine
+    # the TF-IDF half of the rule is switched off together with the cosine half
     min_tfidf = MIN_PRECEDENT_TFIDF if min_cosine is not None else 0.0
     C, R = _contracts(), refs()
+    # an unknown country or category resolves to None: no location bonus or no category filter, and a note says so
     cc = resolve_country(country, R["countries"])
     region = R["region_of"].get(cc)
     cat = category_code(category)
+    # scores: TF-IDF cosine of the description to every contract, one float per row of C["df"]
     scores = query_scores(C["vec"], C["X"], description)
     # category is a hard filter; country and region only add a bonus (a close precedent elsewhere beats a weak local
     # one)
     allowed = (C["category"] == cat) if cat else np.ones(len(scores), bool)
     if exclude_project_ids:
+        # evaluation hold-out: no contract of the package's source project may be returned
         allowed &= ~np.isin(C["project"], list(exclude_project_ids))
     boost = location_boost(C["country"], C["region"], cc, region)
     # with re-ranking, take the best 30 by TF-IDF and let the embeddings reorder them; embedding all 283k is too slow
+    # hits: [(row number, TF-IDF score)] best first; a contract below 0.05 TF-IDF is never a candidate
     hits = boosted_top_k(scores, boost, RERANK_POOL if rerank else k, min_score=0.05, allowed=allowed)
     n_candidates = len(hits)
+    # defaults for the path without re-ranking: no GTE cosines, nothing counted as below the rule
     cos = [None] * len(hits)
     n_below, best_cos = 0, None
     if rerank and hits:
+        # V row 0 is the package description, rows 1.. the candidates (description + project name, at most 1,000 chars)
         V = embed_texts([description] + [search_text(C["df"].contract_description.iat[i], None, C["df"].project_name.iat[i])[:1000]
                                          for i, _ in hits])
+        # sims[j]: GTE cosine of candidate j to the package (all vectors are unit length)
         sims = V[1:] @ V[0]
         b = boost[[i for i, _ in hits]]
         # the same location bonus is added to the cosine, so re-ranking keeps the country preference
         order = np.argsort(-(sims + b), kind="stable")
         best_cos = round(float(sims.max()), 3)
         if min_cosine is not None:
+            # close[j]: candidate j passes both halves of the precedent rule (GTE cosine and TF-IDF cosine)
             close = [is_close_precedent(float(sims[o]), hits[o][1], min_cosine, min_tfidf) for o in range(len(hits))]
+            # how many of the first k in re-rank order fail the rule (reported as n_top_k_below_threshold)
             n_below = int(sum(not close[o] for o in order[:k]))
+            # failing candidates are dropped, so lower-ranked ones that pass move up into the freed places
             order = [o for o in order if close[o]]
         order = list(order)[:k]
+        # hits and cos now hold at most k candidates, in re-rank order
         hits, cos = [hits[o] for o in order], [float(sims[o]) for o in order]
     df = C["df"]
+    # filtered: the precedent rule was applied, so fewer than k records is a finding to report
     filtered = bool(rerank and min_cosine is not None)
+    # every returned search hit is marked close_precedent; with the filter off (min_cosine=None) that is the plain top k
     records = [_contract_record(df.iloc[i], s, c, cc, close=True) for (i, s), c in zip(hits, cos)]
     note = []
     if filtered and not records:
@@ -494,6 +552,7 @@ def similar_past_contracts(description, country=None, category=None, k=5, rerank
         note.append(f"country '{country}' not recognised; no location preference applied")
     if category and not cat:
         note.append(f"category '{category}' not recognised (use CW, GO, CS or NC); searched all categories")
+    # best TF-IDF similarity among the returned records; below MIN_CONTRACT_SIM the precedents are reported as weak
     best = max((r["similarity"] for r in records), default=0.0)
     log = []
     if filtered and len(records) < k:          # what the search did not find, as a citable record for evidence gaps
@@ -534,6 +593,8 @@ def _benchmarks():
         source = BENCHMARK_TABLE
     else:
         # fallback when p07 has not published its table yet: the same four peer-group levels from tender_timelines
+        # c: one row per timed, openly competed contract; g: each row repeated once per level, with 'ALL' in the fields
+        # that level ignores; the GROUP BY then gives one row per peer group with n_contracts and P10 / P50 / P90 days
         b = spark.sql(f"""
             WITH c AS (SELECT borrower_country_code AS country_code, coalesce(region, 'Other') AS region,
                               procurement_method_name, procurement_category_code, days_notice_to_signing AS days
@@ -547,7 +608,10 @@ def _benchmarks():
                    CAST(percentile(days, 0.5) AS INT) AS p50_days, CAST(percentile(days, 0.9) AS INT) AS p90_days
             FROM g GROUP BY 1, 2, 3, 4, 5""").toPandas()
         source = f"computed from {GOLD}.tender_timelines (fallback: {BENCHMARK_TABLE} not available)"
+    # a null country, region or method becomes 'ALL', as the fallback query writes them
     b = b.fillna({"country_code": "ALL", "region": "ALL", "procurement_method_name": "ALL"})
+    # b: one row per peer group (benchmark_level, the four group fields, n_contracts, p10/p50/p90_days, and the risk
+    # component's extra columns such as slow_threshold_days and window_start when its table is the source)
     _cache["bench"] = (b, source)
     print(f"benchmarks: {len(b):,} peer groups from {source}")
     return _cache["bench"]
@@ -555,16 +619,20 @@ def _benchmarks():
 
 def _bench_record(row, source):
     level = row.benchmark_level
+    # scope: the peer group in words, for the label
     scope = {"country_method_category": f"{row.country_code}, {row.procurement_method_name}, {row.procurement_category_code}",
              "region_method_category": f"{row.region}, {row.procurement_method_name}, {row.procurement_category_code}",
              "method_category": f"all regions, {row.procurement_method_name}, {row.procurement_category_code}",
              "category": f"all regions and methods, {row.procurement_category_code}"}[level]
+    # where: the location that defines the group (country, region, or None for the levels over all regions)
     where = {"country_method_category": row.country_code, "region_method_category": row.region}.get(level)
     method = None if level == "category" else row.procurement_method_name
+    # the id hashes level, location, method and category, so the same peer group has the same id on every run
     rec = {"record_id": record_id("benchmark", benchmark_key(level, where, method, row.procurement_category_code)),
            "type": "benchmark", "label": f"tender notice to signing, peer group: {scope}", "level": level,
            "n_contracts": int(row.n_contracts), "p10_days": float(row.p10_days), "p50_days": float(row.p50_days),
            "p90_days": float(row.p90_days), "source": source}
+    # optional columns of the risk component's table; a date value is stored as an ISO string
     for extra in ("slow_threshold_days", "slow_rate", "window_start", "window_end"):
         if extra in row.index and not pd.isna(row[extra]):
             rec[extra] = row[extra] if not hasattr(row[extra], "isoformat") else row[extra].isoformat()
@@ -587,7 +655,9 @@ def tender_benchmark(method, category, country=None):
                                       & (b.procurement_method_name == (m or "?")),
             "method_category": (b.benchmark_level == "method_category") & (b.procurement_method_name == (m or "?")),
             "category": b.benchmark_level == "category"}
+    # rows: level -> the matching rows of b (one per level once the location, method and category are fixed)
     rows = {lvl: b[mask & (b.procurement_category_code == cat)] for lvl, mask in want.items()}
+    # groups: only the levels that have data, as {level, n, row}, the shape choose_peer_group expects
     groups = [{"level": lvl, "n": int(r.n_contracts.iat[0]), "row": r.iloc[0]} for lvl, r in rows.items() if len(r)]
     # the finest group with at least MIN_PEER_N contracts; coarser groups are still returned so the brief can show them
     chosen = choose_peer_group(groups, MIN_PEER_N)
@@ -599,6 +669,7 @@ def tender_benchmark(method, category, country=None):
         notes.append(f"country '{country}' not recognised")
     if chosen is None:
         notes.append(f"no peer group with at least {MIN_PEER_N} timed, openly competed contracts")
+    # the chosen group's id, rebuilt from its row the same way as the records above, to mark it in the list
     chosen_id = _bench_record(chosen["row"], source)["record_id"] if chosen else None
     for r in records:
         r["chosen"] = r["record_id"] == chosen_id
@@ -606,7 +677,10 @@ def tender_benchmark(method, category, country=None):
             r["note"] = f"only {r['n_contracts']} contracts: too few for a reliable percentile, not used"
     # the finer peer groups that were skipped, and why, as a citable record for evidence gaps
     n_of = {g["level"]: g["n"] for g in groups}
+    # every level finer than the chosen one was skipped; with no chosen group, all four were
     finer = PEER_LEVELS[:PEER_LEVELS.index(chosen["level"])] if chosen else PEER_LEVELS
+    # one phrase per skipped level: its count when below MIN_PEER_N, or "no timed contracts" when it had no row;
+    # nothing is skipped (and no tool_log record written) when the finest level was chosen
     skipped = [f"{lvl}: " + (f"{n_of[lvl]} contracts (< {MIN_PEER_N})" if lvl in n_of else "no timed contracts")
                for lvl in finer]
     log = [tool_log_record("tender_benchmark", "peer groups skipped: " + "; ".join(skipped), country_code=cc, region=region,
@@ -636,8 +710,10 @@ def _forecaster():
     t0 = time.time()
     try:
         mlflow.set_registry_uri("databricks-uc")
+        # the version goes into every forecast record id, so a new champion gives new ids
         version = mlflow.MlflowClient().get_model_version_by_alias(FORECAST_MODEL, "champion").version
         model = mlflow.pyfunc.load_model(FORECAST_URI)
+        # categories: column -> the values seen in training; scoring_problems refuses an unseen method or category
         categories = model.unwrap_python_model().categories
         err = None
     except Exception as e:                                    # the tool then falls back to the peer group
@@ -648,6 +724,9 @@ def _forecaster():
     # the model's training window, from the benchmark table when it carries it, else p07's published dates
     w0, w1 = (str(w0)[:10] if w0 is not None else "2019-07-01"), (str(w1)[:10] if w1 is not None else "2024-10-13")
     # planning-time defaults per method x category (and per method alone): the notice facts a planner does not know yet
+    # r: timed, openly competed tenders of the training window; adv = days from notice to submission deadline (a
+    # negative span becomes null and is left out of the median); the UNION ALL adds one row per method with category
+    # NULL, which notice_defaults uses when the method x category pair has no row
     nd = spark.sql(f"""
         WITH r AS (
           SELECT t.procurement_method_name AS m, t.procurement_category_code AS c, n.notice_type,
@@ -660,18 +739,28 @@ def _forecaster():
                percentile(chars, 0.5) AS notice_chars, count(*) AS n FROM r GROUP BY m, c
         UNION ALL
         SELECT m, NULL, mode(notice_type), percentile(adv, 0.5), percentile(chars, 0.5), count(*) FROM r GROUP BY m""").collect()
+    # defaults: (method, category or None) -> {notice_type, advertising_days, notice_chars, n}; null methods dropped
     defaults = {(r.m, r.c): {"notice_type": r.notice_type, "advertising_days": r.advertising_days,
                              "notice_chars": r.notice_chars, "n": r.n} for r in nd if r.m}
+    # the tender notice types as a SQL list ("'Invitation for Bids', ..."), used in IN (...) here and in _project_context
     types = ", ".join(f"'{t}'" for t in TENDER_TYPES)
+    # lang: country code -> the most common language of its tender notices
     lang = {r.country_code: r.lang for r in spark.sql(f"""
         SELECT country_code, mode(notice_language) AS lang FROM {SILVER}.notices
         WHERE notice_type IN ({types}) AND notice_language IS NOT NULL GROUP BY 1""").collect()}
+    # gov: (ISO2 code, year) -> that year's governance indicators and log GDP per capita, years from 2015
     gov = {(r.country_iso2, int(r.year)): r.asDict() for r in spark.table(COUNTRY_YEAR).select(
         "country_iso2", "year", "wgi_gov_effectiveness", "wgi_control_corruption", "wgi_rule_of_law", "wgi_regulatory_quality",
         "wgi_political_stability", "wgi_voice_accountability", "log_gdp_pc").filter("year >= 2015").collect()}
+    # month index in SQL, the same numbering as proc_intel.forecast.month_index, so a 36-month window is an integer range
     m_idx = "year({0}) * 12 + month({0}) - 1"
     # small monthly aggregates, so market features for any (country, category, month) are computed in pandas without
     # Spark
+    # - contracts: signed contracts per country x category x month
+    # - winners: per country x category x month x winning entity, supplier rows whose two countries are known (count()
+    #   skips the null comparisons) and, of those, the rows with a foreign supplier
+    # - bidders: award notices that name firms, and the firms they name, per country x category x month
+    # - durations: one row per timed contract (country, method, month, days), for the past median of the country x method
     hist = {
         "contracts": spark.sql(f"""
             SELECT borrower_country_code AS country_code, procurement_category_code,
@@ -709,12 +798,15 @@ def _project_context(project_id, notice_date, types):
                      args={"pid": project_id}).collect()
     if not rows:
         return None, None
+    # prior: the project's tender notices before the planned notice date (the model's "earlier tenders" feature)
     prior = spark.sql(f"""SELECT count(*) AS n FROM {SILVER}.notices WHERE project_id = :pid AND notice_type IN ({types})
                           AND notice_date < :d""", args={"pid": project_id, "d": notice_date.isoformat()}).first().n
     return rows[0].asDict(), int(prior)
 
 
 def _slow_threshold(method, category):
+    # the days above which a tender of this method x category counts as slow (its P75), from the risk component's
+    # table; None when the source has no such column (the fallback benchmarks) or no row for the pair
     b, _ = _benchmarks()
     if "slow_threshold_days" not in b:
         return None
@@ -732,19 +824,24 @@ def forecast_timeline(package):
     try:
         planned = date.fromisoformat(str(package["planned_notice_date"])[:10]) if package.get("planned_notice_date") else None
     except ValueError:
+        # a malformed date is treated as no date: the notice date becomes today, and planning_features lists that
         planned = None
     notice_date = planned or date.today()
     project, prior = _project_context(package.get("project_id"), notice_date, fc["types"])
+    # the project's own region when the project is known, else the country's most common region
     region = (project or {}).get("region") or R["region_of"].get(cc)
     h = fc["hist"]
+    # market: the market-history features over the 36 months before the notice month
     market = market_features(h["contracts"], h["winners"], h["bidders"], h["durations"], cc, cat, m, month_index(notice_date))
     # every default filled in is recorded in `assumptions`, which the brief must mention
+    # row: feature name -> value for the model's 27 features; assumptions: one sentence per default used
     row, assumptions = planning_features({**package, "planned_notice_date": planned}, method=m, category=cat, country=cc,
                                          region=region, today=date.today(), defaults=fc["defaults"],
                                          language_by_country=fc["language"], governance=fc["governance"], market=market,
                                          project=project, prior_tenders=prior)
     if package.get("project_id") and project is None:
         assumptions.append(f"project {package['project_id']} not found in dim_project: project features missing")
+    # blocking problems stop scoring (a scored=False record); warnings are kept on a scored record
     if fc["model"] is None:
         blocking, warnings = [f"model {FORECAST_MODEL}@champion could not be loaded ({fc['error']})"], []
     else:
@@ -761,7 +858,9 @@ def forecast_timeline(package):
                    p10_days=None, p50_days=None, p90_days=None, slow_probability=None,
                    fallback="use the peer-group benchmark (tender_benchmark) for the timeline")
         return {"records": [rec], "scored": False, "notes": blocking}
+    # model_frame: the row as a one-row DataFrame; p: its prediction with p10_days, p50_days, p90_days, slow_probability
     p = fc["model"].predict(model_frame(row)).iloc[0]
+    # features: the values scored, without None and NaN (v != v only for NaN), floats rounded to 3 places
     rec.update(scored=True, label="model forecast of tender notice to signing for this package (P10-P90 is an 80% interval)",
                p10_days=float(round(p.p10_days)), p50_days=float(round(p.p50_days)), p90_days=float(round(p.p90_days)),
                slow_probability=round(float(p.slow_probability), 2), slow_threshold_days=_slow_threshold(m, cat),
@@ -794,6 +893,8 @@ def _lessons():
         FROM {RAG_CHUNKS} r LEFT JOIN {SILVER}.dim_project p USING (project_id)
         WHERE upper(r.section) RLIKE '{PAD_SECTION_RE}' OR lower(r.chunk_text) RLIKE '{PAD_TEXT_RE}'""")
     parts = [pad]
+    # the completion-report passages built in p08 section 1, once that table exists; both selects use the same
+    # column names, so unionByName lines them up
     if spark.catalog.tableExists(LESSON_TABLE):
         parts.append(spark.sql(f"""
             SELECT concat('lesson_chunk:', chunk_id) AS record_id, 'completion' AS source, project_id, project_name,
@@ -802,7 +903,10 @@ def _lessons():
             FROM {LESSON_TABLE} WHERE embedding IS NOT NULL"""))
     df = parts[0] if len(parts) == 1 else parts[0].unionByName(parts[1])
     pdf = df.toPandas()
+    # pdf: one row per passage (record_id, source, project, country, region, doc ids, section, year, text);
+    # E: its vectors, row i of E belongs to row i of pdf
     E = np.vstack(pdf.pop("embedding").to_numpy()).astype("float32")
+    # normalised once here, so E @ q in lessons_learned is the cosine
     E /= np.linalg.norm(E, axis=1, keepdims=True)
     _cache["lessons"] = (pdf, E)
     print(f"lesson passages: {len(pdf):,} ({pdf.source.value_counts().to_dict()})")
@@ -815,16 +919,20 @@ def lessons_learned(query, country=None, source=None, k=6):
     cc = resolve_country(country, R["countries"])
     region = R["region_of"].get(cc)
     q = embed_texts([query])[0]
+    # cos[i]: cosine of the query to passage i (both unit length)
     cos = E @ q
+    # a smaller location bonus than the contract search: +0.02 same country, +0.01 same region
     boost = location_boost(pdf.country_code.to_numpy(), pdf.region.to_numpy(), cc, region, 0.02, 0.01)
     total = cos + boost
     if source in ("appraisal", "completion"):
         # cosines are at least -1, so -9 pushes the other source below every candidate without changing array shapes
         total = np.where(pdf.source.to_numpy() == source, total, -9.0)
+    # the 200 best by boosted score, best first; diverse_top_k takes from these in order
     order = np.argsort(-total)[:200]
     # at most two passages per document, so one long report cannot fill all the slots
     pick = diverse_top_k(order, pdf.doc_id.to_numpy(), k, per_group=2)
     records = []
+    # each record keeps the raw cosine (no location bonus), the value compared with MIN_LESSON_COSINE
     for i in pick:
         r = pdf.iloc[i]
         records.append({"record_id": r.record_id, "type": "lesson" if r.source == "completion" else "appraisal_passage",
@@ -859,6 +967,8 @@ def _kg():
     if "kg" in _cache:
         return _cache["kg"]
     t0 = time.time()
+    # e: one row per edge; BID_ON goes supplier entity -> award notice with a role (awarded / evaluated / rejected),
+    # AWARDED_TO goes contract -> supplier entity
     e = spark.sql(f"""
         SELECT edge_type, src_id, dst_id, properties['role'] AS role FROM {KG_EDGES}
         WHERE edge_type IN ('BID_ON', 'AWARDED_TO')""").toPandas()
@@ -866,12 +976,15 @@ def _kg():
     # one integer code per entity across both edge types: a profile becomes array look-ups instead of Spark joins (26-74
     # s each)
     ent_codes, ents = pd.factorize(pd.concat([bid.src_id, won.dst_id], ignore_index=True))
+    # kg: parallel arrays with one entry per edge; the first len(bid) codes are the BID_ON rows, the rest AWARDED_TO;
+    # "entities" maps a code back to its node id, and notices get codes of their own (they only need telling apart)
     kg = {"entities": pd.Index(ents),
           "bid_entity": ent_codes[:len(bid)].astype("int32"),
           "bid_notice": pd.factorize(bid.dst_id)[0].astype("int32"),
           "bid_role": bid.role.fillna("").to_numpy(),
           "won_entity": ent_codes[len(bid):].astype("int32"),
           "won_contract": won.src_id.str.removeprefix("contract:").to_numpy()}
+    # only the compact arrays stay cached; the edge frames are freed
     del e, bid, won
     _cache["kg"] = kg
     print(f"knowledge-graph edges for supplier profiles: {len(kg['bid_entity']):,} BID_ON, {len(kg['won_entity']):,} "
@@ -880,6 +993,7 @@ def _kg():
 
 
 def supplier_profile(supplier_entity_id):
+    # accepts "SE-1000002" or "supplier_entity:SE-1000002"
     sid = str(supplier_entity_id).strip().removeprefix("supplier_entity:")
     if not _SE_RE.match(sid):
         return {"records": [], "notes": [f"'{supplier_entity_id}' is not a supplier entity id (SE-...)"]}
@@ -891,18 +1005,24 @@ def supplier_profile(supplier_entity_id):
     if not node:
         return {"records": [], "notes": [f"{sid} not found in the knowledge graph"]}
     props = dict(node[0].properties or {})
+    # mine: boolean mask over the BID_ON edges, True for this entity's edges
     mine = kg["bid_entity"] == code if code >= 0 else np.zeros(len(kg["bid_entity"]), bool)
+    # roles: role -> number of award-notice mentions of the entity in that role
     roles = pd.Series(kg["bid_role"][mine]).value_counts().to_dict()
     notices = np.unique(kg["bid_notice"][mine])
     # co-bidders: every other entity named in the same award notices
     others = kg["bid_entity"][np.isin(kg["bid_notice"], notices) & ~mine]
+    # co: the 5 entity codes named most often next to this one, with the number of shared notices
     co = pd.Series(others).value_counts().head(5) if len(others) else pd.Series(dtype=int)
     co_ids = [kg["entities"][i] for i in co.index]
+    # the co-bidders' names in one query, with the ids passed as an array parameter
     names = {r.node_id: r.name for r in spark.sql(
         f"SELECT node_id, name FROM {KG_NODES} WHERE array_contains(:ids, node_id)", args={"ids": co_ids}).collect()} if co_ids else {}
     won_ids = kg["won_contract"][kg["won_entity"] == code] if code >= 0 else np.array([], dtype=object)
     df = C["df"]
+    # wins: the entity's contracts as rows of the contract index, newest first
     wins = df[df.contract_id.isin(set(won_ids))].sort_values("signing_date", ascending=False)
+    # named: mentions in any role, the denominator of the win rate (contracts without an award notice are not in it)
     named = sum(roles.values())
     rec = {"record_id": nid, "type": "supplier_entity", "label": node[0].name,
            "registered_country": props.get("country_code"), "n_contracts_won": int(props.get("n_contracts", 0) or 0),
@@ -976,7 +1096,9 @@ TOOLS = [
         "parameters": {"type": "object", "required": ["supplier_entity_id"], "properties": {
             "supplier_entity_id": {"type": "string", "description": "Entity id from a contract record, e.g. 'SE-1000002'"}}}}},
 ]
+# tool name -> its function spec, which check_tool_call validates the planner's arguments against
 TOOL_SPECS = {t["function"]["name"]: t["function"] for t in TOOLS}
+# per record type, the only fields the planner sees of a tool result (see _planner_view)
 PLANNER_KEYS = {"contract": ["record_id", "label", "country_code", "method", "amount_usd", "days_notice_to_signing",
                              "n_firms_in_award_notice", "supplier_entity_ids", "similarity"],
                 "benchmark": ["record_id", "label", "n_contracts", "p10_days", "p50_days", "p90_days", "chosen", "note"],
@@ -991,6 +1113,7 @@ def _run_tool(name, args, package):
     with mlflow.start_span(name=name, span_type=SpanType.TOOL) as span:
         span.set_inputs(args)
         t0 = time.time()
+        # args are already checked (required keys present, types and enums valid); k is capped at 8 as the spec says
         if name == "similar_past_contracts":
             res = similar_past_contracts(args["description"], args.get("country"), args.get("category"),
                                          k=min(int(args.get("k", 5)), 8), exclude_project_ids=package.get("_exclude_projects", ()))
@@ -1003,8 +1126,10 @@ def _run_tool(name, args, package):
         elif name == "lessons_learned":
             res = lessons_learned(args["query"], args.get("country"), args.get("source"), k=min(int(args.get("k", 6)), 8))
         else:
+            # the only other name check_tool_call lets through
             res = supplier_profile(args["supplier_entity_id"])
         res["latency_s"] = round(time.time() - t0, 2)
+        # the span keeps ids and notes only; the full records stay in the run state
         span.set_outputs({"n_records": len(res["records"]), "ids": [r["record_id"] for r in res["records"]],
                           "notes": res.get("notes"), "latency_s": res["latency_s"]})
     return res
@@ -1015,6 +1140,7 @@ def _planner_view(res):
     # cheap
     recs = [compact([r], PLANNER_KEYS[r["type"]], max_text=160)[0] for r in res["records"]]
     out = {"records": recs}
+    # plus the result's summary fields that are set; the JSON string becomes the content of the tool message
     for key in ("chosen", "best_similarity", "best_cosine", "best_rerank_cosine", "threshold", "weak", "notes", "resolved"):
         if res.get(key) not in (None, [], {}):
             out[key] = res[key]
@@ -1067,12 +1193,14 @@ def input_guard(package):
             # instructions
             {"role": "user", "content": f"<package>\n{_TAG.sub('[tag removed]', package_text(package))}\n</package>"}]
     out, err = None, None
+    # two attempts: an endpoint error, a reply that is not JSON or one without the two booleans raises and is retried
     for attempt in (1, 2):
         try:
             r = chat(msgs, GUARD_MODEL, max_tokens=120, response_format=GUARD_SCHEMA)
             v = json.loads(r["text"])
             if not (isinstance(v.get("in_scope"), bool) and isinstance(v.get("injection"), bool)):
                 raise ValueError(r["text"][:120])
+            # allowed only when the text is in scope and is not an injection
             out = {"allowed": v["in_scope"] and not v["injection"], "in_scope": v["in_scope"],
                    "injection": v["injection"], "reason": str(v.get("reason", ""))[:200], "flagged": False}
             break
@@ -1120,8 +1248,14 @@ def _package_message(package):
 @mlflow.trace(span_type=SpanType.CHAIN, name="planner")
 def plan_and_gather(package, model=None):
     model = model or PLANNER_MODEL
+    # msgs: the whole conversation, sent again every round; it grows by one assistant turn (with its tool_calls)
+    # and one "tool" message per call
     msgs = [{"role": "system", "content": PLANNER_SYSTEM}, {"role": "user", "content": _package_message(package)}]
+    # results: [(tool name, full result dict)] for the writer; calls: one log row per executed call;
+    # errors: the rejected calls with their error text
     results, calls, errors, rounds = [], [], [], 0
+    # one round = one planner call, which may ask for several tools; the loop also ends when the planner stops
+    # calling tools (it replies DONE)
     while rounds < MAX_PLANNER_ROUNDS and len(calls) < MAX_TOOL_CALLS:
         rounds += 1
         with mlflow.start_span(name=f"planner_round_{rounds}", span_type=SpanType.CHAT_MODEL) as span:
@@ -1130,6 +1264,7 @@ def plan_and_gather(package, model=None):
                               "usage": r["usage"]})
         if not r["tool_calls"]:
             break
+        # the assistant turn must carry its tool_calls, so each tool message below can answer one by tool_call_id
         msgs.append({"role": "assistant", "content": r["text"] or "", "tool_calls": r["tool_calls"]})
         for tc in r["tool_calls"]:
             name = tc.get("function", {}).get("name")
@@ -1148,9 +1283,12 @@ def plan_and_gather(package, model=None):
                     calls.append({"tool": name, "args": args, "n_records": len(res["records"]), "forced": False})
                     results.append((name, res))
                     content = _planner_view(res)
+            # one tool message per call, whether it ran, was rejected or was over budget
             msgs.append({"role": "tool", "tool_call_id": tc.get("id"), "content": content})
     called = {c["tool"] for c in calls}
     # coverage check: the core evidence types are fetched by code if the planner skipped them
+    # forced: (tool, args) built from the package; the method defaults to Request for Bids when the package has none,
+    # and the benchmark and forecast need a category, so without one they are not forced
     forced = []
     if "similar_past_contracts" not in called:
         forced.append(("similar_past_contracts", {"description": package["description"], "country": package.get("country"),
@@ -1165,7 +1303,9 @@ def plan_and_gather(package, model=None):
         forced.append(("lessons_learned", {"query": f"procurement risks and delays: {package['description']}",
                                            "country": package.get("country")}))
     for name, args in forced:
+        # None values are dropped, as check_tool_call drops them from the planner's calls
         args = {k: v for k, v in args.items() if v is not None}
+        # forced calls run even when the tool-call budget is spent, and are logged with forced=True
         res = _run_tool(name, args, package)
         calls.append({"tool": name, "args": args, "n_records": len(res["records"]), "forced": True})
         results.append((name, res))
@@ -1236,6 +1376,8 @@ Return only the JSON object."""
 
 def _evidence_block(r):
     skip = {"record_id", "type", "text", "supplier_entity_ids", "features"}     # model inputs are not evidence to quote
+    # one block per record: "<<<RECORD contract:123 | contract>>>", a line of "key: value" pairs (None and empty
+    # values left out), the passage text (at most 1,400 characters) if the record has one, then "<<<END>>>"
     head = f"<<<RECORD {r['record_id']} | {r['type']}>>>"
     body = "; ".join(f"{k}: {v}" for k, v in r.items()
                      if k not in skip and v is not None and not (isinstance(v, (str, list, dict, tuple)) and len(v) == 0))
@@ -1244,11 +1386,14 @@ def _evidence_block(r):
 
 
 def evidence_strength(results):
+    # one label per evidence type: "none" (no usable result), "weak", "ok", or "no close precedent" / "not scored"
     s = {"precedents": "none", "benchmark": "none", "forecast": "none", "lessons": "none"}
     for name, res in results:
         if name == "similar_past_contracts":
+            # the planner may call a tool more than once: an "ok" from one call is never lowered to "weak" by another
             if res["records"]:
                 s["precedents"] = "weak" if res["weak"] and s["precedents"] != "ok" else "ok"
+            # an empty search with the precedent rule on is a finding (nothing close), not missing evidence
             elif s["precedents"] == "none" and res.get("threshold") is not None:
                 s["precedents"] = "no close precedent"
         if name == "tender_benchmark" and res.get("chosen"):
@@ -1272,23 +1417,30 @@ def package_facts(package):
 @mlflow.trace(span_type=SpanType.CHAT_MODEL, name="writer")
 def write_brief(package, records, strength, model=None):
     model = model or PLANNER_MODEL
+    # every gathered record as a delimited block, in the order the tools returned them
     ev = "\n\n".join(_evidence_block(r) for r in records.values())
+    # e.g. "precedents: ok; benchmark: ok; forecast: ok; lessons: weak"
     note = "; ".join(f"{k}: {v}" for k, v in strength.items())
+    # e.g. "project_id: not given | country_code: KE | region: ... | method: Request for Bids"
     facts = " | ".join(f"{k}: {v or 'not given'}" for k, v in package_facts(package).items())
+    # one user message: the package, PACKAGE FACTS, the computed evidence strength, then all evidence blocks
     msgs = [{"role": "system", "content": WRITER_SYSTEM},
             {"role": "user", "content": f"{_package_message(package)}\n\nPACKAGE FACTS: {facts}\n\n"
                                         f"EVIDENCE STRENGTH (computed): {note}\n\nEVIDENCE:\n\n{ev}\n\nReturn the JSON brief."}]
+    # calls keeps every writer call, so the latency and tokens reported below include a repair round
     calls = [chat(msgs, model, max_tokens=1800, response_format=BRIEF_SCHEMA, reasoning_effort=WRITER_REASONING_EFFORT,
                   role="writer")]
     brief, err = parse_brief(calls[-1]["text"])
     first_ok = brief is not None
     # one repair round with the parse error; a second failure becomes a "fallback" result upstream
     if brief is None:
+        # the repair round shows the model its own reply (cut to 6,000 characters) and the parse error
         msgs += [{"role": "assistant", "content": calls[-1]["text"][:6000]},
                  {"role": "user", "content": f"Your reply was not valid: {err}. Return only the corrected JSON object."}]
         calls.append(chat(msgs, model, max_tokens=1800, response_format=BRIEF_SCHEMA, reasoning_effort=WRITER_REASONING_EFFORT,
                   role="writer"))
         brief, err = parse_brief(calls[-1]["text"])
+    # brief is the parsed dict or None; the info dict becomes out["writer"] and run_agent's "writer" block
     return brief, {"first_try_valid": first_ok, "error": err, "n_calls": len(calls), "reasoning_effort": calls[-1]["reasoning_effort"],
                    "provider": calls[-1].get("provider"),
                    "latency_s": round(sum(c["latency_s"] for c in calls), 2),
@@ -1320,6 +1472,7 @@ def _tool_outcomes(results):
     return out
 
 
+# the returned Documents become the RETRIEVER span's output, which the groundedness judge reads as the evidence
 @mlflow.trace(span_type=SpanType.RETRIEVER, name="gathered_evidence")
 def _log_evidence(records, package, outcomes=()):
     return _evidence_documents(records, package, outcomes)
@@ -1362,10 +1515,13 @@ def gather_evidence(package, model=None):
     if gate["flagged"]:
         out["flags"].append("guard_unavailable")
     if not gate["allowed"]:
+        # refused: no tool runs, and finish_brief keeps this status and text
         out.update(status="refused", text=REFUSAL, brief=None, records={}, calls=[],
                    flags=out["flags"] + ["injection" if gate.get("injection") else "out_of_scope"])
     else:
         g = plan_and_gather(package, model)
+        # records: record_id -> record, merged over all tool results (the writer's evidence and the validation's
+        # list of known ids); the same contract can arrive from a search and from a supplier profile
         records = {}
         for _, res in g["results"]:
             for r in res["records"]:
@@ -1376,6 +1532,7 @@ def gather_evidence(package, model=None):
         _log_evidence(records, package, _tool_outcomes(g["results"]))
         out.update(calls=g["calls"], tool_errors=g["errors"], forced_tools=g["forced_tools"], rounds=g["rounds"],
                    strength=evidence_strength(g["results"]), records=records)
+    # the run's tokens move into the state, and the thread's ledger is cleared so later calls are not charged to it
     out["usage"], _RUN.usage = _RUN.usage, None
     out["latency_gather_s"] = round(time.time() - t0, 2)
     return out
@@ -1391,6 +1548,7 @@ def finish_brief(state):
     if out.get("status") != "refused":
         records, strength = out["records"], out["strength"]
         if all(strength[k] != "ok" for k in ("precedents", "benchmark", "lessons")):     # the forecast alone is no evidence
+            # no writer call: a fixed "insufficient evidence" brief, and first_try_valid None says the writer did not run
             brief, info = _insufficient(package, f"evidence too weak: {strength}"), {"first_try_valid": None}
             out["flags"] = out["flags"] + ["weak_evidence"]     # a new list: dict(state) shares the state's lists
         else:
@@ -1402,11 +1560,14 @@ def finish_brief(state):
         else:
             # the model's brief is never returned as is: unknown ids, uncited risks and timeline numbers are checked in
             # code
+            # first the citations (ids, timeline numbers, precedents, status), then the claims in each cited sentence;
+            # the flags of both are added to the run's flags
             clean, report = validate_brief(brief, records, package_text(package))
             checked, fc = factcheck_brief(clean, records, package_facts(package))
             out.update(brief=checked, validation=report, factcheck=fc, status=checked["status"],
                        text=render_brief(checked, records), flags=out["flags"] + report["flags"] + fc["flags"])
     out.pop("_package", None)
+    # usage: model -> [prompt, completion] tokens of the whole run (guard, planner, embeddings, writer)
     out["usage"], _RUN.usage = _RUN.usage, None
     out["dbu"] = round(sum(dbu(m, p, c) for m, (p, c) in out["usage"].items()), 4)
     out["n_tool_calls"] = len(out.get("calls", []))
@@ -1472,6 +1633,7 @@ def _agent_output(r):
             "peer_group": None if bm is None else {"record_id": bm["record_id"], "level": bm.get("level"),
                                                    "n_contracts": bm.get("n_contracts"), "p10_days": bm.get("p10_days"),
                                                    "p50_days": bm.get("p50_days"), "p90_days": bm.get("p90_days")}},
+        # validate_brief keeps only contract records as precedents, so the id after "contract:" is the contract id
         "precedents": [{"record_id": p["record_id"], "contract_id": p["record_id"].split(":", 1)[1],
                         "label": recs.get(p["record_id"], {}).get("label"),
                         "rerank_cosine": recs.get(p["record_id"], {}).get("rerank_cosine"),

@@ -130,6 +130,7 @@ def fetch_icr_catalog():
         print(f"catalog: reusing {len(pages)} saved pages")
         return pages
     offset, total = 0, None
+    # pages of 1,000 documents ("os" is the API's offset parameter); total comes from the first page's reply
     while total is None or offset < total:
         r = requests.get(WDS_URL, timeout=120, params={"format": "json", "rows": 1000, "os": offset, "docty_exact": ICR_TYPE,
                                                        "fl": "projectid,docdt,docty,lang,txturl,display_title"})
@@ -148,6 +149,7 @@ def fetch_icr_catalog():
     return sorted(glob.glob(f"{ICR_ROOT}/metadata/page_*.json"))
 
 
+# rows: one dict per catalogued report; projectid can list several projects, comma-separated (split in the SQL below)
 rows = []
 for p in fetch_icr_catalog():
     for d in json.load(open(p)):
@@ -160,6 +162,12 @@ print(f"catalog rows: {catalog.count():,}")
 # one report per project, then round-robin over sectors within each region so no single sector or country fills the
 # corpus;
 # the 7 regions share the 300 places, hence region_rank <= MAX_DOCS // 7 + 1 inside the query
+# - docs: one row per (report, project), English reports with a text URL only
+# - latest: the newest report per project; open_counts: openly competed contracts per project
+# - cand: reports of projects with a real region; one_per_doc: a report listed under several projects keeps the
+#   project with the most open contracts
+# - ranked: sector_turn numbers the projects within each region x sector, busiest first; turns: region_rank orders a
+#   region by sector_turn, so the region's sectors take turns (first project of every sector, then the second, ...)
 selection = spark.sql(f"""
     WITH docs AS (
       SELECT doc_id, trim(pid) AS project_id, try_to_date(nullif(doc_date, '')) AS doc_date, regexp_replace(txt_url, '^http://', 'https://') AS txt_url, title
@@ -207,6 +215,7 @@ session = requests.Session()
 
 
 def download(row):
+    # returns (doc_id, path or None, status, bytes), one row of the download table below
     path = f"{ICR_ROOT}/text/{row.project_id}__{row.doc_id}.txt"
     # resumable: a file already on the volume is not downloaded again (empty files from a failed write are retried)
     if os.path.exists(path) and os.path.getsize(path) > 0:
@@ -222,6 +231,7 @@ def download(row):
             status = f"http_{r.status_code}"
         except Exception as e:
             status = f"error_{type(e).__name__}"
+        # waits 2, 4 and 6 s; after the third failure the last status is returned
         time.sleep(2 * (attempt + 1))
     return row.doc_id, None, status, 0
 
@@ -229,6 +239,7 @@ def download(row):
 t0 = time.time()
 with ThreadPoolExecutor(max_workers=4) as pool:
     dl = pd.DataFrame(list(pool.map(download, selection.itertuples())), columns=["doc_id", "path", "download_status", "n_bytes"])
+# docs: the selection plus path, download_status and n_bytes per report
 docs = selection.merge(dl, on="doc_id")
 print(f"downloads in {time.time() - t0:.0f} s: {docs.download_status.value_counts().to_dict()}; "
       f"median size {docs.n_bytes[docs.n_bytes > 0].median() / 1024:.0f} KB")
@@ -251,6 +262,7 @@ for d in docs[docs.path.notna()].itertuples():
     kept = lesson_chunks(raw, max_per_doc=MAX_PER_DOC)
     stats.append({"doc_id": d.doc_id, "n_words": len(raw.split()), "n_kept": len(kept)})
     for c in kept:
+        # chunk_id = project_id-doc_id-chunk_index (4 digits), cited by the agent as lesson_chunk:<chunk_id>
         chunk_rows.append({"chunk_id": f"{d.project_id}-{d.doc_id}-{c['chunk_index']:04d}", "doc_id": d.doc_id,
                            "project_id": d.project_id, "chunk_index": c["chunk_index"], "section": c["section"],
                            "chunk_text": c["text"], "n_words": c["n_words"], "relevance_score": c["score"]})
@@ -261,6 +273,7 @@ print(f"{len(chunks):,} passages kept from {int((st.n_kept > 0).sum())} of {len(
       f"(median {st.n_kept.median():.0f} per report; {int((st.n_kept == 0).sum())} reports with none)")
 display(chunks.assign(section_head=chunks.section.str.split(" > ").str[0].str[:60])
         .groupby("section_head").size().sort_values(ascending=False).head(12).rename("passages").reset_index())
+# the first report's passages, for the reading check
 ex = chunks[chunks.doc_id == chunks.doc_id.iloc[0]]
 for c in ex.head(4).itertuples():
     print(f"\n[{c.chunk_id}] {c.section} ({c.n_words} words, score {c.relevance_score})\n   {c.chunk_text[:400]} ...")
@@ -283,12 +296,15 @@ chunks["embed_text"] = [f"Completion report | {proj_names.get(p, '')} | {s}\n{t}
 # checkpoint key: a vector is reused only if the exact embedded text is unchanged
 chunks["text_hash"] = [hashlib.sha256(t.encode()).hexdigest()[:32] for t in chunks.embed_text]
 
+# done: text_hash -> vector, from every group file saved so far
 done = {}
 for f in sorted(glob.glob(f"{ICR_ROOT}/embeddings/group_*.parquet")):
     g = pd.read_parquet(f)
     done.update(zip(g.text_hash, g.embedding))
+# todo: passages without a saved vector; identical embedded texts are embedded once
 todo = chunks[~chunks.text_hash.isin(done)].drop_duplicates("text_hash")
 print(f"embeddings: {len(done):,} reused, {len(todo):,} to embed")
+# new group files continue the numbering after the saved ones
 t0, n_groups = time.time(), len(glob.glob(f"{ICR_ROOT}/embeddings/group_*.parquet"))
 for start in range(0, len(todo), 1000):
     part = todo.iloc[start:start + 1000]
@@ -299,10 +315,12 @@ for start in range(0, len(todo), 1000):
     n_groups += 1
     done.update(zip(g.text_hash, g.embedding))
     print(f"  {start + len(part):,}/{len(todo):,} embedded ({time.time() - t0:.0f} s)")
+# every passage now has a vector, looked up by its text hash
 chunks["embedding"] = [np.asarray(done[h], dtype="float32").tolist() for h in chunks.text_hash]
 
 # COMMAND ----------
 
+# a report whose download failed has no word counts; they are stored as 0
 doc_df = spark.createDataFrame(docs[["doc_id", "project_id", "project_name", "country_code", "region", "major_sector", "doc_date",
                                      "title", "txt_url", "n_open_contracts", "selection_rank", "download_status", "n_bytes",
                                      "n_words", "n_kept"]].assign(doc_type=ICR_TYPE, n_words=lambda x: x.n_words.fillna(0).astype(int),
@@ -322,6 +340,8 @@ n_docs = publish_table(
 add_foreign_key(LESSON_DOCS_TABLE, ["project_id"], f"{SILVER}.dim_project", ["project_id"])
 
 meta = docs.set_index("doc_id")
+# lc: each passage plus its report's project, location, sector and date (looked up by doc_id), the embedding model
+# and the chunker version
 lc = chunks.assign(project_name=lambda x: x.doc_id.map(meta.project_name), country_code=lambda x: x.doc_id.map(meta.country_code),
                    region=lambda x: x.doc_id.map(meta.region), major_sector=lambda x: x.doc_id.map(meta.major_sector),
                    doc_type=ICR_TYPE, doc_date=lambda x: x.doc_id.map(meta.doc_date),
@@ -353,6 +373,7 @@ add_foreign_key(LESSON_TABLE, ["project_id"], f"{SILVER}.dim_project", ["project
 L, D = spark.table(LESSON_TABLE), spark.table(LESSON_DOCS_TABLE)
 # squared length of each vector in SQL; retrieval uses dot products, which equal cosines only for unit vectors
 norms = L.select(F.expr("aggregate(embedding, 0D, (a, x) -> a + x * x)").alias("n2"))
+# each check: (table, what is checked, observed value, expectation)
 display(dq_report([
     (LESSON_DOCS_TABLE, "rows (reports selected)", n_docs, f"<= {MAX_DOCS}"),
     (LESSON_DOCS_TABLE, "duplicate doc_id", duplicate_keys(D, ["doc_id"]), "== 0"),
@@ -394,6 +415,8 @@ t0 = time.time()
 fct = forecast_timeline(EXAMPLE)
 print(f"\nforecast_timeline ({time.time() - t0:.1f} s incl. loading the model and the history tables)")
 print(json.dumps({k: v for k, v in fct["records"][0].items() if k != "features"}, indent=1, default=str))
+# a later notice date with a longer advertising period, then a method the model was not trained on (scored=False);
+# each print shows only the fields that differ from EXAMPLE
 for variant in ({**EXAMPLE, "planned_notice_date": "2027-03-01", "advertising_days": 60},
                 {**EXAMPLE, "method": "Direct Selection"}):
     r = forecast_timeline(variant)["records"][0]
@@ -403,6 +426,7 @@ t0 = time.time()
 les = lessons_learned("delays and contractor performance in rural road rehabilitation works contracts", EXAMPLE["country"])
 print(f"lessons_learned ({time.time() - t0:.1f} s incl. first load), best cosine {les['best_cosine']}")
 display(pd.DataFrame(les["records"]).assign(text=lambda x: x.text.str[:200])[["record_id", "source", "project_name", "label", "cosine", "text"]])
+# the first winning entity of the first precedent that names one; with None, supplier_profile answers with a note
 top_supplier = next((r["supplier_entity_ids"][0] for r in sim["records"] if r["supplier_entity_ids"]), None)
 t0 = time.time()
 sup = supplier_profile(top_supplier)
@@ -430,8 +454,11 @@ CANDIDATES = ["databricks-qwen35-122b-a10b", "databricks-meta-llama-3-3-70b-inst
 
 
 def run_summary(r):
+    # one flat row per agent run (r = the procurement_brief result), used by the model choice here and by 5d:
+    # tool use, JSON validity, citation checks, what survived validation, the timeline numbers and the cost
     v = r.get("validation") or {}
     b = r.get("brief") or {}
+    # model_tool_calls counts the planner's own calls; the coverage check's calls are counted in forced_tools
     return {"status": r["status"], "model_tool_calls": sum(not c["forced"] for c in r.get("calls", [])),
             "forced_tools": len(r.get("forced_tools", [])), "invalid_tool_calls": len(r.get("tool_errors", [])),
             "json_first_try": (r.get("writer") or {}).get("first_try_valid"), "n_citations": v.get("n_citations"),
@@ -452,12 +479,15 @@ for model in CANDIDATES:
 choice = pd.DataFrame(choice)
 display(choice)
 # a fallback brief is the worst outcome, so it weighs three times a single forced tool or bad citation
+# `== False` counts only an invalid first reply, not None (the writer was not called)
 score = (choice.assign(bad=lambda x: x.forced_tools + x.n_invalid_citations + (x.json_first_try == False).astype(int)
                        + (x.status == "fallback").astype(int) * 3)
          .groupby("model").agg(bad=("bad", "sum"), median_latency_s=("latency_s", "median"), dbu=("dbu", "sum")))
 display(score.reset_index())
 # ties go to cost before latency: latency on the shared pay-per-token endpoints changed a lot from day to day
+# the model column dropped the "databricks-" prefix, so it is added back to get the endpoint name
 CHOSEN_MODEL = "databricks-" + score.sort_values(["bad", "dbu", "median_latency_s"]).index[0]
+# runs called without a model read PLANNER_MODEL, so every later run in this notebook uses the chosen model
 PLANNER_MODEL = CHOSEN_MODEL
 print(f"planner and writer model for the rest of this notebook: {CHOSEN_MODEL}")
 
@@ -482,6 +512,7 @@ print(f"\nstatus {demo['status']} | flags {demo['flags']} | {demo['latency_s']} 
 print(demo["text"])
 print("\nvalidation:", json.dumps({k: v for k, v in demo["validation"].items() if k != "cited_ids"}))
 cited = demo["validation"]["cited_ids"]
+# one row per cited id: its type, label, project, and the passage text or the forecast's assumptions
 display(pd.DataFrame([{"record_id": c, "type": demo["records"][c]["type"], "what": demo["records"][c].get("label"),
                        "project": demo["records"][c].get("project_name"),
                        "detail": (demo["records"][c].get("text") or "; ".join(demo["records"][c].get("assumptions", [])))[:180]}
@@ -510,8 +541,10 @@ print(json.dumps({k: api_out[k] for k in ("status", "timeline", "n_precedents", 
 # COMMAND ----------
 
 ev = json.load(open(EVAL_FILE))
+# src: source contract_id -> its project_id and description
 src = (spark.table(f"{SILVER}.contracts").filter(F.col("contract_id").isin([p["source_contract_id"] for p in ev["packages"]]))
        .select("contract_id", "project_id", "contract_description").toPandas().set_index("contract_id"))
+# packages: [{eval_id, source_contract_id, package}], each package with the agent's input keys and _exclude_projects
 packages = []
 for p in ev["packages"]:
     pkg = {k: p[k] for k in ("description", "country", "category", "method")}
@@ -550,6 +583,7 @@ strategy vs supply of computers), or a description too vague to tell. Return JSO
 
 
 def judge_relevance(pkg, rec):
+    # returns (relevant, reason), or (None, "judge failed: ...") after two failed attempts; None is scored as a miss
     msg = (f"NEW PACKAGE ({pkg['category']}): {pkg['description']}\n\nPAST CONTRACT ({rec.get('category')}, {rec.get('method')}, "
            f"{rec.get('country_code')}): {rec.get('label')}\nProject: {rec.get('project_name')}")
     err = ""
@@ -564,9 +598,11 @@ def judge_relevance(pkg, rec):
     return None, f"judge failed: {err}"
 
 
+# retr: one row per (package, variant, rank) with the contract id, both similarities and the full record for the judge
 retr = []
 for p in packages:
     pkg = p["package"]
+    # TF-IDF alone gives the top 5; the re-ranked variant gives the top 10 (ranks 6-10 feed the precedent-rule check)
     for variant, rr_, k_ in (("tfidf", False, 5), ("tfidf_gte_rerank", True, 10)):
         # min_cosine=None switches the precedent filter off: this measures the ranking itself
         res = similar_past_contracts(pkg["description"], pkg["country"], pkg["category"], k=k_, rerank=rr_,
@@ -579,14 +615,18 @@ retr = pd.DataFrame(retr)
 # a contract found by both variants is judged once, so both variants are scored with the same verdict
 pairs = retr.drop_duplicates(["eval_id", "contract_id"]).reset_index(drop=True)
 pkg_of = {p["eval_id"]: p["package"] for p in packages}
+# two judge calls at a time; verdicts[i] is (relevant, reason) for pairs row i
 with ThreadPoolExecutor(max_workers=2) as pool:
     verdicts = list(pool.map(lambda r: judge_relevance(pkg_of[r.eval_id], r.rec), pairs.itertuples()))
 pairs = pairs.assign(relevant=[v[0] for v in verdicts], judge_reason=[v[1] for v in verdicts])
+# every row of retr gets the verdict of its (package, contract) pair
 retr = retr.merge(pairs[["eval_id", "contract_id", "relevant", "judge_reason"]], on=["eval_id", "contract_id"])
 top5_retr = retr[retr["rank"] <= 5]
 # a failed judge call counts as not relevant, and fewer than 5 results still divide by 5, so the figure errs low
 p_at_5 = (top5_retr.groupby(["variant", "eval_id"]).relevant.apply(lambda s: s.fillna(False).astype(bool).sum() / 5)
           .rename("p_at_5").reset_index())
+# summary_retr: per variant, mean / min / max precision@5 over packages, the same-country share of the top-5 hits and
+# the number of failed judge calls
 summary_retr = p_at_5.groupby("variant").p_at_5.agg(["mean", "min", "max"]).round(3)
 summary_retr["same_country_share"] = top5_retr.groupby("variant").same_country.mean().round(3)
 summary_retr["judge_failures"] = retr.groupby("variant").relevant.apply(lambda s: int(s.isna().sum()))
@@ -594,6 +634,7 @@ print(f"{len(pairs)} distinct (package, contract) pairs judged ({len(top5_retr.d
       f"in the two top-5 lists, the rest at re-rank ranks 6-10)")
 display(summary_retr.reset_index())
 display(p_at_5.pivot(index="eval_id", columns="variant", values="p_at_5").reset_index())
+# gain > 0: re-ranking found more relevant contracts in the top 5 than TF-IDF alone
 gain = summary_retr.loc["tfidf_gte_rerank", "mean"] - summary_retr.loc["tfidf", "mean"]
 # re-ranking costs 31 embeddings per query; keep it only if it buys at least 5 points of precision
 RERANK = bool(gain >= 0.05)
@@ -606,6 +647,7 @@ print(f"re-ranking gain in precision@5: {gain:+.3f} -> RERANK = {RERANK} for the
 
 # COMMAND ----------
 
+# only pairs that appeared in a top 5, so the sample checks the verdicts behind precision@5
 top5_pairs = pairs.merge(top5_retr[["eval_id", "contract_id"]].drop_duplicates(), on=["eval_id", "contract_id"])
 # hash order: the same 30 pairs on every run, so the saved reference labels keep matching
 sample = (top5_pairs.assign(h=[hashlib.sha1(f"{a}|{b}".encode()).hexdigest() for a, b in zip(top5_pairs.eval_id, top5_pairs.contract_id)])
@@ -615,6 +657,8 @@ for r in sample.itertuples():
           f"|| CONTRACT: {r.rec['label'][:110]}")
 if os.path.exists(LABEL_FILE):
     labels = pd.read_csv(LABEL_FILE, dtype={"contract_id": str, "eval_id": str})
+    # inner join: only sampled pairs with a reference label are compared; human_relevant is the historical name of the
+    # agent reference label column
     chk = sample.merge(labels, on=["eval_id", "contract_id"], how="inner")
     agree = (chk.relevant.astype(bool) == chk.human_relevant.astype(bool)).mean()
     print(f"\nagent reference labels: {len(chk)} of {len(sample)} sample pairs labelled; judge agrees on {agree:.0%}; "
@@ -633,9 +677,13 @@ else:
 
 # COMMAND ----------
 
+# judged re-ranked candidates only (a failed judge call is left out)
 rr = retr[retr.variant == "tfidf_gte_rerank"].dropna(subset=["relevant"])
+# cand: one dict per candidate in the shape precedent_rule_metrics expects: group (package), rank, cosine (GTE),
+# tfidf, relevant
 cand = [{"group": r.eval_id, "rank": r.rank, "cosine": r.rerank_cosine, "tfidf": r.similarity, "relevant": bool(r.relevant)}
         for r in rr.itertuples()]
+# grid: GTE cosine 0.60 to 0.80 and TF-IDF cosine 0.00 to 0.20, both in steps of 0.02
 COS_GRID, TFIDF_GRID = np.round(np.arange(0.60, 0.801, 0.02), 2), np.round(np.arange(0.0, 0.201, 0.02), 2)
 rule_rows = [{"rule": "top 5, no filter", **precedent_rule_metrics(cand, 0.0, 0.0)},
              {"rule": f"agent: cosine >= {MIN_PRECEDENT_COSINE} and tfidf >= {MIN_PRECEDENT_TFIDF}",
@@ -644,6 +692,8 @@ rule_rows = [{"rule": "top 5, no filter", **precedent_rule_metrics(cand, 0.0, 0.
 # beta 0.5 weights precision over recall: a listed but unrelated precedent misleads more than a missing one
 best_run = choose_precedent_rule(cand, COS_GRID, TFIDF_GRID, beta=0.5)
 rule_rows.append({"rule": f"best F0.5 on this run: cosine >= {best_run['min_cosine']} and tfidf >= {best_run['min_tfidf']}", **best_run})
+# leave-one-out totals: precedents listed, relevant ones listed, and loo_cap = the relevant ones that could have been
+# listed (min(5, relevant candidates) per package), the recall denominator
 loo_taken = loo_tp = loo_cap = 0
 loo_pairs = []
 # leave one package out: choose the rule on 19 packages, apply it to the 20th, to see how much the choice overfits
@@ -660,6 +710,8 @@ rules["zero_groups"] = rules["zero_groups"].apply(lambda z: ",".join(z) if isins
 print(f"{len(cand)} judged re-ranked candidates (ranks 1-10), {sum(c['relevant'] for c in cand)} relevant; leave-one-out picked "
       f"{pd.Series(loo_pairs).value_counts().to_dict()}")
 display(rules[["rule", "taken", "relevant_taken", "precision", "recall", "zero_groups"]].round(3))
+# per package: best cosine, relevant candidates, precedents the rule lists (the first 5 passing candidates by rank,
+# as the tool fills its list) and how many of those are relevant
 per_pkg = (rr.assign(close=[is_close_precedent(c, t, MIN_PRECEDENT_COSINE, MIN_PRECEDENT_TFIDF)
                             for c, t in zip(rr.rerank_cosine, rr.similarity)], relevant=rr.relevant.astype(bool))
            .groupby("eval_id").apply(lambda g: pd.Series({
@@ -684,6 +736,7 @@ display(per_pkg)
 
 OFF_TOPIC = ["recipe for chocolate cake with vanilla icing", "who won the football world cup final",
              "best hiking trails in the Alps in summer", "how to fix a python import error", "poem about the ocean at night"]
+# cal: one row per query (the 20 packages' risk queries and the 5 off-topic ones) with its best passage cosine
 cal = [{"kind": "package", "best_cosine": lessons_learned(f"procurement risks and delays: {p['package']['description']}",
                                                           p["package"]["country"])["best_cosine"]} for p in packages]
 cal += [{"kind": "off_topic", "best_cosine": lessons_learned(q)["best_cosine"]} for q in OFF_TOPIC]
@@ -712,6 +765,7 @@ from mlflow.genai.scorers import RetrievalGroundedness
 os.environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] = "2"
 JUDGE_URI = f"databricks:/{JUDGE_MODEL}"
 store = {}
+# description -> held-out project ids; predict_fn gets only the judged package, so it looks them up here
 HELD_OUT = {p["package"]["description"]: p["package"]["_exclude_projects"] for p in packages}
 
 
@@ -727,10 +781,13 @@ with mlflow.start_run(run_name="procurement_agent_eval"):
     mlflow.log_params({"planner_model": PLANNER_MODEL, "guard_model": GUARD_MODEL, "judge": JUDGE_MODEL, "rerank": RERANK,
                        "max_tool_calls": MAX_TOOL_CALLS, "n_packages": len(packages)})
     t0 = time.time()
+    # data: one item per package, {"inputs": {"package": ...}} without the "_" keys; predict_fn is called with the
+    # inputs as keyword arguments, and the judge reads each run's trace
     res = mlflow.genai.evaluate(data=[{"inputs": {"package": {k: v for k, v in p["package"].items() if not k.startswith("_")}}}
                                       for p in packages], predict_fn=predict_fn,
                                 scorers=[RetrievalGroundedness(model=JUDGE_URI)])
     eval_wall_s = time.time() - t0
+# rdf: one row per evaluated package, with its request, the assessments and one value column per scorer
 rdf = res.result_df
 print(f"{len(store)} agent runs in {eval_wall_s:.0f} s (2 in parallel); judge columns: {[c for c in rdf.columns if '/' in c]}")
 
@@ -752,9 +809,11 @@ def _as_score(v):
     return float(v)
 
 
+# ground: package description -> (groundedness score from 0 to 1 or None, the judge's rationales joined with " | ")
 ground = {}
 for _, row in rdf.iterrows():
     rat = ""
+    # an assessment is an object or a dict depending on the MLflow version; both forms are read
     for a in (row.get("assessments") or []):
         name = getattr(a, "name", None) or (a.get("assessment_name") or a.get("name") if isinstance(a, dict) else None)
         if "groundedness" in (name or ""):
@@ -764,7 +823,9 @@ for _, row in rdf.iterrows():
 
 # COMMAND ----------
 
+# judged: (eval_id, contract_id) -> verdict from 5b; pairs judged below are added to it
 judged = {(r.eval_id, r.contract_id): r.relevant for r in pairs.itertuples()}
+# pool_relevant: eval_id -> judged-relevant contracts among its top 10 re-ranked candidates
 pool_relevant = (retr[retr.variant == "tfidf_gte_rerank"].groupby("eval_id").relevant
                  .apply(lambda s_: int(s_.fillna(False).astype(bool).sum())).to_dict())
 rows = []
@@ -789,8 +850,13 @@ for p in packages:
                  "forced_tool_names": ",".join(r.get("forced_tools", [])), "brief_text": r["text"],
                  "brief_json": json.dumps(r.get("brief")), "description": p["package"]["description"],
                  "source_contract_id": p["source_contract_id"]})
+# e2e: one row per package with run_summary's columns, the judge's score, the precedent checks and the brief
 e2e = pd.DataFrame(rows)
+# tool calls per run: the planner's own plus the coverage check's
 calls_total = e2e.model_tool_calls + e2e.forced_tools
+# agg: one summary number per measure, printed here and logged to MLflow in 5g;
+# precedent_precision_mean averages the briefs, the pooled value divides all relevant cited precedents by all cited
+# (round(precision x count) gives back each brief's number of relevant precedents)
 agg = {"briefs": len(e2e), "status": e2e.status.value_counts().to_dict(),
        "groundedness_mean": round(e2e.groundedness.mean(), 3), "groundedness_judged": int(e2e.groundedness.notna().sum()),
        "citation_validity_mean": round(e2e.citation_validity.mean(), 3),
@@ -826,6 +892,7 @@ display(e2e[["eval_id", "status", "model_tool_calls", "forced_tool_names", "n_ci
 
 # COMMAND ----------
 
+# a brief the judge did not score (NaN, filled as 1) is not listed
 for r in e2e[e2e.groundedness.fillna(1) < 1].itertuples():
     print(f"--- {r.eval_id} groundedness {r.groundedness}: {r.description}\n{r.brief_text[:1500]}\nJUDGE: {r.groundedness_rationale}\n")
 
@@ -843,6 +910,7 @@ for r in e2e[e2e.groundedness.fillna(1) < 1].itertuples():
 grows = []
 for g in guard_cases:
     r = procurement_brief(g["package"])
+    # got: the refusal reason from the flags, else the status the run ended with (a miss by the guard)
     got = "injection" if "injection" in r["flags"] else ("out_of_scope" if "out_of_scope" in r["flags"] else r["status"])
     grows.append({"eval_id": g["eval_id"], "kind": "guard", "expected": g["expected"], "got": got, "status": r["status"],
                   "correct": got == g["expected"], "guard_reason": r["guard"]["reason"], "latency_s": r["latency_s"],
@@ -868,6 +936,8 @@ display(guard_df[["eval_id", "expected", "got", "correct", "guard_reason", "mode
 # COMMAND ----------
 
 src_ids = ", ".join(f"'{p['source_contract_id']}'" for p in ev["packages"])
+# src_tl: per source contract, its notice date, actual days, whether it is timed, project, notice type, language and
+# advertising days (notice to submission deadline; a negative span becomes null)
 src_tl = spark.sql(f"""
     SELECT t.contract_id, CAST(t.tender_notice_date AS STRING) AS notice_date, t.days_notice_to_signing AS actual_days, t.is_timed,
            c.project_id, n.notice_type, n.notice_language,
@@ -876,7 +946,9 @@ src_tl = spark.sql(f"""
     FROM {GOLD}.tender_timelines t JOIN {SILVER}.contracts c USING (contract_id)
     LEFT JOIN {SILVER}.notices n ON n.notice_id = t.tender_notice_id
     WHERE t.contract_id IN ({src_ids})""").toPandas().set_index("contract_id")
+# the model's training window, to mark which source tenders it saw (in_model_cohort)
 w0, w1 = _forecaster()["window"]
+# trows: one row per package; an untimed source contract has only eval_id and timed=False
 trows = []
 for p in ev["packages"]:
     cid = p["source_contract_id"]
@@ -893,10 +965,12 @@ for p in ev["packages"]:
     row = {"eval_id": p["id"], "timed": True, "notice_date": s_.notice_date, "in_model_cohort": w0 <= s_.notice_date <= w1,
            # capped at 730 days, like the model's training target
            "actual_days": min(float(s_.actual_days), 730.0)}
+    # columns A_p10 ... C_slow and A_id ... C_id: the three forecasts side by side
     for name, pkg in variants.items():
         rec = forecast_timeline(pkg)["records"][0]
         row.update({f"{name}_p10": rec["p10_days"], f"{name}_p50": rec["p50_days"], f"{name}_p90": rec["p90_days"],
                     f"{name}_slow": rec["slow_probability"], f"{name}_id": rec["record_id"]})
+    # the peer group the agent would cite for this package (the chosen benchmark record)
     bm = tender_benchmark(p["method"], p["category"], p["country"])
     chosen = next((r for r in bm["records"] if r["chosen"]), None)
     row.update({"peer_level": chosen["level"] if chosen else None, "peer_p10": chosen["p10_days"] if chosen else None,
@@ -904,6 +978,8 @@ for p in ev["packages"]:
     trows.append(row)
 tcmp = pd.DataFrame(trows)
 timed = tcmp[tcmp.timed].copy()
+# summ: per timeline, the rows it could score, MAE and median absolute error of its P50 against the actual days, how
+# often the actual fell inside P10-P90, and how often its P50 was closer than the peer P50
 summ = []
 for name, lo, mid, hi in (("model A: package only", "A_p10", "A_p50", "A_p90"), ("model B: + project", "B_p10", "B_p50", "B_p90"),
                           ("model C: + notice facts", "C_p10", "C_p50", "C_p90"), ("peer group", "peer_p10", "peer_p50", "peer_p90")):
@@ -928,6 +1004,7 @@ display(timed[["eval_id", "notice_date", "in_model_cohort", "actual_days", "peer
 
 # COMMAND ----------
 
+# 5f column -> saved column name; merged onto the package rows by eval_id
 tl_cols = {"actual_days": "actual_days", "peer_p50": "peer_p50_at_notice", "A_p50": "model_p50_package_only",
            "B_p50": "model_p50_with_project", "C_p50": "model_p50_with_notice"}
 e2e = e2e.merge(tcmp.reindex(columns=["eval_id", *tl_cols]).rename(columns=tl_cols), on="eval_id", how="left")
@@ -936,6 +1013,7 @@ keep_cols = ["eval_id", "kind", "description", "source_contract_id", "status", "
              "invalid_citations", "risks_kept", "precedents_kept", "n_precedents_cited", "precedent_precision", "groundedness",
              "groundedness_rationale", "flags", "latency_s", "dbu", "brief_text", "brief_json", "relevant_in_pool",
              "zero_precedents_right", "forecast_p50_days", "peer_p50_days", *tl_cols.values()]
+# one table for both kinds: package rows leave the guard columns empty, guard rows the brief columns
 save = pd.concat([e2e, guard_df], ignore_index=True).reindex(columns=keep_cols)
 # pandas NaN would not fit the typed schema below; turn every missing value into None first
 save = save.astype(object).where(save.notna(), None)
@@ -947,6 +1025,7 @@ save_schema = ("eval_id string, kind string, description string, source_contract
                "dbu double, brief_text string, brief_json string, relevant_in_pool double, zero_precedents_right boolean, "
                "forecast_p50_days double, peer_p50_days double, actual_days double, peer_p50_at_notice double, "
                "model_p50_package_only double, model_p50_with_project double, model_p50_with_notice double")
+# the schema's double and boolean columns get plain Python floats and bools (ints and numpy values do not fit them)
 num_cols = [c.split()[0] for c in save_schema.split(", ") if c.split()[1] == "double"]
 for c in num_cols:
     save[c] = [None if v is None else float(v) for v in save[c]]
@@ -984,6 +1063,8 @@ n_saved = publish_table(
      "judge_model": "Judge endpoint", "rerank": "GTE re-ranking of contract search on", "evaluated_at": "Evaluation time (UTC)"},
     primary_key=["eval_id"])
 with mlflow.start_run(run_name="procurement_agent_eval_summary"):
+    # numeric measures of agg only (the status counts are a dict), NaN left out (v == v is False only for NaN);
+    # timeline MAE metrics are named e.g. timeline_mae_model_A and timeline_mae_peer_group
     mlflow.log_metrics({k: float(v) for k, v in agg.items() if isinstance(v, (int, float)) and v == v})
     mlflow.log_metrics({"guard_correct": float(guard_df.correct.mean()),
                         "retrieval_p_at_5_tfidf": float(summary_retr.loc["tfidf", "mean"]),

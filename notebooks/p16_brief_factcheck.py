@@ -85,10 +85,13 @@ SUFFIX = dbutils.widgets.get("suffix")
 _here = os.path.dirname(dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get())
 # p11's source is read from the workspace at run time, so this replay cannot drift from p11's own code
 _p11 = base64.b64decode(WorkspaceClient().workspace.export(f"{_here}/p11_backtest", format=ExportFormat.SOURCE).content).decode()
+# P11_CELLS: p11's cells as code text, with markdown (# MAGIC) lines and the source header removed
 P11_CELLS = ["\n".join(line for line in c.split("\n") if not line.startswith("# MAGIC") and line != "# Databricks notebook source")
              for c in _p11.split("# COMMAND ----------")]
 
 
+# the names one top-level statement defines: functions, classes, assignment targets, and assignments
+# nested in try / with / if blocks
 def _defined(node):
     if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
         return {node.name}
@@ -104,6 +107,7 @@ def _defined(node):
 def run_p11(marker, names=None):
     """Execute the p11 cell containing `marker` in this notebook's namespace; with `names`, only the top-level
     statements that define those names."""
+    # the marker must match exactly one p11 cell, so a renamed line fails here instead of running the wrong cell
     cells = [c for c in P11_CELLS if marker in c]
     assert len(cells) == 1, f"p11 cell '{marker}': {len(cells)} matches"
     tree = ast.parse(cells[0])
@@ -112,6 +116,7 @@ def run_p11(marker, names=None):
         tree.body = [n for n in tree.body if _defined(n) & set(names)]
         missing = set(names) - set().union(*(_defined(n) for n in tree.body))
         assert not missing, f"p11 cell '{marker}' does not define {missing}"
+    # run in this notebook's globals, so p11's definitions become names here; the filename shows the cell in tracebacks
     exec(compile(tree, f"p11_backtest[{marker[:30]}]", "exec"), globals())
 
 
@@ -126,8 +131,9 @@ run_p11('tl = spark.table(f"{GOLD}.tender_timelines")')       # 1a cohort featur
 run_p11("def slow_thresholds(")                               # 1b slow label and package texts
 run_p11('test["stratum"] = ')                                 # 1c the 300-package sample
 run_p11("model_a = fit_recipe(train, CAL_START)")             # 2a model A at the cutoff (+ p07 reproduction check)
-run_p11("def benchmark_table(", ["benchmark_table", "cutoff_bench"])
+run_p11("def benchmark_table(", ["benchmark_table", "cutoff_bench"])  # 2b the cutoff benchmark table only
 run_p11("def as_of(")                                         # 3a hiding the future
+# 3c the judge cache and the relevance judge; 5a the review selection and the groundedness rubric; the record text helper
 run_p11("def judge_json(", ["_JUDGE_LOCK", "JCACHE", "save_judge_cache", "judge_json", "REL_SCHEMA", "REL_SYSTEM",
                             "judge_relevance"])
 run_p11("GROUND_SCHEMA = ", ["order", "first", "review", "GROUND_SCHEMA", "GROUND_SYSTEM", "HAS_FORECAST_TOOL"])
@@ -145,10 +151,12 @@ run_p11("def short_text(", ["short_text"])
 # COMMAND ----------
 
 v1_path = f"{REVIEW_DIR}/review_briefs.csv"
+# p11's review file in the volume, or the repository copy when the volume has none
 v1 = pd.read_csv(v1_path if os.path.exists(v1_path) else os.path.join(DATA_DIR, "human_review", "review_briefs.csv"),
                  dtype={"contract_id": str})
 # fail before any model call if p11's review selection changed
 assert review["row_id"].astype(str).tolist() == v1["contract_id"].tolist(), "p11's review selection changed"
+# a smoke run keeps the first LIMIT packages; the assert above has already checked all of them
 review = review.head(LIMIT)
 print(f"{len(review)} packages, identical to p11's review pack (first: {review['row_id'].iloc[0]}, "
       f"last: {review['row_id'].iloc[-1]}); held-out projects {review['project_id'].nunique()}")
@@ -179,6 +187,7 @@ if cached and cached["contract_ids"] == review["row_id"].astype(str).tolist() an
     print(f"tool half loaded from {STATES_FILE} (gathered in {t_gather:.0f} s)")
 else:
     states = []
+    # the tool half one package at a time, exactly as p11 section 5a calls the agent: as_of swaps caches every tool shares
     for pkg in review.itertuples():
         package = {"description": pkg.query, "country": pkg.country_code, "category": pkg.procurement_category_code,
                    "method": pkg.procurement_method_name, "_exclude_projects": [pkg.project_id]}
@@ -206,6 +215,7 @@ def write_one(state):
 t1 = time.time()
 with ThreadPoolExecutor(max_workers=WRITER_THREADS) as pool:
     outs = list(pool.map(write_one, states))
+# pool.map keeps input order, so outs[i] is the brief for states[i] and review row i
 retried = [i for i, o in enumerate(outs) if o is None]
 for i in retried:
     # wait out the per-minute token window before retrying a throttled brief on its own
@@ -219,6 +229,7 @@ for pkg, out in zip(review.itertuples(), outs, strict=True):
     retrieved = [r for r in recs_.values() if r["type"] != "contract" or r.get("close_precedent", True)]
     # p11's leak check: no cited precedent or lesson may be dated after the notice
     check_no_leak(retrieved, pkg.notice_date, pkg.project_id)
+    # graph contracts (supplier history) are not replayed as of the date; they are counted, as in p11
     out["_kg_future"] = leak_violations([r for r in recs_.values() if r["type"] == "contract" and not r.get("close_precedent", True)],
                                         str(pkg.notice_date.date()), [])
     briefs.append((pkg, out))
@@ -246,6 +257,7 @@ search did not find, which peer groups were skipped and why) and the PACKAGE FAC
 the PACKAGE FACTS. "All" / "each" / "all five" claim a fact for every cited contract.
 Return JSON""")
 assert GROUND_SYSTEM_V2 != GROUND_SYSTEM, "p11's rubric text changed: update the round-2 additions"
+# keyed on every test row, so each review package finds its model A range
 pred_a_of = dict(zip(test["row_id"], pred_a.to_dict("records")))
 
 
@@ -276,6 +288,7 @@ def judge_messages(pkg, out):
     package = {"description": pkg.query, "country": pkg.country_code, "category": pkg.procurement_category_code,
                "method": pkg.procurement_method_name, "project_id": pkg.project_id,
                "planned_notice_date": str(pkg.notice_date.date())}
+    # the cited records as the writer saw them, cut to the same sizes as in p11
     ev = "\n\n".join(_evidence_block(r)[:1600] for r in (out.get("cited_records") or {}).values())[:40000]
     facts = " | ".join(f"{k}: {v or 'not given'}" for k, v in package_facts(package).items())
     return (f"PACKAGE:\n{package_text(package)}\nPACKAGE FACTS: {facts}\n\nRECORDS:\n{ev}\n\nBRIEF:\n{out.get('text', '')}",
@@ -283,6 +296,8 @@ def judge_messages(pkg, out):
 
 
 t2 = time.time()
+# two groundedness jobs per written brief: the round-2 rubric on the message with PACKAGE FACTS, and p11's rubric on p11's message.
+# This pass only fills the judge cache in parallel; the loop below reads the same verdicts back from it.
 jobs = [(system, msgs[k]) for pkg, out in briefs if out.get("brief")
         for msgs in [judge_messages(pkg, out)] for k, system in ((0, GROUND_SYSTEM_V2), (1, GROUND_SYSTEM))]
 with ThreadPoolExecutor(max_workers=max(3, WRITER_THREADS)) as pool:          # fills the judge cache in parallel
@@ -295,6 +310,7 @@ for i, (pkg, out) in enumerate(briefs, 1):
                "planned_notice_date": str(pkg.notice_date.date())}
     brief, recs, cited = out.get("brief") or {}, out.get("cited_records") or {}, out.get("cited_ids") or []
     u_new, u_old = judge_messages(pkg, out)
+    # the same automatic scores as p11 section 5a: timeline range check and the relevance judge on the precedents
     tl_out = out.get("timeline") or {}
     model_tl, peer_tl = tl_out.get("model") or {}, tl_out.get("peer_group") or {}
     range_rec = model_tl if model_tl.get("p10_days") is not None else (peer_tl or None)
@@ -303,6 +319,7 @@ for i, (pkg, out) in enumerate(briefs, 1):
     auto_prec = sum(bool(judge_relevance(pkg.query, pkg.procurement_category_code, r)[0]) for r in prec_recs[:5])
     g, _ = judge_json_role(GROUND_SYSTEM_V2, u_new, GROUND_SCHEMA, max_tokens=1500) if brief else (None, False)
     g_old, _ = judge_json_role(GROUND_SYSTEM, u_old, GROUND_SCHEMA, max_tokens=1500) if brief else (None, False)  # p11's rubric
+    # the _full file shows each record's facts line in front of its short text
     full_cited.append(json.dumps([{"record_id": c, "text": (f"{recs[c]['facts']} | " if recs[c].get("facts") else "")
                                    + short_text(recs[c])[:400]} for c in cited if c in recs]))
     pa = pred_a_of[pkg.row_id]
@@ -327,6 +344,7 @@ for i, (pkg, out) in enumerate(briefs, 1):
                      "timeline_ok": "", "precedents_relevant": "", "risks_relevant": "", "any_unsupported_claim": "", "notes": ""})
     fc = out.get("factcheck") or {}
     w = out.get("writer") or {}
+    # extra: the fact-check and writer columns, added to the table but not to the CSV
     extra.append({"review_id": rid, "factcheck_removed": int(fc.get("n_removed") or 0), "factcheck_fixed": int(fc.get("n_fixed") or 0),
                   "factcheck_claims_checked": int(fc.get("n_claims_checked") or 0),
                   "factcheck_events": json.dumps(fc.get("events") or []), "citation_validity": out.get("citation_validity"),
@@ -343,7 +361,9 @@ assert list(review_v2.columns) == list(v1.columns), "review_briefs_v2 must have 
 review_v2.to_csv(f"{REVIEW_DIR}/review_briefs_v2{SUFFIX}.csv", index=False)
 review_v2.assign(cited_records=full_cited).to_csv(f"{REVIEW_DIR}/review_briefs_v2{SUFFIX}_full.csv", index=False)  # facts shown
 fc_df = pd.DataFrame(extra)
+# the table: the CSV columns without the empty label columns, plus the fact-check and writer columns
 table_df = review_v2.drop(columns=["timeline_ok", "precedents_relevant", "risks_relevant", "any_unsupported_claim", "notes"]).merge(fc_df, on="review_id")
+# cast to float, so a column mixing numbers and None has one numeric type in Spark
 for c in ("model_p50_days", "peer_p50_days", "citation_validity", "latency_s", "writer_latency_s", "dbu", "n_precedents",
           "writer_completion_tokens"):
     table_df[c] = table_df[c].astype(float)
@@ -388,6 +408,7 @@ else:
 
 # COMMAND ----------
 
+# one row per fact-check event: review_id plus field, action, before, after and reason
 ev_rows = [{"review_id": r.review_id, **e} for r in fc_df.itertuples() for e in json.loads(r.factcheck_events)]
 print(f"briefs changed by the fact-check: {int(((fc_df.factcheck_removed + fc_df.factcheck_fixed) > 0).sum())} of {len(fc_df)} "
       f"(sentences removed in {int((fc_df.factcheck_removed > 0).sum())}, counts corrected in {int((fc_df.factcheck_fixed > 0).sum())}); "
@@ -396,11 +417,13 @@ print(f"briefs changed by the fact-check: {int(((fc_df.factcheck_removed + fc_df
 for e in ev_rows[:15]:
     print(f"- {e['review_id']} {e['field']} [{e['action']}] {e['before'][:220]!r}\n    -> {str(e['after'])[:220]!r}\n    because {e['reason'][:200]}")
 cv = fc_df["citation_validity"].dropna()
+# the first pack cut to the same number of packages, so a smoke run compares like with like
 lat1, lat2 = v1["latency_s"].astype(float).head(len(review_v2)), review_v2["latency_s"].astype(float)
 compare = pd.DataFrame([
     {"measure": "median latency, s", "v1 (thinking off, no fact-check)": statistics.median(lat1), "v2": statistics.median(lat2)},
     {"measure": "median writer latency, s", "v1 (thinking off, no fact-check)": None, "v2": statistics.median(fc_df["writer_latency_s"].astype(float))},
     {"measure": "citation validity (mean / min)", "v1 (thinking off, no fact-check)": None, "v2": f"{cv.mean():.3f} / {cv.min():.3f}"},
+    # astype(str).eq("True") counts True whether the CSV value was read as a boolean or as text
     {"measure": "groundedness judge, p11 rubric: briefs with an unsupported claim",
      "v1 (thinking off, no fact-check)": int(v1["auto_unsupported_claim"].head(len(review_v2)).astype(str).eq("True").sum()),
      "v2": int(fc_df["auto_unsupported_p11_rubric"].astype(str).eq("True").sum())},
@@ -412,12 +435,14 @@ compare = pd.DataFrame([
      "v2": str(review_v2["status"].value_counts().to_dict())},
     {"measure": "precedents per brief", "v1 (thinking off, no fact-check)": v1["n_precedents"].head(len(review_v2)).mean(), "v2": review_v2["n_precedents"].mean()}])
 print(compare.astype(str).to_string(index=False))
+# the five briefs the final labels of the first pack found unsupported
 watch = review_v2[review_v2["review_id"].isin(["r06", "r10", "r17", "r26", "r30"])]
 for r in review_v2[review_v2["auto_unsupported_claim"].astype(str).eq("True")].itertuples():
     print(f"judge (round-2 rubric) on {r.review_id}: {r.auto_unsupported_examples[:300]}")
 for r in watch.itertuples():
     t = r.brief_text
     print(f"===== {r.review_id} ({r.country}, project {r.project_id}) judge unsupported: {r.auto_unsupported_claim}")
+    # the market-approach and precedents sections, where the errors of the first pack were
     print(t[t.find("Market approach"):t.find("Risks and mitigations")].strip()[:600])
     print(t[t.find("Similar precedents"):t.find("Evidence gaps") if "Evidence gaps" in t else None].strip()[:700])
 print(ledger_frame().to_string(index=False))

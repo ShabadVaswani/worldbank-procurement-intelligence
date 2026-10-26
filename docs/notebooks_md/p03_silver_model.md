@@ -162,12 +162,14 @@ from proc_intel.notices import parse_award_notice
 from proc_intel.procurement import CATEGORIES, category_code, clean_method_name, method_competition
 from proc_intel.references import normalise_reference, step_activity_id
 
+# Each UDF wraps a tested pure function from src/proc_intel and runs once per row in Python.
 to_iso2_udf = as_udf(to_iso2, StringType())
 category_udf = as_udf(category_code, StringType())
 method_udf = as_udf(clean_method_name, StringType())
 competition_udf = as_udf(method_competition, StringType())
 ref_norm_udf = as_udf(normalise_reference, StringType())
 step_id_udf = as_udf(step_activity_id, StringType())
+# parse_award_notice returns a dict; this schema tells Spark its shape: two scalars plus a list of firm structs.
 award_schema = StructType([
     StructField("award_notification_date", DateType()),
     StructField("contract_duration_days", IntegerType()),
@@ -176,10 +178,12 @@ award_schema = StructType([
 ])
 award_udf = as_udf(parse_award_notice, award_schema)
 
+# soft-deleted bronze rows stay for the audit trail but must not reach the model
 awards = spark.table(f"{BRONZE}.contract_awards").filter("_removed_at_source IS NULL")
 raw_notices = spark.table(f"{BRONZE}.procurement_notices")
 INDIVIDUAL_ID = "^[0-9a-f]{16}$"     # anonymised individual consultants
 
+# foreign keys pointing at a parent table block overwriting it, so drop them all first and redeclare them in section 9
 dropped_fks = drop_foreign_keys(SILVER)
 print("foreign keys dropped before rebuild:", dropped_fks)
 ```
@@ -218,19 +222,23 @@ categories: 4
 **Why:** both feeds use the same names, so the cleaned name is the conformed key. `competition` matters downstream: only openly competed methods are expected to have a published tender notice, which sets the denominator for tender timelines in `p05`.
 
 ```python
+# One row per notice: its cleaned method name and its method code (blank codes become null).
 notice_methods = (raw_notices.select(method_udf("procurement_method_name").alias("method_name"),
                                      F.nullif(F.trim("procurement_method_code"), F.lit("")).alias("code"))
                   .filter("method_name IS NOT NULL"))
+# a name can appear with more than one code in the notices feed; keep its most frequent code
 method_codes = (notice_methods.filter("code IS NOT NULL").groupBy("method_name", "code").count()
                 .withColumn("rn", F.row_number().over(Window.partitionBy("method_name").orderBy(F.desc("count"))))
                 .filter("rn = 1").select("method_name", F.col("code").alias("method_code")))
+# Grain of methods: one row per cleaned method name, with how many award rows and notices use it.
 methods = (awards.select(method_udf("procurement_method").alias("method_name"))
            .groupBy("method_name").agg(F.count("*").alias("n_award_rows"))
+           # full join: some methods occur in only one of the two feeds
            .join(notice_methods.groupBy("method_name").agg(F.count("*").alias("n_notices")), "method_name", "full")
-           .filter("method_name IS NOT NULL")
+           .filter("method_name IS NOT NULL")  # clean_method_name returns None for blank names
            .join(method_codes, "method_name", "left")
            .withColumn("competition", competition_udf("method_name"))
-           .fillna(0, ["n_award_rows", "n_notices"])
+           .fillna(0, ["n_award_rows", "n_notices"])  # a method absent from one feed gets 0 there, not null
            .select("method_name", "method_code", "competition", "n_award_rows", "n_notices"))
 n_methods = publish_table(
     methods, f"{SILVER}.dim_procurement_method",
@@ -280,22 +288,30 @@ International Competitive Bidding   | ICB         | open        | 0            |
 **Why:** the notices feed and the award-notice HTML carry country *names* only. Indicator names are used only for codes already seen in the awards, because the indicators table also holds aggregates ("Latin America & Caribbean", "World") that must not become countries.
 
 ```python
+# Every distinct (country_code, name) pair in the awards: borrower and supplier columns stacked, codes crosswalked by to_iso2.
 award_names = (awards.select(to_iso2_udf("borrower_country_code", "borrower_country").alias("country_code"),
                              F.col("borrower_country").alias("name"))
                .unionByName(awards.select(to_iso2_udf("supplier_country_code", "supplier_country").alias("country_code"),
                                           F.col("supplier_country").alias("name")))
                .filter("country_code IS NOT NULL AND name IS NOT NULL").distinct())
+# only for codes already seen in the awards: the indicators table also holds aggregates ("World", regions) that are not
+# countries
+# The left_semi join is a filter: it keeps indicator rows whose code is in the awards and adds no columns.
 indicator_names = (spark.table(OUTCOME_INDICATORS).filter("country_iso2 <> ''")
                    .groupBy(F.col("country_iso2").alias("country_code"))
                    .agg(F.first("country_name").alias("indicator_name"))
                    .join(award_names.select("country_code").distinct(), "country_code", "left_semi"))
+# NAME_TO_ISO2: spellings with no code in the awards or spelled differently in notices. REGIONAL_CODES: Bank programme codes.
 alias_names = spark.createDataFrame(list(NAME_TO_ISO2.items()), "name string, country_code string")
 regional_names = spark.createDataFrame(list(REGIONAL_CODES.items()), "country_code string, name string")
+# One row per (name, country_code) pair from all four sources; cached because it is counted, checked and joined below.
 name_to_code = (award_names.unionByName(alias_names)
                 .unionByName(indicator_names.select("country_code", F.col("indicator_name").alias("name")))
                 .unionByName(regional_names).distinct().cache())
 ambiguous = name_to_code.groupBy("name").agg(F.countDistinct("country_code").alias("codes")).filter("codes > 1")
+# a spelling that maps to two codes would duplicate rows in every join on this lookup
 assert ambiguous.count() == 0, f"country names mapping to several codes: {ambiguous.collect()}"
+# _cname is the join column for the name lookups in section 5 (notice country and bidder country).
 country_lookup = name_to_code.withColumnRenamed("name", "_cname")
 print("country spellings:", name_to_code.count(), "| codes:", name_to_code.select("country_code").distinct().count())
 ```
@@ -312,6 +328,8 @@ country spellings: 257 | codes: 238
 **Why:** this is the fact table most analysis starts from. The normalised reference and STEP activity id are the join keys to tender notices in `p05`.
 
 ```python
+# first() is safe for the contract-level columns: section 10 checks that none of them varies within a contract
+# awards has one row per contract x supplier; the groupBy collapses it to one row per contract.
 contracts = (awards.groupBy(F.col("wb_contract_number").alias("contract_id")).agg(
         F.first("project_id").alias("project_id"),
         F.first("borrower_country_code").alias("_bcode"), F.first("borrower_country").alias("borrower_country_name"),
@@ -320,18 +338,24 @@ contracts = (awards.groupBy(F.col("wb_contract_number").alias("contract_id")).ag
         F.first("review_type").alias("review_type"),
         F.first("borrower_contract_reference_number").alias("borrower_reference"),
         F.first("contract_description").alias("contract_description"),
+        # max, not sum: the feed repeats the contract value on every joint-venture member row
         F.max("supplier_contract_amount_usd").alias("contract_amount_usd"),
+        # spread is usually 1.0; ~1.03 or ~1.0003 is a known conversion artefact, not a split between members
+        # nullif turns a minimum of 0 into null, so the ratio is null instead of a division by zero
         (F.max("supplier_contract_amount_usd") / F.nullif(F.min("supplier_contract_amount_usd"), F.lit(0.0)))
             .alias("amount_spread_ratio"),
         F.count("*").alias("n_suppliers"),
+        # max of a boolean is True when any supplier row of the contract has an anonymised id
         F.max(F.col("supplier_id").rlike(INDIVIDUAL_ID)).alias("is_individual_consultant"),
         F.max("as_of_date").alias("as_of_date"))
+    # the _-prefixed raw columns are converted here: country crosswalk, text date to date, method and category UDFs
     .select("contract_id", "project_id",
             to_iso2_udf("_bcode", "borrower_country_name").alias("borrower_country_code"), "borrower_country_name",
             F.to_date("_signed", "dd-MMM-yyyy").alias("signing_date"), "fiscal_year",
             method_udf("_method").alias("procurement_method_name"),
             category_udf("_category").alias("procurement_category_code"),
             "review_type", "borrower_reference",
+            # reference_norm and step_activity_id are the join keys to tender notices in p05
             ref_norm_udf("borrower_reference").alias("reference_norm"),
             step_id_udf("borrower_reference").alias("step_activity_id"),
             "contract_description", "contract_amount_usd", "amount_spread_ratio", "n_suppliers",
@@ -382,15 +406,18 @@ def blank_to_null(col: str):
     return F.nullif(F.trim(F.col(col)), F.lit(""))
 
 
+# bronze also holds pre-2018 rows from the last page of each country; silver keeps the 2018+ window only
 in_window = (raw_notices.withColumn("notice_date", F.to_date("noticedate", "dd-MMM-yyyy"))
-             .filter(F.col("notice_date") >= F.lit(NOTICE_CUTOFF)))
+             .filter(F.col("notice_date") >= F.lit(NOTICE_CUTOFF)))  # a null (undated) notice_date also fails this
 # Parse only award notices: a Python UDF inside F.when would still run on every row.
 award_parsed = (in_window.filter("notice_type = 'Contract Award'")
                 .select("id", award_udf("notice_text").alias("award")))
+# Left join: non-award notices keep a null award struct. The lookup adds country_code from the printed country name.
 notices_typed = (in_window.join(award_parsed, "id", "left")
                  .join(country_lookup, F.col("project_ctry_name") == F.col("_cname"), "left"))
 notices = notices_typed.select(
     F.col("id").alias("notice_id"), blank_to_null("notice_type").alias("notice_type"), "notice_date",
+    # these fields arrive as timestamps in text; the first 10 characters are the ISO date
     F.to_date(F.substring("submission_date", 1, 10)).alias("published_date"),
     F.to_date(F.substring("submission_deadline_date", 1, 10)).alias("submission_deadline"),
     blank_to_null("project_id").alias("project_id"),
@@ -410,9 +437,11 @@ notices = notices_typed.select(
     F.col("award.contract_duration_days").alias("contract_duration_days"),
     F.size("award.firms").alias("n_named_firms"),
     F.col("award.firms").alias("_firms"))
+# reused twice below (notices table and the exploded bidders), and the award UDF is the expensive part
 notices.cache()
 
 n_notices = publish_table(
+    # size() of a null array is -1, so blank the count on non-award notices instead of showing -1
     notices.drop("_firms").withColumn("n_named_firms", F.when(F.col("notice_type") == "Contract Award",
                                                              F.col("n_named_firms"))),
     f"{SILVER}.notices",
@@ -442,12 +471,14 @@ n_notices = publish_table(
      "n_named_firms": "Contract Award notices: distinct firms named as awarded, evaluated or rejected"},
     primary_key=["notice_id"])
 
+# explode gives one row per firm named in an award notice; a null _firms array (non-award notice) gives no rows.
 bidders = (notices.select("notice_id", F.explode("_firms").alias("f"))
            .select("notice_id", F.col("f.supplier_id").alias("supplier_id"), F.col("f.role").alias("role"),
                    F.col("f.name").alias("firm_name"), F.col("f.country_name").alias("firm_country_name"))
            .join(country_lookup.withColumnRenamed("country_code", "firm_country_code"),
                  F.col("firm_country_name") == F.col("_cname"), "left").drop("_cname")
            # a firm listed in two sections keeps its strongest role
+           # _rank: awarded 0, evaluated 1, rejected 2; _rn = 1 leaves one row per notice x supplier_id (the PK)
            .withColumn("_rank", F.when(F.col("role") == "awarded", 0).when(F.col("role") == "evaluated", 1).otherwise(2))
            .withColumn("_rn", F.row_number().over(Window.partitionBy("notice_id", "supplier_id").orderBy("_rank")))
            .filter("_rn = 1").drop("_rank", "_rn"))
@@ -477,7 +508,9 @@ notices: 379820 | notice_bidders: 678025
 **Why:** the bridge is what lets a joint venture point to all its members without duplicating the contract. Bidders seen only in notices are included so that `notice_bidders` has no orphans and losing bidders can join the knowledge graph.
 
 ```python
+# one award row has no supplier_id; a surrogate keyed on its text keeps the bridge's primary key non-null
 supplier_key = F.coalesce("supplier_id", F.concat(F.lit("NOID-"), F.substring(F.sha2("supplier", 256), 1, 12)))
+# Same grain as the awards rows: one row per contract x supplier, so joint-venture members stay separate rows.
 contract_suppliers = (awards.select(
         F.col("wb_contract_number").alias("contract_id"), supplier_key.alias("supplier_id"),
         F.col("supplier").alias("supplier_name"),
@@ -494,6 +527,8 @@ n_cs = publish_table(
 
 cs = spark.table(f"{SILVER}.contract_suppliers")
 contract_value = spark.table(f"{SILVER}.contracts").select("contract_id", "contract_amount_usd", "signing_date")
+# contracts carries the amount once per contract, so summing it per member does not double count within a joint venture
+# award_side: one row per supplier_id in the awards; F.mode picks the most frequent name and country for the id.
 award_side = (cs.join(contract_value, "contract_id")
               .groupBy("supplier_id").agg(
                   F.mode("supplier_name").alias("award_name"),
@@ -502,9 +537,12 @@ award_side = (cs.join(contract_value, "contract_id")
                   F.countDistinct("contract_id").alias("n_contracts"),
                   F.sum("contract_amount_usd").alias("value_won_as_member_usd"),
                   F.min("signing_date").alias("first_signing_date"), F.max("signing_date").alias("last_signing_date")))
+# notice_side: one row per supplier_id named in any award notice, in any role.
 notice_side = (spark.table(f"{SILVER}.notice_bidders").groupBy("supplier_id").agg(
                   F.mode("firm_name").alias("notice_name"), F.mode("firm_country_code").alias("notice_country"),
                   F.countDistinct("notice_id").alias("n_award_notices")))
+# full join so losing bidders that never won a contract still get a supplier row (no orphans in notice_bidders)
+# Award values win over notice values; ids seen on only one side get 0 counts and a 0.0 value instead of nulls.
 suppliers = (award_side.join(notice_side, "supplier_id", "full").select(
     "supplier_id",
     F.coalesce("award_name", "notice_name").alias("supplier_name"),
@@ -546,11 +584,13 @@ contract_suppliers: 295058 | suppliers: 399502
 **Why:** the project is the bridge between procurement and everything the outcome project already knows (documents, ratings, risk). Copying a handful of descriptive columns keeps common queries simple; anything else is one join away on `project_id`.
 
 ```python
+# Every project id referenced by a contract or a notice: this is the row set of dim_project.
 project_ids = (spark.table(f"{SILVER}.contracts").select("project_id")
                .union(spark.table(f"{SILVER}.notices").select("project_id")).filter("project_id IS NOT NULL").distinct())
 award_proj = awards.groupBy("project_id").agg(F.mode("project_name").alias("award_project_name"),
                                               F.mode("region").alias("award_region"),
                                               F.mode("project_global_practice").alias("global_practice"))
+# silver notices does not keep project_name, so it is read back from bronze by notice id.
 notice_proj = (spark.table(f"{SILVER}.notices").filter("project_id IS NOT NULL")
                .join(raw_notices.select(F.col("id").alias("notice_id"), "project_name"), "notice_id")
                .groupBy("project_id").agg(F.mode("project_name").alias("notice_project_name"),
@@ -561,13 +601,17 @@ outcome = spark.table(OUTCOME_PROJECTS).select("project_id", F.col("project_name
                                                "commitment_musd", "status", "env_category")
 risk = spark.table(RISK_SCORES).select("project_id", F.col("risk_band").alias("outcome_risk_band"),
                                        F.col("risk_of_failure").alias("outcome_risk_of_failure"))
+# The most frequent borrower code across the project's contracts.
 contract_country = (spark.table(f"{SILVER}.contracts").groupBy("project_id")
                     .agg(F.mode("borrower_country_code").alias("contract_country")))
+# all left joins on project_id: each side is already one row per project, so the grain stays one row per project
 projects = (project_ids.join(award_proj, "project_id", "left").join(notice_proj, "project_id", "left")
             .join(outcome, "project_id", "left").join(risk, "project_id", "left")
             .join(contract_country, "project_id", "left")
             .select("project_id",
                     F.coalesce("award_project_name", "notice_project_name", "outcome_project_name").alias("project_name"),
+                    # prefer the crosswalked procurement codes; the outcome table's code goes through the same crosswalk
+                    # as a fallback
                     F.coalesce("contract_country", "notice_country", to_iso2_udf("outcome_country")).alias("country_code"),
                     F.coalesce("award_region", "outcome_region").alias("region"),
                     "global_practice", "major_sector", "approval_date", "approval_fy", "commitment_musd", "status",
@@ -602,6 +646,7 @@ projects: 3768
 **Why:** built last so it contains exactly the codes the facts reference: no orphans, and no unused aggregates.
 
 ```python
+# Every country code referenced by the tables built above: this is the row set of dim_country.
 used_codes = (spark.table(f"{SILVER}.contracts").select(F.col("borrower_country_code").alias("country_code"))
               .union(spark.table(f"{SILVER}.contract_suppliers").select("supplier_country_code"))
               .union(spark.table(f"{SILVER}.notices").select("country_code"))
@@ -611,9 +656,11 @@ used_codes = (spark.table(f"{SILVER}.contracts").select(F.col("borrower_country_
 wgi_codes = (spark.table(COUNTRY_YEAR).filter("wgi_gov_effectiveness IS NOT NULL")
              .select(F.col("country_iso2").alias("country_code")).distinct()
              .withColumn("has_country_indicators", F.lit(True)))
+# Unlike indicator_names in section 3 this is not filtered to award codes: the left joins below start from used_codes.
 all_indicator_names = (spark.table(OUTCOME_INDICATORS).filter("country_iso2 <> ''")
                        .groupBy(F.col("country_iso2").alias("country_code"))
                        .agg(F.first("country_name").alias("indicator_name")))
+# min() picks one spelling per code, the same one on every run, when the awards hold several.
 award_display = award_names.groupBy("country_code").agg(F.min("name").alias("award_name"))
 countries = (used_codes
              .join(all_indicator_names, "country_code", "left")
@@ -621,6 +668,7 @@ countries = (used_codes
              .join(regional_names.withColumnRenamed("name", "regional_name"), "country_code", "left")
              .join(wgi_codes, "country_code", "left")
              .select("country_code",
+                     # display name: the indicators name first, then the awards spelling, then the programme name
                      F.coalesce("indicator_name", "award_name", "regional_name").alias("country_name"),
                      F.when(F.col("regional_name").isNotNull(), "region").otherwise("country").alias("kind"),
                      F.coalesce("has_country_indicators", F.lit(False)).alias("has_country_indicators")))
@@ -649,6 +697,7 @@ countries: 246
 **Why:** the relationships then show up in Catalog Explorer and in tools that read constraints (BI semantic layers, the optimizer). They are counted for orphans in the next cell.
 
 ```python
+# (child table, child column, parent table, parent column). Section 10 counts orphans from this same list.
 FOREIGN_KEYS = [
     ("contracts", "project_id", "dim_project", "project_id"),
     ("contracts", "borrower_country_code", "dim_country", "country_code"),
@@ -684,6 +733,7 @@ foreign keys declared: 16
 **Why:** declared keys are not enforced, so this table is the actual guarantee. `info` rows are facts to know, not failures. For example, regional programmes legitimately have no country code.
 
 ```python
+# Read every table back from the catalog, so the checks test what was written, not the in-memory DataFrames.
 T = {name: spark.table(f"{SILVER}.{name}") for name in
      ["contracts", "contract_suppliers", "suppliers", "notices", "notice_bidders", "dim_project", "dim_country",
       "dim_procurement_method", "dim_procurement_category"]}
@@ -691,12 +741,16 @@ pk = {"contracts": ["contract_id"], "contract_suppliers": ["contract_id", "suppl
       "notices": ["notice_id"], "notice_bidders": ["notice_id", "supplier_id"], "dim_project": ["project_id"],
       "dim_country": ["country_code"], "dim_procurement_method": ["method_name"],
       "dim_procurement_category": ["category_code"]}
+# Each check is (table, description, value, rule); dq_report scores "== 0" rules as pass or FAIL and leaves "info" unscored.
 checks = [(t, f"duplicate PK {'+'.join(k)}", duplicate_keys(T[t], k), "== 0") for t, k in pk.items()]
 checks += [(child, f"orphan {col} -> {parent}", orphan_count(T[child], col, T[parent], parent_col), "== 0")
            for child, col, parent, parent_col in FOREIGN_KEYS]
 
+# Raw awards columns that must hold one value per contract for the first() calls in section 4 to be safe.
 per_contract_attrs = ["project_id", "contract_signing_date", "procurement_method", "procurement_category",
                       "borrower_contract_reference_number", "review_type", "borrower_country_code", "fiscal_year"]
+# re-checks the Step 2 claim on every run; nulls are counted as a value so null-vs-value also counts as varying
+# Result: the number of contracts where at least one of these columns has more than one distinct value.
 varying = (awards.groupBy("wb_contract_number")
            .agg(*[F.countDistinct(F.coalesce(F.col(c).cast("string"), F.lit("<null>"))).alias(c) for c in per_contract_attrs])
            .filter(" OR ".join(f"{c} > 1" for c in per_contract_attrs)).count())
@@ -706,6 +760,7 @@ checks += [
     ("contracts", "rows in bronze (current)", awards.count(), "info"),
     ("contracts", "contract_amount_usd null", null_count(c, "contract_amount_usd"), "info"),
     ("contracts", "contract_amount_usd <= 0", c.filter("contract_amount_usd <= 0").count(), "info"),
+    # info only: very large contracts exist (e.g. big works), so this is a pointer for review, not an error
     ("contracts", "contract_amount_usd > 500 million", c.filter("contract_amount_usd > 5e8").count(), "info"),
     ("contracts", "amount_spread_ratio > 1.05 (members disagree by >5%)", c.filter("amount_spread_ratio > 1.05").count(), "info"),
     ("contracts", "signing_date null", null_count(c, "signing_date"), "== 0"),
@@ -720,6 +775,7 @@ checks += [
     ("dim_procurement_method", "methods without a competition group", T["dim_procurement_method"].filter("competition IS NULL").count(), "== 0"),
     ("dim_project", "projects not in outcome silver.projects", T["dim_project"].filter("NOT in_outcome_projects").count(), "info"),
     ("dim_project", "projects with an outcome risk band", T["dim_project"].filter("outcome_risk_band IS NOT NULL").count(), "info"),
+    # borrower codes that are countries (not regional programmes) yet have no WGI scores in country_year
     ("dim_country", "borrower countries without WGI indicators",
      c.join(T["dim_country"].filter("kind = 'country' AND NOT has_country_indicators"),
             F.col("borrower_country_code") == F.col("country_code"), "left_semi").select("borrower_country_code").distinct().count(), "info"),
@@ -738,6 +794,7 @@ checks += [
 ]
 dq = dq_report(checks)
 display(dq)
+# stop the job if any rule fails, so downstream notebooks never build on a broken model
 assert (dq["status"] != "FAIL").all(), dq[dq["status"] == "FAIL"]
 ```
 
